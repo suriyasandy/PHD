@@ -1,0 +1,453 @@
+"""
+Enhanced Email Entity Extractor with Pattern ID Tracking
+Adapted for your existing Pattern_Config.json structure
+"""
+
+import os
+import re
+import json
+import logging
+from datetime import datetime
+from collections import defaultdict, Counter
+from typing import Dict, List, Optional
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 1. PATTERN MANAGER - Adapted for Your Config Structure
+# ============================================================================
+
+class PatternManager:
+    """Manages regex patterns with IDs for your entities structure"""
+    
+    def __init__(self, config_file: str = "Pattern_Config.json"):
+        self.config_file = config_file
+        self.entities = []
+        self.patterns_by_entity = {}
+        self.pattern_id_map = {}
+        self.load_patterns()
+    
+    def load_patterns(self):
+        """Load patterns from your entities-based config"""
+        if not os.path.exists(self.config_file):
+            logger.error(f"Pattern config not found: {self.config_file}")
+            return
+        
+        with open(self.config_file, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        
+        self.entities = config_data.get('entities', [])
+        
+        # Process each entity and add pattern IDs
+        for entity in self.entities:
+            entity_name = entity.get('name', 'Unknown')
+            entity_type = entity.get('type', 'pattern')
+            patterns = entity.get('patterns', [])
+            
+            # Store patterns by entity name
+            self.patterns_by_entity[entity_name] = []
+            
+            for idx, pattern_str in enumerate(patterns):
+                # Generate unique pattern ID
+                pattern_id = f"{entity_name.upper().replace(' ', '_')}_PTN{idx+1:03d}"
+                
+                pattern_entry = {
+                    'pattern_id': pattern_id,
+                    'pattern': pattern_str,
+                    'entity_name': entity_name,
+                    'entity_type': entity_type,
+                    'priority': idx + 1
+                }
+                
+                self.patterns_by_entity[entity_name].append(pattern_entry)
+                self.pattern_id_map[pattern_id] = pattern_entry
+        
+        # Save updated config with pattern IDs
+        self._save_enhanced_config()
+        
+        logger.info(f"Loaded {len(self.pattern_id_map)} patterns from {len(self.entities)} entities")
+    
+    def _save_enhanced_config(self):
+        """Save enhanced config with pattern IDs to a new file"""
+        enhanced_config = {
+            'entities': []
+        }
+        
+        for entity_name, patterns in self.patterns_by_entity.items():
+            entity_entry = {
+                'name': entity_name,
+                'type': patterns[0]['entity_type'] if patterns else 'pattern',
+                'patterns': [
+                    {
+                        'pattern_id': p['pattern_id'],
+                        'pattern': p['pattern'],
+                        'priority': p['priority']
+                    }
+                    for p in patterns
+                ]
+            }
+            enhanced_config['entities'].append(entity_entry)
+        
+        enhanced_file = self.config_file.replace('.json', '_with_IDs.json')
+        with open(enhanced_file, 'w', encoding='utf-8') as f:
+            json.dump(enhanced_config, f, indent=4, ensure_ascii=False)
+        
+        logger.info(f"Enhanced config saved to: {enhanced_file}")
+    
+    def get_patterns_for_entity(self, entity_name: str) -> List[Dict]:
+        """Get all patterns for a specific entity"""
+        return self.patterns_by_entity.get(entity_name, [])
+    
+    def get_all_entity_names(self) -> List[str]:
+        """Get list of all entity names"""
+        return list(self.patterns_by_entity.keys())
+
+
+# ============================================================================
+# 2. PATTERN USAGE TRACKER
+# ============================================================================
+
+class PatternUsageTracker:
+    """Track pattern usage statistics"""
+    
+    def __init__(self, metrics_file: str = "pattern_usage_metrics.json"):
+        self.metrics_file = metrics_file
+        self.current_run_stats = defaultdict(lambda: {
+            'attempts': 0,
+            'matches': 0,
+            'extracted_values': []
+        })
+        self.historical_stats = {}
+        self.load_historical_metrics()
+    
+    def load_historical_metrics(self):
+        """Load historical usage data"""
+        if os.path.exists(self.metrics_file):
+            try:
+                with open(self.metrics_file, 'r') as f:
+                    self.historical_stats = json.load(f)
+            except Exception as e:
+                logger.warning(f"Could not load metrics: {e}")
+                self.historical_stats = {}
+    
+    def record_attempt(self, pattern_id: str):
+        """Record pattern usage attempt"""
+        self.current_run_stats[pattern_id]['attempts'] += 1
+    
+    def record_match(self, pattern_id: str, extracted_value: str):
+        """Record successful pattern match"""
+        self.current_run_stats[pattern_id]['matches'] += 1
+        self.current_run_stats[pattern_id]['extracted_values'].append(extracted_value)
+    
+    def finalize_run(self, run_date: str):
+        """Finalize current run and update historical stats"""
+        if run_date not in self.historical_stats:
+            self.historical_stats[run_date] = {}
+        
+        for pattern_id, stats in self.current_run_stats.items():
+            if pattern_id not in self.historical_stats[run_date]:
+                self.historical_stats[run_date][pattern_id] = {
+                    'total_attempts': 0,
+                    'total_matches': 0,
+                    'unique_values_count': 0
+                }
+            
+            self.historical_stats[run_date][pattern_id]['total_attempts'] += stats['attempts']
+            self.historical_stats[run_date][pattern_id]['total_matches'] += stats['matches']
+            self.historical_stats[run_date][pattern_id]['unique_values_count'] = len(
+                set(stats['extracted_values'])
+            )
+        
+        self.save_metrics()
+        self.current_run_stats.clear()
+    
+    def save_metrics(self):
+        """Save metrics to JSON file"""
+        with open(self.metrics_file, 'w') as f:
+            json.dump(self.historical_stats, f, indent=2)
+        logger.info(f"Metrics saved to {self.metrics_file}")
+    
+    def generate_mi_report(self, output_path: str, pattern_manager: PatternManager):
+        """Generate comprehensive MI report"""
+        report_data = []
+        
+        # Aggregate stats across all dates
+        pattern_aggregates = defaultdict(lambda: {
+            'total_attempts': 0,
+            'total_matches': 0,
+            'dates_used': 0
+        })
+        
+        for run_date, date_stats in self.historical_stats.items():
+            for pattern_id, stats in date_stats.items():
+                pattern_aggregates[pattern_id]['total_attempts'] += stats['total_attempts']
+                pattern_aggregates[pattern_id]['total_matches'] += stats['total_matches']
+                pattern_aggregates[pattern_id]['dates_used'] += 1
+        
+        # Build report rows
+        for pattern_id, agg_stats in pattern_aggregates.items():
+            attempts = agg_stats['total_attempts']
+            matches = agg_stats['total_matches']
+            success_rate = (matches / attempts * 100) if attempts > 0 else 0.0
+            
+            # Get pattern details
+            pattern_info = pattern_manager.pattern_id_map.get(pattern_id, {})
+            
+            report_data.append({
+                'Pattern ID': pattern_id,
+                'Entity Name': pattern_info.get('entity_name', 'Unknown'),
+                'Pattern': pattern_info.get('pattern', '')[:50] + '...',  # Truncate for display
+                'Total Attempts': attempts,
+                'Total Matches': matches,
+                'Success Rate (%)': round(success_rate, 2),
+                'Days Used': agg_stats['dates_used']
+            })
+        
+        # Create DataFrame and save
+        df = pd.DataFrame(report_data)
+        df = df.sort_values('Total Matches', ascending=False)
+        
+        # Multi-sheet Excel
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Pattern Summary', index=False)
+            
+            # Daily breakdown
+            daily_data = []
+            for run_date, date_stats in self.historical_stats.items():
+                for pattern_id, stats in date_stats.items():
+                    pattern_info = pattern_manager.pattern_id_map.get(pattern_id, {})
+                    daily_data.append({
+                        'Date': run_date,
+                        'Pattern ID': pattern_id,
+                        'Entity Name': pattern_info.get('entity_name', 'Unknown'),
+                        'Attempts': stats['total_attempts'],
+                        'Matches': stats['total_matches'],
+                        'Unique Values': stats['unique_values_count']
+                    })
+            
+            if daily_
+                daily_df = pd.DataFrame(daily_data)
+                daily_df.to_excel(writer, sheet_name='Daily Breakdown', index=False)
+            
+            # Top 10 patterns
+            top_10 = df.head(10)
+            top_10.to_excel(writer, sheet_name='Top 10 Patterns', index=False)
+        
+        logger.info(f"MI Report saved to {output_path}")
+        return df
+
+
+# ============================================================================
+# 3. TRACKED ENTITY EXTRACTOR
+# ============================================================================
+
+class TrackedEntityExtractor:
+    """Entity extractor with pattern tracking"""
+    
+    def __init__(self, pattern_manager: PatternManager, tracker: PatternUsageTracker):
+        self.pattern_manager = pattern_manager
+        self.tracker = tracker
+    
+    def extract_entity(self, text: str, entity_name: str) -> Dict:
+        """Extract a specific entity with pattern tracking"""
+        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        
+        result = {
+            'value': None,
+            'pattern_id': None,
+            'entity_name': entity_name
+        }
+        
+        for pattern_entry in patterns:
+            pattern_id = pattern_entry['pattern_id']
+            pattern_regex = pattern_entry['pattern']
+            
+            # Record attempt
+            self.tracker.record_attempt(pattern_id)
+            
+            try:
+                match = re.search(pattern_regex, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                if match:
+                    # Extract value (try group 1 first, then group 0)
+                    extracted_value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                    extracted_value = extracted_value.strip()
+                    
+                    if extracted_value:
+                        # Record success
+                        self.tracker.record_match(pattern_id, extracted_value)
+                        
+                        # Return first match (highest priority)
+                        result = {
+                            'value': extracted_value,
+                            'pattern_id': pattern_id,
+                            'entity_name': entity_name
+                        }
+                        break
+            
+            except re.error as e:
+                logger.error(f"Regex error in pattern {pattern_id}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error with pattern {pattern_id}: {e}")
+        
+        return result
+    
+    def extract_all_entities(self, text: str) -> Dict[str, Dict]:
+        """Extract all entities from text"""
+        entity_names = self.pattern_manager.get_all_entity_names()
+        
+        results = {}
+        for entity_name in entity_names:
+            results[entity_name] = self.extract_entity(text, entity_name)
+        
+        return results
+
+
+# ============================================================================
+# 4. INTEGRATION EXAMPLE
+# ============================================================================
+
+def integrate_with_your_app():
+    """
+    Example integration with your existing EmailEntityExtractor class
+    
+    Add to your __init__ method:
+    """
+    
+    class EmailEntityExtractorEnhanced:
+        def __init__(self, root, dir_path, temp_path):
+            # Your existing initialization...
+            self.root = root
+            self.dir_path = dir_path
+            self.temp_path = temp_path
+            
+            # NEW: Add pattern tracking
+            self.pattern_manager = PatternManager("Pattern_Config.json")
+            self.usage_tracker = PatternUsageTracker()
+            self.tracked_extractor = TrackedEntityExtractor(
+                self.pattern_manager,
+                self.usage_tracker
+            )
+            
+            # Rest of your existing init...
+        
+        def extract_entities_from_email(self, email_subject: str, email_body: str) -> Dict:
+            """Extract all entities with tracking"""
+            full_text = f"{email_subject}\n\n{email_body}"
+            
+            # Extract with tracking
+            results = self.tracked_extractor.extract_all_entities(full_text)
+            
+            return results
+        
+        def process_email(self, email):
+            """Your existing email processing with tracking"""
+            # Extract entities
+            extracted = self.extract_entities_from_email(
+                email.get('subject', ''),
+                email.get('body', '')
+            )
+            
+            # Access extracted values
+            # Example: PackageDetails
+            package_details = extracted.get('PackageDetails', {})
+            package_value = package_details.get('value')
+            pattern_used = package_details.get('pattern_id')
+            
+            # Your existing processing logic...
+            return extracted
+        
+        def finish_extraction(self):
+            """Called at end of extraction run"""
+            # Your existing finish logic...
+            
+            # NEW: Finalize tracking and generate MI report
+            run_date = datetime.now().strftime("%Y-%m-%d")
+            self.usage_tracker.finalize_run(run_date)
+            
+            mi_report_path = os.path.join(
+                self.out_path,
+                f"Pattern_MI_Report_{run_date}.xlsx"
+            )
+            self.usage_tracker.generate_mi_report(mi_report_path, self.pattern_manager)
+            
+            logger.info(f"MI Report: {mi_report_path}")
+            
+            # Show summary
+            self.show_mi_summary()
+        
+        def show_mi_summary(self):
+            """Display MI summary in your GUI"""
+            summary_lines = [
+                "\n" + "="*60,
+                "PATTERN USAGE SUMMARY",
+                "="*60
+            ]
+            
+            # Top patterns
+            top_patterns = Counter()
+            for pattern_id, stats in self.usage_tracker.current_run_stats.items():
+                top_patterns[pattern_id] = stats['matches']
+            
+            summary_lines.append("\nTop 5 Patterns Used:")
+            for pattern_id, count in top_patterns.most_common(5):
+                pattern_info = self.pattern_manager.pattern_id_map.get(pattern_id, {})
+                entity_name = pattern_info.get('entity_name', 'Unknown')
+                summary_lines.append(f"  {pattern_id}: {count} matches [{entity_name}]")
+            
+            summary_lines.append("="*60 + "\n")
+            summary_text = "\n".join(summary_lines)
+            
+            # Display in your text widget
+            self.entity_result_text.insert(tk.END, summary_text)
+
+
+# ============================================================================
+# 5. STANDALONE TEST/DEMO
+# ============================================================================
+
+def test_pattern_extraction():
+    """Test the pattern extraction with your config"""
+    
+    # Initialize
+    pattern_manager = PatternManager("Pattern_Config.json")
+    tracker = PatternUsageTracker()
+    extractor = TrackedEntityExtractor(pattern_manager, tracker)
+    
+    # Sample email text
+    sample_text = """
+    Trade ID: ABC12345
+    Currency: USD
+    Status: Confirmed
+    Product: Interest Rate Swap
+    SubProduct: Fixed-Float
+    Notional: $100,000,000
+    Business Date: 2025-11-07
+    Counterparty: XYZ Corporation
+    """
+    
+    # Extract all entities
+    results = extractor.extract_all_entities(sample_text)
+    
+    print("="*80)
+    print("EXTRACTION RESULTS")
+    print("="*80)
+    
+    for entity_name, result in results.items():
+        value = result.get('value', 'NOT FOUND')
+        pattern_id = result.get('pattern_id', 'N/A')
+        print(f"{entity_name:20s}: {value} [{pattern_id}]")
+    
+    # Finalize and generate report
+    tracker.finalize_run(datetime.now().strftime("%Y-%m-%d"))
+    tracker.generate_mi_report("MI_Report_Test.xlsx", pattern_manager)
+    
+    print("\n" + "="*80)
+    print("MI Report generated: MI_Report_Test.xlsx")
+    print("="*80)
+
+
+if __name__ == "__main__":
+    test_pattern_extraction()

@@ -1,0 +1,550 @@
+"""
+ML-Enhanced Trade Surveillance Email Parser
+Combines regex patterns with transformer-based NLP for intelligent extraction
+"""
+
+import os
+import re
+import logging
+from datetime import datetime, timedelta
+from collections import defaultdict
+import win32com.client
+import pandas as pd
+from typing import List, Dict, Any, Optional
+
+# ML/NLP libraries
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForTokenClassification,
+    AutoModelForSequenceClassification,
+    pipeline
+)
+import spacy
+import torch
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 1. EMAIL EXTRACTION & THREADING
+# ============================================================================
+
+class OutlookEmailExtractor:
+    """Extract emails from Outlook with thread reconstruction"""
+    
+    def __init__(self, mailbox_name: str, folder_name: str):
+        self.mailbox_name = mailbox_name
+        self.folder_name = folder_name
+        self.outlook = win32com.client.Dispatch("Outlook.Application").GetNamespace("MAPI")
+    
+    def connect_to_folder(self):
+        """Connect to specified Outlook folder"""
+        try:
+            mailbox = self.outlook.Folders(self.mailbox_name)
+            folder = mailbox.Folders(self.folder_name)
+            return folder
+        except Exception as e:
+            logger.error(f"Failed to connect to folder: {e}")
+            return None
+    
+    def extract_emails(self, start_date: datetime, days_back: int = 3) -> List[Dict]:
+        """Extract emails within date range"""
+        folder = self.connect_to_folder()
+        if not folder:
+            return []
+        
+        all_emails = []
+        date_fmt, use_ampm = self.get_region_datefmt_ampm()
+        
+        for day_offset in range(days_back):
+            target_date = start_date - timedelta(days=day_offset)
+            if target_date.weekday() >= 5:  # Skip weekends
+                continue
+            
+            start_time, end_time = self.restrict_datetime_strings(target_date, date_fmt, use_ampm)
+            filter_str = f"[ReceivedTime] >= '{start_time}' AND [ReceivedTime] <= '{end_time}'"
+            
+            try:
+                items = folder.Items.Restrict(filter_str)
+                for item in items:
+                    if hasattr(item, 'Subject'):
+                        email_data = {
+                            'message_id': getattr(item, 'EntryID', ''),
+                            'in_reply_to': self._get_header(item, 'In-Reply-To'),
+                            'references': self._get_header(item, 'References'),
+                            'subject': item.Subject,
+                            'sender': getattr(item, 'SenderName', ''),
+                            'recipient': getattr(item, 'To', ''),
+                            'date': item.ReceivedTime.strftime('%Y-%m-%d %H:%M:%S'),
+                            'body': getattr(item, 'Body', ''),
+                            'html_body': getattr(item, 'HTMLBody', '')
+                        }
+                        all_emails.append(email_data)
+            except Exception as e:
+                logger.error(f"Error extracting emails for {target_date}: {e}")
+        
+        return all_emails
+    
+    def _get_header(self, item, header_name: str) -> str:
+        """Extract email header value"""
+        try:
+            return item.PropertyAccessor.GetProperty(
+                f"http://schemas.microsoft.com/mapi/proptag/0x{header_name}"
+            )
+        except:
+            return ""
+    
+    def get_region_datefmt_ampm(self):
+        """Detect system date format"""
+        return "%m/%d/%Y", True  # Default US format
+    
+    def restrict_datetime_strings(self, date, date_fmt, use_ampm):
+        """Generate Outlook filter datetime strings"""
+        start_str = date.strftime(date_fmt) + " 12:00 AM" if use_ampm else " 00:00"
+        end_str = date.strftime(date_fmt) + " 11:59 PM" if use_ampm else " 23:59"
+        return start_str, end_str
+
+
+class EmailThreadReconstructor:
+    """Reconstruct email conversation threads"""
+    
+    def __init__(self, emails: List[Dict]):
+        self.emails = emails
+        self.thread_map = {}
+    
+    def reconstruct_threads(self) -> Dict[str, List[Dict]]:
+        """Build conversation threads from email headers"""
+        # Build message ID index
+        for email in self.emails:
+            msg_id = email['message_id']
+            self.thread_map[msg_id] = {
+                'email': email,
+                'parent': email['in_reply_to'],
+                'children': [],
+                'timestamp': datetime.strptime(email['date'], '%Y-%m-%d %H:%M:%S')
+            }
+        
+        # Link parent-child relationships
+        for msg_id, node in self.thread_map.items():
+            parent_id = node['parent']
+            if parent_id and parent_id in self.thread_map:
+                self.thread_map[parent_id]['children'].append(msg_id)
+        
+        # Group into threads (find root messages)
+        threads = defaultdict(list)
+        for msg_id, node in self.thread_map.items():
+            root_id = self._find_root(msg_id)
+            threads[root_id].append(node['email'])
+        
+        # Sort each thread chronologically
+        for root_id in threads:
+            threads[root_id].sort(key=lambda x: x['date'])
+        
+        return dict(threads)
+    
+    def _find_root(self, msg_id: str) -> str:
+        """Find root message of thread"""
+        node = self.thread_map.get(msg_id)
+        if not node or not node['parent'] or node['parent'] not in self.thread_map:
+            return msg_id
+        return self._find_root(node['parent'])
+
+
+# ============================================================================
+# 2. ML-BASED ENTITY EXTRACTION
+# ============================================================================
+
+class FinancialNERExtractor:
+    """Named Entity Recognition for financial entities"""
+    
+    def __init__(self, model_name: str = "dslim/bert-base-NER"):
+        """Initialize NER pipeline with financial model"""
+        logger.info(f"Loading NER model: {model_name}")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForTokenClassification.from_pretrained(model_name)
+        self.ner_pipeline = pipeline(
+            "ner", 
+            model=self.model, 
+            tokenizer=self.tokenizer,
+            aggregation_strategy="simple"
+        )
+        
+        # Compile regex patterns for financial entities
+        self.patterns = {
+            'trade_id': re.compile(r'(?:Trade\s*ID|Package|Deal)\s*[:=#]?\s*([A-Z0-9\-]+)', re.I),
+            'amount': re.compile(r'([\$£€]\s*[\d,]+(?:\.\d{2})?(?:\s*[MBK])?|\d+(?:,\d{3})*(?:\.\d{2})?\s*(?:USD|EUR|GBP|million|billion))', re.I),
+            'rate': re.compile(r'(\d+\.?\d*\s*%|\d+\.?\d*\s*bps|LIBOR\s*[+\-]\s*\d+)', re.I),
+            'tenor': re.compile(r'(\d+[\-\s]*(?:year|yr|month|mo|M|Y))', re.I),
+            'date': re.compile(r'(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})', re.I)
+        }
+    
+    def extract_entities(self, text: str) -> Dict[str, List[str]]:
+        """Extract all financial entities from text"""
+        entities = {
+            'trade_ids': [],
+            'amounts': [],
+            'rates': [],
+            'tenors': [],
+            'dates': [],
+            'counterparties': [],
+            'fees': []
+        }
+        
+        # Regex-based extraction (fast, reliable for structured data)
+        entities['trade_ids'] = self.patterns['trade_id'].findall(text)
+        entities['amounts'] = self.patterns['amount'].findall(text)
+        entities['rates'] = self.patterns['rate'].findall(text)
+        entities['tenors'] = self.patterns['tenor'].findall(text)
+        entities['dates'] = self.patterns['date'].findall(text)
+        
+        # ML-based NER (handles variations)
+        try:
+            ner_results = self.ner_pipeline(text[:512])  # Limit token length
+            for entity in ner_results:
+                if entity['entity_group'] in ['ORG', 'PERSON']:
+                    entities['counterparties'].append(entity['word'])
+        except Exception as e:
+            logger.warning(f"NER pipeline error: {e}")
+        
+        # Normalize and deduplicate
+        for key in entities:
+            entities[key] = list(set(entities[key]))
+        
+        return entities
+
+
+class RelationExtractor:
+    """Extract relationships between entities"""
+    
+    def __init__(self):
+        # Load spaCy for dependency parsing
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except:
+            logger.warning("spaCy model not found, using basic relation extraction")
+            self.nlp = None
+    
+    def link_fees_to_trades(self, text: str, entities: Dict) -> List[Dict]:
+        """Link fee amounts to specific trades"""
+        fee_relations = []
+        
+        # Simple proximity-based linking
+        lines = text.split('\n')
+        for line in lines:
+            if 'fee' in line.lower():
+                # Find amounts in this line
+                amounts = [a for a in entities['amounts'] if a in line]
+                # Find trade IDs nearby
+                trade_ids = [t for t in entities['trade_ids'] if t in line]
+                
+                for amount in amounts:
+                    fee_relations.append({
+                        'fee_amount': amount,
+                        'trade_id': trade_ids[0] if trade_ids else 'package',
+                        'fee_type': self._classify_fee_type(line),
+                        'context': line.strip()
+                    })
+        
+        return fee_relations
+    
+    def _classify_fee_type(self, text: str) -> str:
+        """Classify type of fee"""
+        text_lower = text.lower()
+        if 'upfront' in text_lower:
+            return 'upfront'
+        elif 'ongoing' in text_lower or 'annual' in text_lower:
+            return 'ongoing'
+        elif 'termination' in text_lower or 'break' in text_lower:
+            return 'termination'
+        else:
+            return 'other'
+
+
+# ============================================================================
+# 3. JUSTIFICATION QUALITY ASSESSMENT
+# ============================================================================
+
+class JustificationQualityAssessor:
+    """Assess quality of business justifications"""
+    
+    def __init__(self):
+        """Initialize sentiment and classification models"""
+        logger.info("Loading justification assessment models...")
+        self.sentiment_pipeline = pipeline(
+            "sentiment-analysis",
+            model="distilbert-base-uncased-finetuned-sst-2-english"
+        )
+        
+        # Red flag patterns
+        self.red_flags = [
+            r'threaten(?:ing|ed)?\s+to\s+move',
+            r'must\s+approve\s+by\s+EOD',
+            r'lose\s+(?:the\s+)?deal',
+            r'client\s+ultimatum',
+            r'pressure\s+from',
+            r'urgent(?:ly)?.*approve'
+        ]
+        
+        # Quality indicators
+        self.high_quality_indicators = [
+            r'strategic\s+partnership',
+            r'long[\-\s]term\s+relationship',
+            r'committed\s+to.*\$\d+',
+            r'structured\s+facility',
+            r'cross[\-\s]sell',
+            r'pipeline\s+of.*deals'
+        ]
+    
+    def assess_justification(self, text: str) -> Dict[str, Any]:
+        """Comprehensive justification quality assessment"""
+        assessment = {
+            'quality_score': 'MEDIUM',
+            'confidence': 0.5,
+            'red_flags': [],
+            'green_signals': [],
+            'sentiment': 'neutral',
+            'specificity_score': 0.0
+        }
+        
+        # Detect red flags
+        for pattern in self.red_flags:
+            matches = re.findall(pattern, text, re.I)
+            if matches:
+                assessment['red_flags'].extend(matches)
+        
+        # Detect quality indicators
+        for pattern in self.high_quality_indicators:
+            matches = re.findall(pattern, text, re.I)
+            if matches:
+                assessment['green_signals'].extend(matches)
+        
+        # Sentiment analysis
+        try:
+            sentiment_result = self.sentiment_pipeline(text[:512])[0]
+            assessment['sentiment'] = sentiment_result['label'].lower()
+            assessment['confidence'] = sentiment_result['score']
+        except:
+            pass
+        
+        # Calculate specificity (presence of numbers, names, dates)
+        has_amounts = bool(re.search(r'\$[\d,]+', text))
+        has_dates = bool(re.search(r'\d{1,2}[/-]\d{1,2}[/-]\d{2,4}', text))
+        has_details = len(text.split()) > 50
+        
+        specificity = sum([has_amounts, has_dates, has_details]) / 3.0
+        assessment['specificity_score'] = specificity
+        
+        # Final quality determination
+        if assessment['red_flags']:
+            assessment['quality_score'] = 'LOW'
+        elif len(assessment['green_signals']) >= 2 and specificity > 0.6:
+            assessment['quality_score'] = 'HIGH'
+        elif specificity > 0.3:
+            assessment['quality_score'] = 'MEDIUM'
+        else:
+            assessment['quality_score'] = 'LOW'
+        
+        return assessment
+
+
+# ============================================================================
+# 4. EMAIL SUMMARIZATION
+# ============================================================================
+
+class EmailThreadSummarizer:
+    """Generate concise summaries of email threads"""
+    
+    def __init__(self):
+        logger.info("Loading summarization model...")
+        self.summarizer = pipeline(
+            "summarization",
+            model="facebook/bart-large-cnn",
+            device=0 if torch.cuda.is_available() else -1
+        )
+    
+    def summarize_thread(self, emails: List[Dict]) -> Dict[str, str]:
+        """Generate summary of entire email thread"""
+        # Concatenate thread chronologically
+        conversation_text = "\n\n".join([
+            f"{email['sender']} ({email['date']}): {email['body'][:500]}"
+            for email in sorted(emails, key=lambda x: x['date'])
+        ])
+        
+        # Limit text length
+        max_chars = 1024
+        if len(conversation_text) > max_chars:
+            conversation_text = conversation_text[:max_chars] + "..."
+        
+        try:
+            summary_result = self.summarizer(
+                conversation_text,
+                max_length=150,
+                min_length=50,
+                do_sample=False
+            )
+            summary_text = summary_result[0]['summary_text']
+        except Exception as e:
+            logger.error(f"Summarization error: {e}")
+            summary_text = "Unable to generate summary"
+        
+        # Extract key decision timeline
+        decisions = self._extract_decisions(emails)
+        
+        return {
+            'summary': summary_text,
+            'key_decisions': decisions,
+            'participant_count': len(set(e['sender'] for e in emails)),
+            'message_count': len(emails)
+        }
+    
+    def _extract_decisions(self, emails: List[Dict]) -> List[Dict]:
+        """Extract approval/rejection decisions"""
+        decision_keywords = ['approved', 'rejected', 'declined', 'accepted', 'agreed']
+        decisions = []
+        
+        for email in emails:
+            for keyword in decision_keywords:
+                if keyword in email['body'].lower():
+                    decisions.append({
+                        'decision': keyword,
+                        'by': email['sender'],
+                        'date': email['date'],
+                        'context': email['body'][:200]
+                    })
+                    break
+        
+        return decisions
+
+
+# ============================================================================
+# 5. MAIN PIPELINE ORCHESTRATOR
+# ============================================================================
+
+class MLEnhancedEmailParser:
+    """Complete ML-enhanced email parsing pipeline"""
+    
+    def __init__(self, mailbox: str, folder: str):
+        self.extractor = OutlookEmailExtractor(mailbox, folder)
+        self.ner = FinancialNERExtractor()
+        self.relation_extractor = RelationExtractor()
+        self.quality_assessor = JustificationQualityAssessor()
+        self.summarizer = EmailThreadSummarizer()
+    
+    def process_emails(self, start_date: datetime, days_back: int = 3) -> pd.DataFrame:
+        """End-to-end email processing pipeline"""
+        logger.info("Step 1: Extracting emails from Outlook...")
+        emails = self.extractor.extract_emails(start_date, days_back)
+        logger.info(f"Extracted {len(emails)} emails")
+        
+        if not emails:
+            return pd.DataFrame()
+        
+        logger.info("Step 2: Reconstructing email threads...")
+        threader = EmailThreadReconstructor(emails)
+        threads = threader.reconstruct_threads()
+        logger.info(f"Identified {len(threads)} email threads")
+        
+        logger.info("Step 3: Extracting entities and analyzing content...")
+        results = []
+        
+        for thread_id, thread_emails in threads.items():
+            # Process entire thread
+            full_text = "\n\n".join([e['body'] for e in thread_emails])
+            
+            # Entity extraction
+            entities = self.ner.extract_entities(full_text)
+            
+            # Fee-trade linking
+            fee_relations = self.relation_extractor.link_fees_to_trades(full_text, entities)
+            
+            # Justification assessment
+            justification_assessment = self.quality_assessor.assess_justification(full_text)
+            
+            # Thread summarization
+            summary = self.summarizer.summarize_thread(thread_emails)
+            
+            # Compile results
+            result_row = {
+                'thread_id': thread_id,
+                'trade_ids': ', '.join(entities['trade_ids']),
+                'amounts': ', '.join(entities['amounts']),
+                'rates': ', '.join(entities['rates']),
+                'tenors': ', '.join(entities['tenors']),
+                'counterparties': ', '.join(entities['counterparties']),
+                'fees': ', '.join([f"{r['fee_amount']} ({r['fee_type']})" for r in fee_relations]),
+                'justification_quality': justification_assessment['quality_score'],
+                'red_flags': ', '.join(justification_assessment['red_flags']),
+                'green_signals': ', '.join(justification_assessment['green_signals']),
+                'sentiment': justification_assessment['sentiment'],
+                'summary': summary['summary'],
+                'participant_count': summary['participant_count'],
+                'message_count': summary['message_count'],
+                'latest_date': thread_emails[-1]['date']
+            }
+            
+            results.append(result_row)
+        
+        logger.info("Step 4: Consolidating results...")
+        df = pd.DataFrame(results)
+        
+        return df
+
+
+# ============================================================================
+# 6. MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution entry point"""
+    # Configuration
+    MAILBOX_NAME = "your_mailbox@company.com"
+    FOLDER_NAME = "Inbox"  # or "Trade Confirmation" folder
+    START_DATE = datetime.now()
+    DAYS_BACK = 5
+    OUTPUT_DIR = "./results"
+    
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    try:
+        # Initialize parser
+        logger.info("="*80)
+        logger.info("ML-Enhanced Trade Surveillance Email Parser")
+        logger.info("="*80)
+        
+        parser = MLEnhancedEmailParser(MAILBOX_NAME, FOLDER_NAME)
+        
+        # Process emails
+        results_df = parser.process_emails(START_DATE, DAYS_BACK)
+        
+        # Save results
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_csv = os.path.join(OUTPUT_DIR, f"trade_surveillance_{timestamp}.csv")
+        output_excel = os.path.join(OUTPUT_DIR, f"trade_surveillance_{timestamp}.xlsx")
+        
+        results_df.to_csv(output_csv, index=False)
+        results_df.to_excel(output_excel, index=False)
+        
+        logger.info("="*80)
+        logger.info(f"Processing complete!")
+        logger.info(f"Total threads analyzed: {len(results_df)}")
+        logger.info(f"Output saved to: {output_csv}")
+        logger.info("="*80)
+        
+        # Print summary statistics
+        print("\n" + "="*80)
+        print("SUMMARY STATISTICS")
+        print("="*80)
+        print(f"Total Email Threads: {len(results_df)}")
+        print(f"High Quality Justifications: {sum(results_df['justification_quality'] == 'HIGH')}")
+        print(f"Red Flags Detected: {sum(results_df['red_flags'] != '')}")
+        print(f"Unique Trade IDs: {results_df['trade_ids'].nunique()}")
+        print("="*80)
+        
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()

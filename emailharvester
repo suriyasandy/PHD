@@ -1,6 +1,6 @@
 """
-Enhanced Regex Pattern System with Pattern IDs and Usage Analytics
-Tracks which patterns are used, success rates, and generates MI reports
+Enhanced Email Entity Extractor with Pattern ID Tracking and MI Metrics
+Integrates with your existing Tkinter app
 """
 
 import os
@@ -8,8 +8,8 @@ import re
 import json
 import logging
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
 from collections import defaultdict, Counter
+from typing import Dict, List
 import pandas as pd
 
 logging.basicConfig(level=logging.INFO)
@@ -17,479 +17,422 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# 1. ENHANCED PATTERN CONFIG WITH IDs
+# 1. PATTERN MANAGER WITH IDs (Updated Pattern_Config.json structure)
 # ============================================================================
 
-class PatternConfig:
-    """
-    Pattern configuration with unique IDs for tracking
-    Example config JSON structure:
-    {
-        "patterns": [
-            {
-                "pattern_id": "PTN001",
-                "pattern_name": "Trade ID Standard",
-                "entity_type": "trade_id",
-                "regex": "Trade ID:\\s*([A-Z0-9\\-]+)",
-                "description": "Standard trade ID format",
-                "priority": 1,
-                "active": true
-            },
-            ...
-        ]
-    }
-    """
+class PatternManager:
+    """Manages regex patterns with unique IDs for tracking"""
     
-    def __init__(self, config_path: str = "pattern_config.json"):
-        self.config_path = config_path
-        self.patterns = []
-        self.patterns_by_id = {}
-        self.patterns_by_entity = defaultdict(list)
+    def __init__(self, config_file: str = "Pattern_Config.json"):
+        self.config_file = config_file
+        self.patterns = {}
+        self.pattern_id_map = {}
         self.load_patterns()
     
     def load_patterns(self):
-        """Load patterns from JSON config"""
-        if os.path.exists(self.config_path):
-            with open(self.config_path, 'r') as f:
-                config_data = json.load(f)
-                self.patterns = config_data.get('patterns', [])
-        else:
-            # Create default config
-            self.patterns = self._create_default_patterns()
-            self.save_patterns()
+        """Load patterns from existing Pattern_Config.json with IDs"""
+        if not os.path.exists(self.config_file):
+            logger.warning(f"Pattern config not found: {self.config_file}")
+            return
         
-        # Build indexes
-        for pattern in self.patterns:
-            if pattern.get('active', True):
-                pattern_id = pattern['pattern_id']
-                entity_type = pattern['entity_type']
+        with open(self.config_file, 'r') as f:
+            config_data = json.load(f)
+        
+        # Add pattern IDs if not present
+        for field_name, field_config in config_data.items():
+            if isinstance(field_config, dict) and 'patterns' in field_config:
+                patterns_list = field_config['patterns']
                 
-                self.patterns_by_id[pattern_id] = pattern
-                self.patterns_by_entity[entity_type].append(pattern)
+                for idx, pattern_entry in enumerate(patterns_list):
+                    # Generate pattern ID if not present
+                    if 'pattern_id' not in pattern_entry:
+                        pattern_entry['pattern_id'] = f"{field_name.upper()}_PTN{idx+1:03d}"
+                    
+                    pattern_id = pattern_entry['pattern_id']
+                    self.pattern_id_map[pattern_id] = {
+                        'field': field_name,
+                        'pattern': pattern_entry.get('pattern', ''),
+                        'description': pattern_entry.get('description', ''),
+                        'priority': idx + 1
+                    }
         
-        # Sort by priority
-        for entity_type in self.patterns_by_entity:
-            self.patterns_by_entity[entity_type].sort(
-                key=lambda p: p.get('priority', 999)
-            )
+        self.patterns = config_data
         
-        logger.info(f"Loaded {len(self.patterns)} patterns from {self.config_path}")
+        # Save updated config with IDs
+        self.save_patterns()
+        logger.info(f"Loaded {len(self.pattern_id_map)} patterns with IDs")
     
     def save_patterns(self):
-        """Save patterns to JSON config"""
-        with open(self.config_path, 'w') as f:
-            json.dump({'patterns': self.patterns}, f, indent=2)
-        logger.info(f"Saved patterns to {self.config_path}")
+        """Save patterns back to config file"""
+        with open(self.config_file, 'w') as f:
+            json.dump(self.patterns, f, indent=4)
     
-    def _create_default_patterns(self) -> List[Dict]:
-        """Create default pattern set with IDs"""
-        return [
-            # Trade ID patterns
-            {
-                "pattern_id": "PTN001",
-                "pattern_name": "Trade ID - Standard Format",
-                "entity_type": "trade_id",
-                "regex": r"(?:Trade\s*ID|Package|Deal)\s*[:=#]?\s*([A-Z0-9\-]+)",
-                "description": "Standard trade ID with prefix",
-                "priority": 1,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN002",
-                "pattern_name": "Trade ID - Numeric Only",
-                "entity_type": "trade_id",
-                "regex": r"\b(\d{6,10})\b",
-                "description": "Numeric trade ID 6-10 digits",
-                "priority": 2,
-                "active": True
-            },
-            
-            # Amount patterns
-            {
-                "pattern_id": "PTN101",
-                "pattern_name": "Amount - USD Symbol",
-                "entity_type": "amount",
-                "regex": r"\$\s*([\d,]+(?:\.\d{2})?(?:\s*[MBK])?)",
-                "description": "Dollar amounts with optional M/B/K suffix",
-                "priority": 1,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN102",
-                "pattern_name": "Amount - Currency Suffix",
-                "entity_type": "amount",
-                "regex": r"([\d,]+(?:\.\d{2})?)\s*(USD|EUR|GBP)",
-                "description": "Amount with currency code",
-                "priority": 2,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN103",
-                "pattern_name": "Amount - Word Format",
-                "entity_type": "amount",
-                "regex": r"([\d,]+(?:\.\d{2})?)\s*(million|billion)",
-                "description": "Amount with word suffix",
-                "priority": 3,
-                "active": True
-            },
-            
-            # Rate patterns
-            {
-                "pattern_id": "PTN201",
-                "pattern_name": "Rate - Percentage",
-                "entity_type": "rate",
-                "regex": r"(\d+\.?\d*)\s*%",
-                "description": "Rate as percentage",
-                "priority": 1,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN202",
-                "pattern_name": "Rate - Basis Points",
-                "entity_type": "rate",
-                "regex": r"(\d+\.?\d*)\s*(?:bps|basis\s*points)",
-                "description": "Rate in basis points",
-                "priority": 2,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN203",
-                "pattern_name": "Rate - LIBOR Based",
-                "entity_type": "rate",
-                "regex": r"(LIBOR\s*[+\-]\s*\d+\.?\d*(?:\s*bps)?)",
-                "description": "LIBOR plus/minus spread",
-                "priority": 1,
-                "active": True
-            },
-            
-            # Tenor patterns
-            {
-                "pattern_id": "PTN301",
-                "pattern_name": "Tenor - Year Format",
-                "entity_type": "tenor",
-                "regex": r"(\d+)[\-\s]*(?:year|yr|Y)\b",
-                "description": "Tenor in years",
-                "priority": 1,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN302",
-                "pattern_name": "Tenor - Month Format",
-                "entity_type": "tenor",
-                "regex": r"(\d+)[\-\s]*(?:month|mo|M)\b",
-                "description": "Tenor in months",
-                "priority": 2,
-                "active": True
-            },
-            
-            # Date patterns
-            {
-                "pattern_id": "PTN401",
-                "pattern_name": "Date - MM/DD/YYYY",
-                "entity_type": "date",
-                "regex": r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-                "description": "US date format",
-                "priority": 1,
-                "active": True
-            },
-            {
-                "pattern_id": "PTN402",
-                "pattern_name": "Date - ISO Format",
-                "entity_type": "date",
-                "regex": r"(\d{4}-\d{2}-\d{2})",
-                "description": "ISO date format YYYY-MM-DD",
-                "priority": 2,
-                "active": True
-            },
-            
-            # Counterparty patterns
-            {
-                "pattern_id": "PTN501",
-                "pattern_name": "Counterparty - Client Name",
-                "entity_type": "counterparty",
-                "regex": r"(?:Client|Counterparty|Customer):\s*([A-Za-z0-9\s&,\.]+?)(?:\.|$|\n)",
-                "description": "Counterparty with prefix",
-                "priority": 1,
-                "active": True
-            }
-        ]
-    
-    def get_patterns_for_entity(self, entity_type: str) -> List[Dict]:
-        """Get all active patterns for a specific entity type"""
-        return self.patterns_by_entity.get(entity_type, [])
-    
-    def get_pattern_by_id(self, pattern_id: str) -> Optional[Dict]:
-        """Get pattern by ID"""
-        return self.patterns_by_id.get(pattern_id)
+    def get_patterns_for_field(self, field_name: str) -> List[Dict]:
+        """Get all patterns for a specific field"""
+        field_config = self.patterns.get(field_name, {})
+        return field_config.get('patterns', [])
 
 
 # ============================================================================
-# 2. PATTERN USAGE TRACKER
+# 2. USAGE TRACKER FOR MI METRICS
 # ============================================================================
 
 class PatternUsageTracker:
-    """Track pattern usage statistics for MI reporting"""
+    """Track pattern usage for MI reporting"""
     
-    def __init__(self, metrics_path: str = "pattern_metrics.json"):
-        self.metrics_path = metrics_path
-        self.session_start = datetime.now()
-        self.usage_stats = defaultdict(lambda: {
+    def __init__(self, metrics_file: str = "pattern_usage_metrics.json"):
+        self.metrics_file = metrics_file
+        self.current_run_stats = defaultdict(lambda: {
             'attempts': 0,
-            'successes': 0,
-            'extracted_values': [],
-            'last_used': None
+            'matches': 0,
+            'extracted_values': []
         })
-        self.load_metrics()
+        self.historical_stats = {}
+        self.load_historical_metrics()
     
-    def load_metrics(self):
-        """Load historical metrics"""
-        if os.path.exists(self.metrics_path):
+    def load_historical_metrics(self):
+        """Load historical usage data"""
+        if os.path.exists(self.metrics_file):
             try:
-                with open(self.metrics_path, 'r') as f:
-                    data = json.load(f)
-                    self.usage_stats = defaultdict(
-                        lambda: {'attempts': 0, 'successes': 0, 'extracted_values': [], 'last_used': None},
-                        data.get('usage_stats', {})
-                    )
+                with open(self.metrics_file, 'r') as f:
+                    self.historical_stats = json.load(f)
             except Exception as e:
                 logger.warning(f"Could not load metrics: {e}")
-    
-    def save_metrics(self):
-        """Save metrics to JSON"""
-        data = {
-            'session_start': self.session_start.isoformat(),
-            'session_end': datetime.now().isoformat(),
-            'usage_stats': dict(self.usage_stats)
-        }
-        with open(self.metrics_path, 'w') as f:
-            json.dump(data, f, indent=2)
+                self.historical_stats = {}
     
     def record_attempt(self, pattern_id: str):
-        """Record pattern usage attempt"""
-        self.usage_stats[pattern_id]['attempts'] += 1
+        """Record a pattern usage attempt"""
+        self.current_run_stats[pattern_id]['attempts'] += 1
     
-    def record_success(self, pattern_id: str, extracted_value: str):
-        """Record successful extraction"""
-        self.usage_stats[pattern_id]['successes'] += 1
-        self.usage_stats[pattern_id]['extracted_values'].append(extracted_value)
-        self.usage_stats[pattern_id]['last_used'] = datetime.now().isoformat()
+    def record_match(self, pattern_id: str, extracted_value: str):
+        """Record a successful pattern match"""
+        self.current_run_stats[pattern_id]['matches'] += 1
+        self.current_run_stats[pattern_id]['extracted_values'].append(extracted_value)
     
-    def get_success_rate(self, pattern_id: str) -> float:
-        """Calculate success rate for a pattern"""
-        stats = self.usage_stats[pattern_id]
-        attempts = stats['attempts']
-        if attempts == 0:
+    def finalize_run(self, run_date: str):
+        """Finalize current run and update historical stats"""
+        # Update historical stats
+        if run_date not in self.historical_stats:
+            self.historical_stats[run_date] = {}
+        
+        for pattern_id, stats in self.current_run_stats.items():
+            if pattern_id not in self.historical_stats[run_date]:
+                self.historical_stats[run_date][pattern_id] = {
+                    'total_attempts': 0,
+                    'total_matches': 0,
+                    'unique_values_count': 0
+                }
+            
+            self.historical_stats[run_date][pattern_id]['total_attempts'] += stats['attempts']
+            self.historical_stats[run_date][pattern_id]['total_matches'] += stats['matches']
+            self.historical_stats[run_date][pattern_id]['unique_values_count'] = len(
+                set(stats['extracted_values'])
+            )
+        
+        # Save to file
+        self.save_metrics()
+        
+        # Reset current run stats
+        self.current_run_stats.clear()
+    
+    def save_metrics(self):
+        """Save metrics to JSON file"""
+        with open(self.metrics_file, 'w') as f:
+            json.dump(self.historical_stats, f, indent=2)
+        logger.info(f"Metrics saved to {self.metrics_file}")
+    
+    def get_pattern_success_rate(self, pattern_id: str) -> float:
+        """Calculate overall success rate for a pattern"""
+        total_attempts = 0
+        total_matches = 0
+        
+        for date_stats in self.historical_stats.values():
+            if pattern_id in date_stats:
+                total_attempts += date_stats[pattern_id]['total_attempts']
+                total_matches += date_stats[pattern_id]['total_matches']
+        
+        if total_attempts == 0:
             return 0.0
-        return (stats['successes'] / attempts) * 100.0
+        return (total_matches / total_attempts) * 100.0
     
-    def get_top_patterns(self, n: int = 10) -> List[Tuple[str, int]]:
-        """Get top N most used patterns"""
-        pattern_usage = [
-            (pattern_id, stats['successes'])
-            for pattern_id, stats in self.usage_stats.items()
-        ]
-        return sorted(pattern_usage, key=lambda x: x[1], reverse=True)[:n]
-    
-    def generate_mi_report(self) -> pd.DataFrame:
-        """Generate MI report as DataFrame"""
+    def generate_mi_report(self, output_path: str):
+        """Generate comprehensive MI report"""
         report_data = []
-        for pattern_id, stats in self.usage_stats.items():
+        
+        # Aggregate stats across all dates
+        pattern_aggregates = defaultdict(lambda: {
+            'total_attempts': 0,
+            'total_matches': 0,
+            'dates_used': 0
+        })
+        
+        for run_date, date_stats in self.historical_stats.items():
+            for pattern_id, stats in date_stats.items():
+                pattern_aggregates[pattern_id]['total_attempts'] += stats['total_attempts']
+                pattern_aggregates[pattern_id]['total_matches'] += stats['total_matches']
+                pattern_aggregates[pattern_id]['dates_used'] += 1
+        
+        # Build report rows
+        for pattern_id, agg_stats in pattern_aggregates.items():
+            attempts = agg_stats['total_attempts']
+            matches = agg_stats['total_matches']
+            success_rate = (matches / attempts * 100) if attempts > 0 else 0.0
+            
             report_data.append({
                 'Pattern ID': pattern_id,
-                'Attempts': stats['attempts'],
-                'Successes': stats['successes'],
-                'Success Rate (%)': self.get_success_rate(pattern_id),
-                'Last Used': stats['last_used'] or 'Never',
-                'Unique Values': len(set(stats['extracted_values']))
+                'Total Attempts': attempts,
+                'Total Matches': matches,
+                'Success Rate (%)': round(success_rate, 2),
+                'Days Used': agg_stats['dates_used']
             })
         
+        # Create DataFrame and save
         df = pd.DataFrame(report_data)
-        df = df.sort_values('Successes', ascending=False)
+        df = df.sort_values('Total Matches', ascending=False)
+        
+        # Multi-sheet Excel
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            df.to_excel(writer, sheet_name='Pattern Summary', index=False)
+            
+            # Daily breakdown
+            daily_data = []
+            for run_date, date_stats in self.historical_stats.items():
+                for pattern_id, stats in date_stats.items():
+                    daily_data.append({
+                        'Date': run_date,
+                        'Pattern ID': pattern_id,
+                        'Attempts': stats['total_attempts'],
+                        'Matches': stats['total_matches'],
+                        'Unique Values': stats['unique_values_count']
+                    })
+            
+            daily_df = pd.DataFrame(daily_data)
+            daily_df.to_excel(writer, sheet_name='Daily Breakdown', index=False)
+        
+        logger.info(f"MI Report saved to {output_path}")
         return df
 
 
 # ============================================================================
-# 3. ENHANCED ENTITY EXTRACTOR WITH TRACKING
+# 3. ENHANCED ENTITY EXTRACTION WITH TRACKING
 # ============================================================================
 
 class TrackedEntityExtractor:
-    """Entity extractor with pattern tracking and MI"""
+    """Entity extractor with pattern tracking"""
     
-    def __init__(self, config_path: str = "pattern_config.json"):
-        self.pattern_config = PatternConfig(config_path)
-        self.tracker = PatternUsageTracker()
-        self.extraction_log = []  # Per-run extraction details
+    def __init__(self, pattern_manager: PatternManager, tracker: PatternUsageTracker):
+        self.pattern_manager = pattern_manager
+        self.tracker = tracker
     
-    def extract_entities(self, text: str, entity_type: str) -> List[Dict]:
-        """
-        Extract entities with pattern tracking
-        Returns: List of {value, pattern_id, pattern_name}
-        """
-        results = []
-        patterns = self.pattern_config.get_patterns_for_entity(entity_type)
+    def extract_field(self, text: str, field_name: str) -> Dict:
+        """Extract a field with pattern tracking"""
+        patterns = self.pattern_manager.get_patterns_for_field(field_name)
         
-        for pattern in patterns:
-            pattern_id = pattern['pattern_id']
-            pattern_name = pattern['pattern_name']
-            regex = pattern['regex']
+        result = {
+            'value': None,
+            'pattern_id': None,
+            'confidence': 0.0
+        }
+        
+        for pattern_entry in patterns:
+            pattern_id = pattern_entry.get('pattern_id', 'UNKNOWN')
+            pattern_regex = pattern_entry.get('pattern', '')
+            
+            if not pattern_regex:
+                continue
             
             # Record attempt
             self.tracker.record_attempt(pattern_id)
             
             try:
-                matches = re.findall(regex, text, re.IGNORECASE)
-                for match in matches:
-                    # Handle tuple matches (from groups)
-                    value = match if isinstance(match, str) else ' '.join(match)
-                    value = value.strip()
+                match = re.search(pattern_regex, text, re.IGNORECASE | re.MULTILINE)
+                if match:
+                    extracted_value = match.group(1) if match.lastindex else match.group(0)
+                    extracted_value = extracted_value.strip()
                     
-                    if value:
+                    if extracted_value:
                         # Record success
-                        self.tracker.record_success(pattern_id, value)
+                        self.tracker.record_match(pattern_id, extracted_value)
                         
-                        results.append({
-                            'value': value,
+                        # Return first match (highest priority)
+                        result = {
+                            'value': extracted_value,
                             'pattern_id': pattern_id,
-                            'pattern_name': pattern_name,
-                            'entity_type': entity_type
-                        })
-                        
-                        # Log extraction
-                        self.extraction_log.append({
-                            'timestamp': datetime.now().isoformat(),
-                            'pattern_id': pattern_id,
-                            'entity_type': entity_type,
-                            'value': value
-                        })
+                            'confidence': 1.0
+                        }
+                        break
             
             except re.error as e:
                 logger.error(f"Regex error in pattern {pattern_id}: {e}")
         
+        return result
+    
+    def extract_all_fields(self, text: str, field_names: List[str]) -> Dict:
+        """Extract multiple fields from text"""
+        results = {}
+        for field_name in field_names:
+            results[field_name] = self.extract_field(text, field_name)
         return results
-    
-    def extract_all_entities(self, text: str) -> Dict[str, List[Dict]]:
-        """Extract all entity types from text"""
-        entity_types = ['trade_id', 'amount', 'rate', 'tenor', 'date', 'counterparty']
-        
-        all_entities = {}
-        for entity_type in entity_types:
-            all_entities[entity_type] = self.extract_entities(text, entity_type)
-        
-        return all_entities
-    
-    def generate_run_summary(self) -> Dict:
-        """Generate summary for current extraction run"""
-        entity_counts = Counter([log['entity_type'] for log in self.extraction_log])
-        pattern_counts = Counter([log['pattern_id'] for log in self.extraction_log])
-        
-        return {
-            'run_timestamp': datetime.now().isoformat(),
-            'total_extractions': len(self.extraction_log),
-            'entities_by_type': dict(entity_counts),
-            'patterns_used': dict(pattern_counts),
-            'top_pattern': pattern_counts.most_common(1)[0] if pattern_counts else None
-        }
-    
-    def save_mi_report(self, output_path: str):
-        """Save MI report to Excel with multiple sheets"""
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            # Sheet 1: Pattern usage metrics
-            mi_df = self.tracker.generate_mi_report()
-            mi_df.to_excel(writer, sheet_name='Pattern Metrics', index=False)
-            
-            # Sheet 2: Current run extraction log
-            if self.extraction_log:
-                log_df = pd.DataFrame(self.extraction_log)
-                log_df.to_excel(writer, sheet_name='Extraction Log', index=False)
-            
-            # Sheet 3: Run summary
-            summary = self.generate_run_summary()
-            summary_df = pd.DataFrame([summary])
-            summary_df.to_excel(writer, sheet_name='Run Summary', index=False)
-            
-            # Sheet 4: Top patterns
-            top_patterns = self.tracker.get_top_patterns(20)
-            top_df = pd.DataFrame(top_patterns, columns=['Pattern ID', 'Success Count'])
-            top_df.to_excel(writer, sheet_name='Top Patterns', index=False)
-        
-        logger.info(f"MI report saved to {output_path}")
 
 
 # ============================================================================
-# 4. INTEGRATION WITH EMAIL EXTRACTION
+# 4. INTEGRATION WITH YOUR EXISTING TKINTER APP
 # ============================================================================
 
-def process_emails_with_tracking(emails: List[Dict], config_path: str = "pattern_config.json") -> pd.DataFrame:
-    """Process emails with pattern tracking and MI"""
+def integrate_with_existing_app(self):
+    """
+    Add this to your existing EmailEntityExtractor class
     
-    extractor = TrackedEntityExtractor(config_path)
-    results = []
-    
-    for email in emails:
-        text = email.get('body', '') + '\n' + email.get('subject', '')
-        
-        # Extract all entities
-        entities = extractor.extract_all_entities(text)
-        
-        # Flatten results
-        row = {
-            'email_date': email.get('date'),
-            'email_subject': email.get('subject'),
-            'trade_ids': ', '.join([e['value'] for e in entities.get('trade_id', [])]),
-            'trade_id_patterns': ', '.join(set([e['pattern_id'] for e in entities.get('trade_id', [])])),
-            'amounts': ', '.join([e['value'] for e in entities.get('amount', [])]),
-            'amount_patterns': ', '.join(set([e['pattern_id'] for e in entities.get('amount', [])])),
-            'rates': ', '.join([e['value'] for e in entities.get('rate', [])]),
-            'rate_patterns': ', '.join(set([e['pattern_id'] for e in entities.get('rate', [])])),
-            'counterparties': ', '.join([e['value'] for e in entities.get('counterparty', [])])
-        }
-        
-        results.append(row)
-    
-    # Save metrics
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    mi_report_path = f"pattern_mi_report_{timestamp}.xlsx"
-    extractor.save_mi_report(mi_report_path)
-    
-    # Save tracker metrics
-    extractor.tracker.save_metrics()
-    
-    return pd.DataFrame(results)
+    In your __init__ method, add:
+        self.pattern_manager = PatternManager("Pattern_Config.json")
+        self.usage_tracker = PatternUsageTracker()
+        self.tracked_extractor = TrackedEntityExtractor(self.pattern_manager, self.usage_tracker)
+    """
+    pass
 
-
-# ============================================================================
-# 5. EXAMPLE USAGE
-# ============================================================================
-
-def main():
-    """Demo: Pattern tracking and MI generation"""
+def extract_entities_with_tracking(self, email_body: str, email_subject: str) -> Dict:
+    """
+    Replace your existing entity extraction method with this
     
-    # Sample email data
-    sample_emails = [
-        {
-            'date': '2025-11-07',
-            'subject': 'Trade Confirmation',
-            'body': 'Trade ID: ABC12345. Amount: $100M USD. Rate: 3.75%. Tenor: 5-year. Client: XYZ Corp.'
-        },
-        {
-            'date': '2025-11-07',
-            'subject': 'Package Deal',
-            'body': 'Deal: PKG9876. Notional $50 million. LIBOR + 50bps. 10-year swap.'
-        }
+    Usage in your existing code:
+        extracted = self.extract_entities_with_tracking(email['body'], email['subject'])
+        trade_id = extracted['Trade_ID']['value']
+        pattern_used = extracted['Trade_ID']['pattern_id']
+    """
+    full_text = f"{email_subject}\n\n{email_body}"
+    
+    # Your existing field names from config
+    field_names = list(self.pattern_manager.patterns.keys())
+    
+    # Extract with tracking
+    results = self.tracked_extractor.extract_all_fields(full_text, field_names)
+    
+    return results
+
+def finish_extraction_with_mi(self):
+    """
+    Updated finish_extraction method with MI generation
+    Call this at the end of your extraction process
+    """
+    # Your existing extraction logic...
+    # [All your current email processing code]
+    
+    # After processing all emails, finalize tracking
+    run_date = datetime.now().strftime("%Y-%m-%d")
+    self.usage_tracker.finalize_run(run_date)
+    
+    # Generate MI report
+    mi_report_path = os.path.join(
+        self.out_path, 
+        f"Pattern_MI_Report_{run_date}.xlsx"
+    )
+    self.usage_tracker.generate_mi_report(mi_report_path)
+    
+    logger.info(f"MI Report generated: {mi_report_path}")
+    
+    # Display summary in your GUI (optional)
+    self.show_mi_summary()
+
+def show_mi_summary(self):
+    """Display MI summary in your existing entity_result_text widget"""
+    summary_lines = [
+        "="*60,
+        "PATTERN USAGE SUMMARY",
+        "="*60
     ]
     
-    # Process with tracking
-    results_df = process_emails_with_tracking(sample_emails)
+    # Top 5 patterns used
+    top_patterns = Counter()
+    for pattern_id, stats in self.usage_tracker.current_run_stats.items():
+        top_patterns[pattern_id] = stats['matches']
     
-    print("\n" + "="*80)
-    print("EXTRACTION RESULTS")
-    print("="*80)
-    print(results_df.to_string(index=False))
+    summary_lines.append("\nTop 5 Patterns Used:")
+    for pattern_id, count in top_patterns.most_common(5):
+        pattern_info = self.pattern_manager.pattern_id_map.get(pattern_id, {})
+        summary_lines.append(f"  {pattern_id}: {count} matches ({pattern_info.get('field', 'N/A')})")
     
-    print("\n" + "="*80)
-    print("MI REPORT GENERATED: pattern_mi_report_<timestamp>.xlsx")
-    print("="*80)
+    summary_lines.append("\n" + "="*60)
+    
+    summary_text = "\n".join(summary_lines)
+    
+    # Display in your existing text widget
+    self.entity_result_text.insert(tk.END, f"\n\n{summary_text}")
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================================
+# 5. UPDATED OUTPUT CSV FORMAT
+# ============================================================================
+
+def save_results_with_pattern_ids(self, results: List[Dict], output_csv: str):
+    """
+    Save extraction results with pattern IDs
+    Each row now includes which pattern was used
+    """
+    enhanced_results = []
+    
+    for result in results:
+        row = {
+            'Trade_ID': result.get('Trade_ID', {}).get('value', ''),
+            'Trade_ID_Pattern': result.get('Trade_ID', {}).get('pattern_id', ''),
+            'Counterparty': result.get('Counterparty', {}).get('value', ''),
+            'Counterparty_Pattern': result.get('Counterparty', {}).get('pattern_id', ''),
+            'Amount': result.get('Amount', {}).get('value', ''),
+            'Amount_Pattern': result.get('Amount', {}).get('pattern_id', ''),
+            # ... add all your fields with their pattern IDs
+        }
+        enhanced_results.append(row)
+    
+    df = pd.DataFrame(enhanced_results)
+    df.to_csv(output_csv, index=False)
+    logger.info(f"Results with pattern IDs saved to {output_csv}")
+
+
+# ============================================================================
+# 6. EXAMPLE: COMPLETE INTEGRATION IN YOUR EXISTING CLASS
+# ============================================================================
+
+class EmailEntityExtractor:
+    """Your existing class with added pattern tracking"""
+    
+    def __init__(self, root, dir_path, temp_path):
+        # Your existing init code...
+        self.root = root
+        self.dir_path = dir_path
+        self.temp_path = temp_path
+        
+        # NEW: Add pattern management and tracking
+        self.pattern_manager = PatternManager("Pattern_Config.json")
+        self.usage_tracker = PatternUsageTracker()
+        self.tracked_extractor = TrackedEntityExtractor(
+            self.pattern_manager, 
+            self.usage_tracker
+        )
+        
+        # Rest of your existing init...
+    
+    def extract_entities(self, email_body: str, email_subject: str) -> Dict:
+        """Your extraction method with tracking"""
+        full_text = f"{email_subject}\n\n{email_body}"
+        field_names = list(self.pattern_manager.patterns.keys())
+        results = self.tracked_extractor.extract_all_fields(full_text, field_names)
+        return results
+    
+    def finish_extraction(self):
+        """Your existing method with MI generation added"""
+        # ... your existing extraction logic ...
+        
+        # NEW: Finalize tracking and generate MI report
+        run_date = datetime.now().strftime("%Y-%m-%d")
+        self.usage_tracker.finalize_run(run_date)
+        
+        mi_report_path = os.path.join(
+            self.out_path,
+            f"Pattern_MI_Report_{run_date}.xlsx"
+        )
+        self.usage_tracker.generate_mi_report(mi_report_path)
+        
+        # Show summary in UI
+        self.show_mi_summary()
+        
+        messagebox.showinfo("Success", 
+            f"Extraction complete!\nMI Report: {mi_report_path}")

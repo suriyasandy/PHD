@@ -1,0 +1,77 @@
+OUTCOMES DELIVERED
+
+OMRC Email Harvester
+- Successfully delivered production-ready email extraction solution processing trade-related data from Outlook, eliminating manual copy-paste workflows and reducing audit preparation time by approximately 60-70%
+- Enabled business users across operations, compliance, and surveillance teams to retrieve structured trade information from both personal and shared mailboxes with point-and-click simplicity
+- Implemented repeatable, auditable extraction pipeline supporting multiple trade IDs per batch, ensuring regulatory compliance and data completeness
+
+OMRC Risk-Based Sampling Framework
+- Designed and implemented statistically robust, multi-dimensional risk-based sampling methodology replacing traditional random sampling, improving audit coverage from 32.5% to 95%+ of risk strata
+- Developed dynamic risk scoring engine calculating weights based on exception frequency across legal entities, products, regions, and reason codes—fully data-driven without hardcoded values
+- Created comprehensive business documentation and methodology guide for auditor review, demonstrating compliance with Basel III, MiFID II, and Dodd-Frank requirements
+
+GFX Trade Alert Dashboard
+- Built interactive threshold management dashboard enabling analysts to monitor and adjust alert thresholds dynamically across currencies, legal entities, and risk categories
+- Implemented pivot-style summary tables with interactive drilldown capabilities, allowing real-time trade count analysis by theme, date, and high-level code
+- Delivered session state management with confirmation workflow preventing accidental threshold changes and ensuring data integrity
+
+External Data Integration
+- Completed Reuters & Bloomberg API connectivity setup with OAuth 2.0 authentication, certificate-based access, and corporate proxy configuration
+- Implemented robust retry logic and error handling for enterprise SFTP/API data pipelines, ensuring 99%+ reliability
+- Validated data integrity including time series consistency, record counts, and compression quality for downstream analytics
+
+Cross-Team Collaboration
+- Provided technical consultation to internal automation team on Python-based solutions, facilitating integration between their tools and Python ecosystem
+- Shared expertise on Outlook MAPI/EWS integration, regex pattern validation, and structured data extraction methodologies
+- Contributed ML/NLP use case design for parsing complex email threads to extract trade details, fees, and approval workflows
+
+KEY LEARNINGS
+
+Technical Skills
+- Mastered Exchange Web Services (EWS) and MAPI protocols for programmatic mailbox access, learning to handle authentication challenges, folder enumeration, and batch processing to prevent COM object leaks
+- Developed deep understanding of statistical sampling methodologies including stratified sampling, risk weighting, confidence intervals, and audit coverage metrics—bridging theory and practical implementation
+- Enhanced Python optimization skills through performance tuning of large dataset operations, reducing sampling execution time from 45+ seconds to under 10 seconds via vectorization and efficient groupby operations
+- Learned advanced AgGrid customization for enterprise UI/UX requirements including dynamic column sizing, wrapped headers, serialization handling, and full-width display
+
+Domain Knowledge
+- Gained comprehensive understanding of OMRC (Off-Market Rate Check) processes across GBM cash bonds, equities, and IRD products, including exception workflows, escalation procedures, and regulatory requirements
+- Understood audit and compliance frameworks (Basel III, MiFID II, Dodd-Frank) and their implications on sampling methodology, documentation requirements, and auditability
+- Learned trade surveillance workflows including front-office and middle-office exception handling, shared mailbox management, and structured data requirements for downstream reconciliation
+
+Problem-Solving & Methodology
+- Developed systematic approach to identifying sampling bias in traditional random methods and designing data-driven alternatives that ensure representation across all risk dimensions
+- Learned to translate complex statistical concepts into business-friendly documentation and visual comparisons for stakeholder buy-in
+- Improved debugging methodology through systematic validation of intermediate calculations (base sample size, risk-adjusted size, final allocation) and edge case testing
+
+Collaboration & Communication
+- Enhanced ability to gather requirements from business users with varying technical backgrounds and translate them into functional specifications
+- Learned importance of creating comprehensive acceptance criteria and test scenarios upfront to prevent scope creep and rework
+- Developed skills in explaining technical trade-offs (e.g., statistical rigor vs. execution speed) to non-technical stakeholders
+
+WHAT COULD HAVE BEEN DONE BETTER
+
+Technical Implementation
+- Earlier performance optimization: Should have conducted load testing with production-scale data (60K+ records) during initial development rather than discovering bottlenecks post-delivery
+- More modular code architecture: Could have separated sampling logic, risk scoring, and UI components into distinct modules from the start, making testing and maintenance easier
+- Comprehensive error handling from day one: Added robust exception handling after encountering edge cases; should have implemented defensive programming practices earlier (e.g., divide-by-zero checks, empty dataset validation)
+- Better configuration management: Could have externalized more parameters (confidence levels, minimum sample sizes) to JSON config files earlier rather than hardcoding initial versions
+
+Documentation & Knowledge Transfer
+- Progressive documentation: Should have documented methodology decisions and mathematical formulas incrementally rather than creating comprehensive documentation at the end
+- Earlier stakeholder engagement: Could have shared interim methodology drafts with auditors sooner to gather feedback before full implementation
+- Video walkthroughs: Should have created screen-recorded demos for end users rather than relying solely on written user guides
+
+Testing & Validation
+- Unit test coverage: Should have written unit tests for core sampling algorithms and risk calculation functions to catch bugs like strata counting issues earlier
+- User acceptance testing: Could have conducted formal UAT sessions with actual business users before production deployment to identify usability issues
+- Edge case scenarios: Should have created comprehensive test dataset covering edge cases (single record strata, identical risk scores, missing values) from the start
+
+Collaboration & Communication
+- Regular progress updates: Could have provided more frequent status updates to stakeholders with visual progress indicators rather than waiting for milestone completion
+- Earlier cross-team sync: Should have initiated discussions with internal automation team sooner to understand their integration requirements and constraints
+- Proactive dependency management: Could have identified external dependencies (API access, mailbox permissions) earlier and escalated blockers sooner
+
+Process Improvements
+- Version control discipline: Should have maintained more granular commit history with descriptive messages documenting rationale for algorithm changes
+- Code review practice: Could have requested peer reviews on critical sampling logic to catch the strata counting bug earlier
+- Retrospective documentation: Should have maintained a lessons-learned log throughout development rather than relying on memory for this appraisal

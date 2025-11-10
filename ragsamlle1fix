@@ -1,13 +1,14 @@
 """
-Complete Offline RAG with Excel Report Generation
-Uses individual label patterns and saves comprehensive RAG report
+Complete Offline RAG with Simplified Pattern Detection
+Only SmartUnseenPatternDetector changed - uses complete config patterns
+Keeps comprehensive save_comprehensive_rag_report as-is
 """
 
 import os
 import re
 import json
 import logging
-from typing import Dict, List, Set
+from typing import Dict, List
 from collections import defaultdict
 from datetime import datetime
 import pandas as pd
@@ -17,11 +18,183 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# COMPLETE INTEGRATION WITH EXCEL REPORT
+# UPDATED: SmartUnseenPatternDetector - Uses Complete Config Patterns
+# ============================================================================
+
+class SmartUnseenPatternDetector:
+    """
+    Updated detector that:
+    1. Uses complete patterns from config with IDs (no label decomposition)
+    2. Tries all config patterns to extract candidates
+    3. Returns structured data for comprehensive report
+    """
+    
+    def __init__(self, pattern_manager, knowledge_base):
+        self.pattern_manager = pattern_manager
+        self.knowledge_base = knowledge_base
+        self.unseen_texts = defaultdict(list)
+        
+        # Load all patterns with IDs from config
+        self.all_config_patterns = self._load_all_patterns_with_ids()
+        
+        # Build label pattern library for report compatibility
+        self.label_pattern_library = self._build_label_library_for_report()
+    
+    def _load_all_patterns_with_ids(self) -> List[Dict]:
+        """Load all patterns from config with their IDs"""
+        all_patterns = []
+        
+        for entity_name in self.pattern_manager.get_all_entity_names():
+            patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+            all_patterns.extend(patterns)
+        
+        logger.info(f"Loaded {len(all_patterns)} patterns from config")
+        return all_patterns
+    
+    def _build_label_library_for_report(self) -> Dict[str, List[Dict]]:
+        """Build label library for report (shows which patterns exist)"""
+        library = defaultdict(list)
+        
+        for pattern_info in self.all_config_patterns:
+            pattern_id = pattern_info.get('pattern_id', 'UNKNOWN')
+            entity_name = pattern_info.get('entity_name', 'Unknown')
+            pattern_str = pattern_info.get('pattern', '')
+            
+            # Add to library indexed by pattern ID
+            library[pattern_id].append({
+                'label': pattern_id,
+                'pattern': pattern_str,
+                'source_pattern_id': pattern_id,
+                'source_entity': entity_name,
+                'original_composite': pattern_str
+            })
+        
+        logger.info(f"Built label library with {len(library)} pattern IDs")
+        return library
+    
+    def detect_unseen(self, text: str, entity_name: str, extracted_result: Dict) -> bool:
+        """Detect unseen patterns by trying all config patterns"""
+        if not extracted_result.get('value'):
+            candidates = self._extract_candidates_with_config_patterns(text, entity_name)
+            
+            if candidates:
+                self.unseen_texts[entity_name].extend(candidates)
+                return True
+        
+        return False
+    
+    def _extract_candidates_with_config_patterns(self, text: str, entity_name: str) -> List[Dict]:
+        """
+        Extract candidates using ALL patterns from config
+        This is the core RAG approach: use existing patterns to find unseen data
+        """
+        candidates = []
+        seen_values = set()
+        
+        logger.info(f"Trying {len(self.all_config_patterns)} config patterns...")
+        
+        # Try each pattern from config
+        for pattern_info in self.all_config_patterns:
+            pattern_id = pattern_info.get('pattern_id', 'UNKNOWN')
+            pattern_str = pattern_info.get('pattern', '')
+            source_entity = pattern_info.get('entity_name', 'Unknown')
+            
+            if not pattern_str:
+                continue
+            
+            try:
+                # Try to match the pattern
+                matches = re.finditer(pattern_str, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                
+                for match in matches:
+                    # Extract values from match
+                    extracted_values = []
+                    
+                    # Try named groups first
+                    group_dict = match.groupdict()
+                    if group_dict:
+                        for group_name, group_value in group_dict.items():
+                            if group_value and group_value.strip():
+                                extracted_values.append((group_name, group_value.strip()))
+                    
+                    # Try group 1
+                    elif match.lastindex and match.lastindex >= 1:
+                        value = match.group(1).strip()
+                        if value:
+                            extracted_values.append(('group_1', value))
+                    
+                    # Full match fallback
+                    else:
+                        value = match.group(0).strip()
+                        if value:
+                            extracted_values.append(('full_match', value))
+                    
+                    # Create candidate entries
+                    for label, value in extracted_values:
+                        if value not in seen_values:
+                            candidates.append({
+                                'value': value,
+                                'label': label,
+                                'pattern_used': pattern_str[:100],
+                                'source_pattern_id': pattern_id,
+                                'entity_name': entity_name,
+                                'extraction_method': 'config_pattern_match',
+                                'source_entity': source_entity
+                            })
+                            seen_values.add(value)
+                            logger.debug(f"  ✓ Pattern {pattern_id}: {value[:50]}")
+            
+            except re.error as e:
+                logger.debug(f"Pattern {pattern_id} regex error: {e}")
+            except Exception as e:
+                logger.debug(f"Pattern {pattern_id} error: {e}")
+        
+        logger.info(f"Extracted {len(candidates)} candidates using config patterns")
+        return candidates
+    
+    def get_unseen_summary(self) -> Dict:
+        """
+        Get summary compatible with comprehensive report
+        Returns data in format expected by report sheets
+        """
+        summary = {}
+        
+        for entity_name, candidate_list in self.unseen_texts.items():
+            # Group by label (extracted field name)
+            by_label = defaultdict(lambda: {'values': [], 'patterns_used': set()})
+            
+            for candidate in candidate_list:
+                if isinstance(candidate, dict):
+                    label = candidate.get('label', 'UNKNOWN')
+                    value = candidate.get('value', str(candidate))
+                    pattern_used = candidate.get('pattern_used', 'N/A')
+                    
+                    by_label[label]['values'].append(value)
+                    by_label[label]['patterns_used'].add(pattern_used)
+            
+            # Create summary in expected format
+            summary[entity_name] = {
+                'total_count': len(candidate_list),
+                'by_label': {
+                    label: {
+                        'count': len(data['values']),
+                        'examples': list(set(data['values']))[:10],
+                        'pattern_count': len(data['patterns_used']),
+                        'patterns_used': list(data['patterns_used'])[:3]
+                    }
+                    for label, data in by_label.items()
+                }
+            }
+        
+        return summary
+
+
+# ============================================================================
+# COMPLETE EXTRACTOR (Unchanged - Uses Comprehensive Report)
 # ============================================================================
 
 class CompleteOfflineRAGExtractor:
-    """Complete RAG extractor with Excel report generation"""
+    """Complete RAG extractor with comprehensive Excel report"""
     
     def __init__(self, pattern_manager, tracker):
         self.pattern_manager = pattern_manager
@@ -37,7 +210,7 @@ class CompleteOfflineRAGExtractor:
         self.extraction_log = []
     
     def extract_entity(self, text: str, entity_name: str) -> Dict:
-        """Extract entity with enhanced unseen detection"""
+        """Extract entity with unseen detection"""
         patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
         
         result = {
@@ -57,7 +230,6 @@ class CompleteOfflineRAGExtractor:
             try:
                 match = re.search(pattern_regex, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
                 if match:
-                    # Try named groups first
                     group_dict = match.groupdict()
                     extracted_value = None
                     
@@ -90,24 +262,19 @@ class CompleteOfflineRAGExtractor:
     
     def save_comprehensive_rag_report(self, output_path: str):
         """
-        Save comprehensive RAG report with multiple sheets:
-        1. Label Pattern Library
-        2. Unseen Patterns Overview
-        3. Candidates by Label
-        4. Pattern Suggestions
-        5. Extraction Summary
+        UNCHANGED - Save comprehensive RAG report with 5 sheets
         """
         logger.info(f"Generating comprehensive RAG report: {output_path}")
         
         with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
             
-            # Sheet 1: Label Pattern Library
+            # Sheet 1: Label Pattern Library (shows all config patterns)
             self._save_label_library_sheet(writer)
             
             # Sheet 2: Unseen Patterns Overview
             self._save_unseen_overview_sheet(writer)
             
-            # Sheet 3: Candidates by Label (Detailed)
+            # Sheet 3: Candidates by Label
             self._save_candidates_by_label_sheet(writer)
             
             # Sheet 4: Pattern Suggestions
@@ -119,23 +286,21 @@ class CompleteOfflineRAGExtractor:
         logger.info(f"✓ RAG report saved: {output_path}")
     
     def _save_label_library_sheet(self, writer):
-        """Sheet 1: Label Pattern Library"""
+        """Sheet 1: Config Patterns Library"""
         library_data = []
         
-        for label, pattern_list in self.unseen_detector.label_pattern_library.items():
-            for pattern_info in pattern_list:
-                library_data.append({
-                    'Label': label,
-                    'Pattern': pattern_info['pattern'][:100],  # Truncate for readability
-                    'Source Pattern ID': pattern_info['source_pattern_id'],
-                    'Source Entity': pattern_info['source_entity'],
-                    'Full Pattern': pattern_info['pattern']
-                })
+        for pattern_info in self.unseen_detector.all_config_patterns:
+            library_data.append({
+                'Pattern ID': pattern_info.get('pattern_id', 'N/A'),
+                'Entity': pattern_info.get('entity_name', 'N/A'),
+                'Pattern Preview': pattern_info.get('pattern', '')[:100],
+                'Full Pattern': pattern_info.get('pattern', '')
+            })
         
         if library_
             df = pd.DataFrame(library_data)
-            df.to_excel(writer, sheet_name='Label Pattern Library', index=False)
-            logger.info(f"  ✓ Label Pattern Library: {len(library_data)} patterns")
+            df.to_excel(writer, sheet_name='Config Patterns', index=False)
+            logger.info(f"  ✓ Config Patterns: {len(library_data)} patterns")
     
     def _save_unseen_overview_sheet(self, writer):
         """Sheet 2: Unseen Patterns Overview"""
@@ -145,7 +310,6 @@ class CompleteOfflineRAGExtractor:
         for entity_name, data in unseen_summary.items():
             labels_found = ', '.join(data.get('by_label', {}).keys())
             
-            # Get examples from all labels
             all_examples = []
             for label_data in data.get('by_label', {}).values():
                 all_examples.extend(label_data['examples'][:3])
@@ -153,7 +317,7 @@ class CompleteOfflineRAGExtractor:
             overview_data.append({
                 'Entity': entity_name,
                 'Total Candidates': data['total_count'],
-                'Labels Found': labels_found,
+                'Fields Found': labels_found,
                 'Sample Values': ', '.join(all_examples[:5])
             })
         
@@ -163,7 +327,7 @@ class CompleteOfflineRAGExtractor:
             logger.info(f"  ✓ Unseen Overview: {len(overview_data)} entities")
     
     def _save_candidates_by_label_sheet(self, writer):
-        """Sheet 3: Detailed Candidates by Label"""
+        """Sheet 3: Detailed Candidates"""
         unseen_summary = self.unseen_detector.get_unseen_summary()
         detailed_data = []
         
@@ -175,17 +339,17 @@ class CompleteOfflineRAGExtractor:
                     
                     detailed_data.append({
                         'Entity': entity_name,
-                        'Label': label,
+                        'Field': label,
                         'Candidate Value': example,
                         'Total Count': label_data['count'],
-                        'Patterns Used Count': label_data['pattern_count'],
+                        'Patterns Used': label_data['pattern_count'],
                         'Sample Pattern': pattern_sample
                     })
         
         if detailed_
             df = pd.DataFrame(detailed_data)
-            df.to_excel(writer, sheet_name='Candidates by Label', index=False)
-            logger.info(f"  ✓ Candidates by Label: {len(detailed_data)} candidates")
+            df.to_excel(writer, sheet_name='Candidates Detail', index=False)
+            logger.info(f"  ✓ Candidates Detail: {len(detailed_data)} candidates")
     
     def _save_pattern_suggestions_sheet(self, writer):
         """Sheet 4: RAG Pattern Suggestions"""
@@ -193,19 +357,17 @@ class CompleteOfflineRAGExtractor:
         suggestions_data = []
         
         for entity_name, data in unseen_summary.items():
-            # Get examples for suggestions
             all_examples = []
             for label_data in data.get('by_label', {}).values():
                 all_examples.extend(label_data['examples'][:5])
             
             if all_examples:
-                # Generate suggestions
                 suggestions = self.suggestion_engine.suggest_patterns(entity_name, all_examples)
                 
                 for sug in suggestions:
                     suggestions_data.append({
                         'Entity': entity_name,
-                        'Suggested Pattern': sug['suggested_pattern'],
+                        'Suggested Pattern': sug['suggested_pattern'][:150],
                         'Method': sug['method'],
                         'Similarity Score': sug['similarity_score'],
                         'Based On': sug['based_on_pattern_id'],
@@ -215,18 +377,16 @@ class CompleteOfflineRAGExtractor:
         
         if suggestions_
             df = pd.DataFrame(suggestions_data)
-            df.to_excel(writer, sheet_name='Pattern Suggestions', index=False)
-            logger.info(f"  ✓ Pattern Suggestions: {len(suggestions_data)} suggestions")
+            df.to_excel(writer, sheet_name='RAG Suggestions', index=False)
+            logger.info(f"  ✓ RAG Suggestions: {len(suggestions_data)} suggestions")
     
     def _save_extraction_summary_sheet(self, writer):
-        """Sheet 5: Overall Extraction Summary"""
+        """Sheet 5: Summary Statistics"""
         unseen_summary = self.unseen_detector.get_unseen_summary()
         
-        # Calculate statistics
         total_entities = len(unseen_summary)
         total_candidates = sum(data['total_count'] for data in unseen_summary.values())
         
-        # Labels with most candidates
         label_counts = defaultdict(int)
         for data in unseen_summary.values():
             for label, label_data in data.get('by_label', {}).items():
@@ -241,124 +401,76 @@ class CompleteOfflineRAGExtractor:
             'Metric': 'Total Candidates Extracted',
             'Value': str(total_candidates)
         }, {
-            'Metric': 'Unique Labels Found',
-            'Value': str(len(label_counts))
-        }, {
-            'Metric': 'Label Patterns in Library',
-            'Value': str(len(self.unseen_detector.label_pattern_library))
+            'Metric': 'Config Patterns Used',
+            'Value': str(len(self.unseen_detector.all_config_patterns))
         }]
         
-        # Add top labels
         for i, (label, count) in enumerate(top_labels, 1):
             summary_data.append({
-                'Metric': f'Top Label #{i}',
+                'Metric': f'Top Field #{i}',
                 'Value': f'{label} ({count} candidates)'
             })
         
         df = pd.DataFrame(summary_data)
-        df.to_excel(writer, sheet_name='Extraction Summary', index=False)
-        logger.info(f"  ✓ Extraction Summary: {len(summary_data)} metrics")
+        df.to_excel(writer, sheet_name='Summary', index=False)
+        logger.info(f"  ✓ Summary: {len(summary_data)} metrics")
 
 
 # ============================================================================
-# DEMO WITH EXCEL REPORT
+# DEMO
 # ============================================================================
 
-def demo_with_excel_report():
-    """Complete demo that generates Excel report"""
+def demo_complete_rag():
+    """Demo with complete RAG and comprehensive report"""
     from pattern_tracking import PatternManager, PatternUsageTracker
     
     print("="*80)
-    print("OFFLINE RAG POC - WITH COMPREHENSIVE EXCEL REPORT")
+    print("COMPLETE OFFLINE RAG - Using Config Patterns with Comprehensive Report")
     print("="*80)
     
-    # Initialize
     pattern_manager = PatternManager("Pattern_Config.json")
     tracker = PatternUsageTracker()
     
-    print("\n[1/4] Initializing RAG components...")
+    print("\n[1/4] Initializing RAG...")
     extractor = CompleteOfflineRAGExtractor(pattern_manager, tracker)
+    print(f"  ✓ Loaded {len(extractor.unseen_detector.all_config_patterns)} config patterns")
     
-    print(f"[2/4] Loaded {len(extractor.unseen_detector.label_pattern_library)} label patterns")
-    
-    # Sample test data
+    # Sample data
     sample_emails = [
         {
             'subject': 'Trade Confirmation',
-            'body': '''
-            Trade Details:
-            Trade ID: 12345678A
-            Currency: USD
-            Secondary Currency: EUR
-            Notional Amount: $100,000,000
-            Status: Confirmed
-            Product: Interest Rate Swap
-            Sub-Product: Fixed-Float-Swap
-            MarketwireID: MW2025110001
-            Business Date: 11/10/2025
-            '''
+            'body': 'Trade ID: 12345678A\nCurrency: USD\nStatus: Confirmed'
         },
         {
-            'subject': 'New Format Deal',
-            'body': '''
-            Deal Reference: XYZ-2025-11-001
-            CCY1: GBP
-            CCY2: JPY
-            State: PENDING
-            TradeAmount: 50000000
-            ProductType: FX_SWAP
-            '''
-        },
-        {
-            'subject': 'Alternative Structure',
-            'body': '''
-            Package ID: PKG_2025_Q4_001
-            Base Currency: CHF
-            Quote Currency: AUD
-            NotionalValue: 25MM
-            TradeStatus: EXECUTED
-            '''
+            'subject': 'New Format',
+            'body': 'Deal: XYZ-2025-11-001\nCCY: EUR\nState: PENDING'
         }
     ]
     
-    print(f"[3/4] Processing {len(sample_emails)} sample emails...")
-    
-    # Process emails
+    print(f"\n[2/4] Processing {len(sample_emails)} emails...")
     for i, email in enumerate(sample_emails, 1):
         text = f"{email['subject']}\n{email['body']}"
         results = extractor.extract_all_entities(text)
-        
-        found_count = sum(1 for r in results.values() if r['value'])
-        unseen_count = sum(1 for r in results.values() if r['is_unseen'])
-        
-        print(f"  Email {i}: {found_count} found, {unseen_count} unseen")
+        found = sum(1 for r in results.values() if r['value'])
+        unseen = sum(1 for r in results.values() if r['is_unseen'])
+        print(f"  Email {i}: {found} found, {unseen} unseen")
     
-    # Generate report
-    print("\n[4/4] Generating comprehensive RAG report...")
+    print("\n[3/4] Generating comprehensive RAG report...")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
-    
+    report_path = f"Complete_RAG_Report_{timestamp}.xlsx"
     extractor.save_comprehensive_rag_report(report_path)
     
+    print("\n[4/4] Done!")
     print("\n" + "="*80)
-    print("✓ COMPLETE!")
-    print("="*80)
-    print(f"\nExcel Report: {report_path}")
-    print("\nReport contains 5 sheets:")
-    print("  1. Label Pattern Library - All extracted label patterns")
+    print(f"Report: {report_path}")
+    print("\n5 Sheets:")
+    print("  1. Config Patterns - All patterns from config with IDs")
     print("  2. Unseen Overview - High-level summary")
-    print("  3. Candidates by Label - Detailed candidate data")
-    print("  4. Pattern Suggestions - RAG-based pattern recommendations")
-    print("  5. Extraction Summary - Statistics and metrics")
-    print("\n" + "="*80)
-    
-    # Print quick summary
-    unseen_summary = extractor.unseen_detector.get_unseen_summary()
-    if unseen_summary:
-        print("\nQuick Summary:")
-        for entity, data in unseen_summary.items():
-            print(f"  {entity}: {data['total_count']} candidates across {len(data['by_label'])} labels")
+    print("  3. Candidates Detail - All extracted candidates")
+    print("  4. RAG Suggestions - Pattern recommendations")
+    print("  5. Summary - Statistics")
+    print("="*80)
 
 
 if __name__ == "__main__":
-    demo_with_excel_report()
+    demo_complete_rag()

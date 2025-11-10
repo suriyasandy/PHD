@@ -1,0 +1,488 @@
+"""
+RAG-Based Pattern Discovery for Email Entity Extraction
+Uses existing pattern knowledge base to identify unseen patterns
+and suggest new regex patterns automatically
+"""
+
+import os
+import re
+import json
+import logging
+from datetime import datetime
+from typing import Dict, List, Tuple, Optional
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+
+# RAG components
+from sentence_transformers import SentenceTransformer
+import faiss
+from transformers import pipeline
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 1. PATTERN KNOWLEDGE BASE (Vector Store)
+# ============================================================================
+
+class PatternKnowledgeBase:
+    """Vector store for existing patterns with semantic search"""
+    
+    def __init__(self, pattern_config_path: str = "Pattern_Config.json"):
+        self.pattern_config_path = pattern_config_path
+        self.patterns = []
+        self.pattern_embeddings = []
+        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+        self.index = None
+        
+        self.load_patterns()
+        self.build_vector_index()
+    
+    def load_patterns(self):
+        """Load patterns from config"""
+        with open(self.pattern_config_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        
+        entities = config_data.get('entities', [])
+        
+        for entity in entities:
+            entity_name = entity.get('name', 'Unknown')
+            entity_patterns = entity.get('patterns', [])
+            
+            for idx, pattern_str in enumerate(entity_patterns):
+                # Create searchable pattern description
+                pattern_description = self._pattern_to_description(pattern_str, entity_name)
+                
+                self.patterns.append({
+                    'entity_name': entity_name,
+                    'pattern': pattern_str,
+                    'description': pattern_description,
+                    'pattern_id': f"{entity_name}_{idx+1}"
+                })
+        
+        logger.info(f"Loaded {len(self.patterns)} patterns into knowledge base")
+    
+    def _pattern_to_description(self, pattern: str, entity_name: str) -> str:
+        """Convert regex pattern to human-readable description"""
+        # Extract key components
+        description_parts = [f"Entity: {entity_name}"]
+        
+        # Detect common pattern elements
+        if r'\d' in pattern:
+            description_parts.append("contains digits")
+        if r'[A-Z]' in pattern or r'[a-z]' in pattern:
+            description_parts.append("contains letters")
+        if r'\w+' in pattern:
+            description_parts.append("word characters")
+        if re.search(r'\\s\+|\s\*', pattern):
+            description_parts.append("with spaces")
+        if '(?P<' in pattern:
+            # Named groups
+            named_groups = re.findall(r'\(\?P<(\w+)>', pattern)
+            description_parts.append(f"extracts: {', '.join(named_groups)}")
+        
+        # Pattern length indicator
+        if len(pattern) > 100:
+            description_parts.append("complex pattern")
+        else:
+            description_parts.append("simple pattern")
+        
+        return " | ".join(description_parts)
+    
+    def build_vector_index(self):
+        """Build FAISS index for semantic search"""
+        # Generate embeddings
+        descriptions = [p['description'] for p in self.patterns]
+        self.pattern_embeddings = self.embedding_model.encode(descriptions)
+        
+        # Build FAISS index
+        dimension = self.pattern_embeddings.shape[1]
+        self.index = faiss.IndexFlatL2(dimension)
+        self.index.add(self.pattern_embeddings.astype('float32'))
+        
+        logger.info(f"Built vector index with {len(self.patterns)} patterns")
+    
+    def search_similar_patterns(self, query_text: str, top_k: int = 5) -> List[Dict]:
+        """Find similar patterns for a given text"""
+        # Encode query
+        query_embedding = self.embedding_model.encode([query_text])
+        
+        # Search
+        distances, indices = self.index.search(query_embedding.astype('float32'), top_k)
+        
+        # Return results
+        results = []
+        for idx, distance in zip(indices[0], distances[0]):
+            if idx < len(self.patterns):
+                pattern_info = self.patterns[idx].copy()
+                pattern_info['similarity_score'] = float(1 / (1 + distance))  # Convert distance to similarity
+                results.append(pattern_info)
+        
+        return results
+
+
+# ============================================================================
+# 2. UNSEEN PATTERN DETECTOR
+# ============================================================================
+
+class UnseenPatternDetector:
+    """Detect texts that don't match existing patterns"""
+    
+    def __init__(self, pattern_manager, knowledge_base: PatternKnowledgeBase):
+        self.pattern_manager = pattern_manager
+        self.knowledge_base = knowledge_base
+        self.unseen_texts = defaultdict(list)
+    
+    def detect_unseen(self, text: str, entity_name: str, extracted_result: Dict) -> bool:
+        """Check if text contains unseen pattern for entity"""
+        # If extraction failed, it's unseen
+        if not extracted_result.get('value'):
+            # Extract potential entity candidates from text
+            candidates = self._extract_candidates(text, entity_name)
+            if candidates:
+                self.unseen_texts[entity_name].extend(candidates)
+                return True
+        
+        return False
+    
+    def _extract_candidates(self, text: str, entity_name: str) -> List[str]:
+        """Extract potential entity values that don't match existing patterns"""
+        candidates = []
+        
+        # Generic patterns to find potential entities
+        generic_patterns = {
+            'TradeID': r'\b[A-Z0-9]{6,12}\b',
+            'Currency': r'\b[A-Z]{3}\b',
+            'Date': r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b',
+            'Amount': r'\$?\d+(?:,\d{3})*(?:\.\d{2})?',
+            'Status': r'\b(?:Confirmed|Pending|Rejected|Approved)\b'
+        }
+        
+        # Use entity-specific or fallback to generic
+        pattern = generic_patterns.get(entity_name.split('Details')[0], r'\b\w{3,20}\b')
+        
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        candidates.extend(matches[:5])  # Limit candidates
+        
+        return candidates
+    
+    def get_unseen_summary(self) -> Dict:
+        """Get summary of unseen patterns"""
+        summary = {}
+        for entity_name, texts in self.unseen_texts.items():
+            summary[entity_name] = {
+                'count': len(texts),
+                'examples': list(set(texts))[:10]  # Top 10 unique examples
+            }
+        return summary
+
+
+# ============================================================================
+# 3. PATTERN SUGGESTION ENGINE (RAG)
+# ============================================================================
+
+class PatternSuggestionEngine:
+    """RAG-based system to suggest new patterns"""
+    
+    def __init__(self, knowledge_base: PatternKnowledgeBase):
+        self.knowledge_base = knowledge_base
+        # Use a code generation model for regex suggestions
+        self.llm_pipeline = pipeline(
+            "text-generation",
+            model="Salesforce/codegen-350M-mono",  # Lightweight code model
+            max_length=200,
+            device=-1  # CPU
+        )
+    
+    def suggest_patterns(self, entity_name: str, unseen_examples: List[str]) -> List[Dict]:
+        """Suggest new regex patterns based on unseen examples"""
+        suggestions = []
+        
+        # Get similar existing patterns from knowledge base
+        query = f"Entity: {entity_name}, examples: {', '.join(unseen_examples[:3])}"
+        similar_patterns = self.knowledge_base.search_similar_patterns(query, top_k=3)
+        
+        # Analyze unseen examples
+        pattern_analysis = self._analyze_examples(unseen_examples)
+        
+        # Generate pattern suggestions
+        for similar in similar_patterns:
+            # Adapt existing pattern
+            adapted_pattern = self._adapt_pattern(
+                similar['pattern'],
+                pattern_analysis,
+                entity_name
+            )
+            
+            suggestions.append({
+                'suggested_pattern': adapted_pattern,
+                'based_on_pattern_id': similar['pattern_id'],
+                'similarity_score': similar['similarity_score'],
+                'reasoning': f"Adapted from {similar['entity_name']} pattern",
+                'test_examples': unseen_examples[:5]
+            })
+        
+        # Generate new pattern from scratch using LLM (optional)
+        llm_pattern = self._generate_llm_pattern(entity_name, unseen_examples)
+        if llm_pattern:
+            suggestions.append({
+                'suggested_pattern': llm_pattern,
+                'based_on_pattern_id': 'LLM_GENERATED',
+                'similarity_score': 0.5,
+                'reasoning': 'Generated by LLM from examples',
+                'test_examples': unseen_examples[:5]
+            })
+        
+        return suggestions
+    
+    def _analyze_examples(self, examples: List[str]) -> Dict:
+        """Analyze common characteristics of examples"""
+        analysis = {
+            'min_length': min(len(e) for e in examples) if examples else 0,
+            'max_length': max(len(e) for e in examples) if examples else 0,
+            'has_digits': any(re.search(r'\d', e) for e in examples),
+            'has_letters': any(re.search(r'[a-zA-Z]', e) for e in examples),
+            'has_special_chars': any(re.search(r'[^a-zA-Z0-9\s]', e) for e in examples),
+            'common_prefix': os.path.commonprefix(examples) if len(examples) > 1 else '',
+            'common_suffix': os.path.commonprefix([e[::-1] for e in examples])[::-1] if len(examples) > 1 else ''
+        }
+        return analysis
+    
+    def _adapt_pattern(self, base_pattern: str, analysis: Dict, entity_name: str) -> str:
+        """Adapt existing pattern based on analysis"""
+        # Simple adaptation logic
+        adapted = base_pattern
+        
+        # Adjust length constraints
+        if 'min_length' in analysis and 'max_length' in analysis:
+            # Replace generic length quantifiers
+            adapted = re.sub(r'\{\d+,\d+\}', f"{{{analysis['min_length']},{analysis['max_length']}}}", adapted)
+        
+        # Add common prefix/suffix if present
+        if analysis.get('common_prefix'):
+            adapted = f"(?:{re.escape(analysis['common_prefix'])})?" + adapted
+        
+        return adapted
+    
+    def _generate_llm_pattern(self, entity_name: str, examples: List[str]) -> Optional[str]:
+        """Generate regex pattern using LLM (simplified for demo)"""
+        # In production, use GPT-4 or similar with proper prompting
+        # For now, generate basic pattern from examples
+        
+        if not examples:
+            return None
+        
+        # Simple heuristic-based generation
+        example = examples[0]
+        
+        pattern_parts = []
+        for char in example:
+            if char.isdigit():
+                pattern_parts.append(r'\d')
+            elif char.isalpha():
+                if char.isupper():
+                    pattern_parts.append(r'[A-Z]')
+                else:
+                    pattern_parts.append(r'[a-z]')
+            elif char.isspace():
+                pattern_parts.append(r'\s')
+            else:
+                pattern_parts.append(re.escape(char))
+        
+        # Generalize repeating patterns
+        pattern = ''.join(pattern_parts)
+        pattern = re.sub(r'(\\d)+', r'\\d+', pattern)
+        pattern = re.sub(r'(\[A-Z\])+', r'[A-Z]+', pattern)
+        pattern = re.sub(r'(\[a-z\])+', r'[a-z]+', pattern)
+        
+        return f"({pattern})"
+
+
+# ============================================================================
+# 4. ENHANCED EXTRACTOR WITH RAG
+# ============================================================================
+
+class RAGEnhancedExtractor:
+    """Entity extractor with RAG-based pattern learning"""
+    
+    def __init__(self, pattern_manager, tracker):
+        self.pattern_manager = pattern_manager
+        self.tracker = tracker
+        
+        # Initialize RAG components
+        self.knowledge_base = PatternKnowledgeBase(pattern_manager.config_file)
+        self.unseen_detector = UnseenPatternDetector(pattern_manager, self.knowledge_base)
+        self.suggestion_engine = PatternSuggestionEngine(self.knowledge_base)
+        
+        # Track extraction attempts
+        self.extraction_log = []
+    
+    def extract_entity(self, text: str, entity_name: str) -> Dict:
+        """Extract entity with unseen pattern detection"""
+        # Try existing patterns first
+        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        
+        result = {
+            'value': None,
+            'pattern_id': None,
+            'entity_name': entity_name,
+            'confidence': 0.0,
+            'is_unseen': False
+        }
+        
+        for pattern_entry in patterns:
+            pattern_id = pattern_entry['pattern_id']
+            pattern_regex = pattern_entry['pattern']
+            
+            self.tracker.record_attempt(pattern_id)
+            
+            try:
+                match = re.search(pattern_regex, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                if match:
+                    extracted_value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                    extracted_value = extracted_value.strip()
+                    
+                    if extracted_value:
+                        self.tracker.record_match(pattern_id, extracted_value)
+                        result = {
+                            'value': extracted_value,
+                            'pattern_id': pattern_id,
+                            'entity_name': entity_name,
+                            'confidence': 1.0,
+                            'is_unseen': False
+                        }
+                        break
+            
+            except Exception as e:
+                logger.error(f"Error with pattern {pattern_id}: {e}")
+        
+        # Detect unseen patterns
+        if not result['value']:
+            is_unseen = self.unseen_detector.detect_unseen(text, entity_name, result)
+            result['is_unseen'] = is_unseen
+        
+        # Log extraction
+        self.extraction_log.append({
+            'timestamp': datetime.now().isoformat(),
+            'entity_name': entity_name,
+            'found': bool(result['value']),
+            'is_unseen': result.get('is_unseen', False)
+        })
+        
+        return result
+    
+    def extract_all_entities(self, text: str) -> Dict[str, Dict]:
+        """Extract all entities"""
+        entity_names = self.pattern_manager.get_all_entity_names()
+        results = {}
+        
+        for entity_name in entity_names:
+            results[entity_name] = self.extract_entity(text, entity_name)
+        
+        return results
+    
+    def generate_pattern_suggestions(self) -> pd.DataFrame:
+        """Generate suggestions for all unseen patterns"""
+        unseen_summary = self.unseen_detector.get_unseen_summary()
+        
+        all_suggestions = []
+        
+        for entity_name, unseen_data in unseen_summary.items():
+            examples = unseen_data['examples']
+            suggestions = self.suggestion_engine.suggest_patterns(entity_name, examples)
+            
+            for suggestion in suggestions:
+                all_suggestions.append({
+                    'Entity Name': entity_name,
+                    'Unseen Count': unseen_data['count'],
+                    'Suggested Pattern': suggestion['suggested_pattern'],
+                    'Based On': suggestion['based_on_pattern_id'],
+                    'Similarity Score': suggestion['similarity_score'],
+                    'Reasoning': suggestion['reasoning'],
+                    'Test Examples': ', '.join(suggestion['test_examples'][:3])
+                })
+        
+        df = pd.DataFrame(all_suggestions)
+        return df
+    
+    def save_rag_report(self, output_path: str):
+        """Save RAG insights and suggestions"""
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            # Unseen patterns summary
+            unseen_summary = self.unseen_detector.get_unseen_summary()
+            unseen_data = []
+            for entity_name, data in unseen_summary.items():
+                unseen_data.append({
+                    'Entity Name': entity_name,
+                    'Unseen Count': data['count'],
+                    'Examples': ', '.join(data['examples'][:5])
+                })
+            
+            if unseen_data:
+                unseen_df = pd.DataFrame(unseen_data)
+                unseen_df.to_excel(writer, sheet_name='Unseen Patterns', index=False)
+            
+            # Pattern suggestions
+            suggestions_df = self.generate_pattern_suggestions()
+            if not suggestions_df.empty:
+                suggestions_df.to_excel(writer, sheet_name='Pattern Suggestions', index=False)
+            
+            # Extraction log
+            log_df = pd.DataFrame(self.extraction_log)
+            if not log_df.empty:
+                log_df.to_excel(writer, sheet_name='Extraction Log', index=False)
+        
+        logger.info(f"RAG report saved to {output_path}")
+
+
+# ============================================================================
+# 5. INTEGRATION EXAMPLE
+# ============================================================================
+
+def demo_rag_extraction():
+    """Demo RAG-based extraction"""
+    from pattern_tracking import PatternManager, PatternUsageTracker
+    
+    # Initialize
+    pattern_manager = PatternManager("Pattern_Config.json")
+    tracker = PatternUsageTracker()
+    rag_extractor = RAGEnhancedExtractor(pattern_manager, tracker)
+    
+    # Sample emails with some unseen patterns
+    sample_emails = [
+        {
+            'subject': 'Trade Confirmation',
+            'body': 'Trade ID: ABC12345\nCurrency: USD\nStatus: Confirmed'
+        },
+        {
+            'subject': 'New Format',
+            'body': 'Deal Reference: XYZ-2025-11-001\nCCY: EUR\nState: PENDING'  # Unseen formats
+        }
+    ]
+    
+    # Extract
+    for email in sample_emails:
+        text = f"{email['subject']}\n{email['body']}"
+        results = rag_extractor.extract_all_entities(text)
+        
+        print("\n" + "="*80)
+        print(f"Email: {email['subject']}")
+        print("="*80)
+        for entity_name, result in results.items():
+            status = "✓ FOUND" if result['value'] else "✗ NOT FOUND"
+            unseen = " [UNSEEN PATTERN]" if result.get('is_unseen') else ""
+            print(f"{entity_name:20s}: {result.get('value', 'N/A'):30s} {status}{unseen}")
+    
+    # Generate and save RAG report
+    rag_extractor.save_rag_report("RAG_Pattern_Report.xlsx")
+    
+    print("\n" + "="*80)
+    print("RAG Report generated: RAG_Pattern_Report.xlsx")
+    print("Check 'Pattern Suggestions' sheet for new pattern recommendations!")
+    print("="*80)
+
+
+if __name__ == "__main__":
+    demo_rag_extraction()

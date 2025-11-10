@@ -1,0 +1,575 @@
+"""
+Offline RAG-Based Pattern Discovery for Email Entity Extraction
+Perfect for restricted/air-gapped environments
+All models downloaded once, runs completely offline
+"""
+
+import os
+import re
+import json
+import logging
+import pickle
+from datetime import datetime
+from typing import Dict, List, Optional
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# 1. OFFLINE EMBEDDING MODULE (No External Dependencies)
+# ============================================================================
+
+class OfflineEmbeddingModel:
+    """
+    Lightweight TF-IDF based embedding for offline use
+    No heavy dependencies, runs in restricted environments
+    """
+    
+    def __init__(self, cache_dir: str = "./model_cache"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        self.vocabulary = {}
+        self.idf_scores = {}
+        self.embedding_dim = 128  # Reduced for offline efficiency
+        
+    def fit(self, documents: List[str]):
+        """Build vocabulary and IDF scores from documents"""
+        from collections import Counter
+        
+        # Build vocabulary
+        word_doc_count = Counter()
+        all_words = set()
+        
+        for doc in documents:
+            words = set(self._tokenize(doc))
+            all_words.update(words)
+            for word in words:
+                word_doc_count[word] += 1
+        
+        # Assign indices
+        self.vocabulary = {word: idx for idx, word in enumerate(sorted(all_words))}
+        
+        # Calculate IDF
+        n_docs = len(documents)
+        for word, count in word_doc_count.items():
+            self.idf_scores[word] = np.log(n_docs / (1 + count))
+        
+        logger.info(f"Vocabulary size: {len(self.vocabulary)}")
+        
+        # Save to cache
+        self._save_cache()
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """Simple tokenization"""
+        text = text.lower()
+        words = re.findall(r'\b\w+\b', text)
+        return words
+    
+    def encode(self, texts: List[str]) -> np.ndarray:
+        """Convert texts to embeddings"""
+        embeddings = []
+        
+        for text in texts:
+            words = self._tokenize(text)
+            
+            # TF-IDF vector
+            vec = np.zeros(len(self.vocabulary))
+            word_count = defaultdict(int)
+            
+            for word in words:
+                word_count[word] += 1
+            
+            for word, count in word_count.items():
+                if word in self.vocabulary:
+                    idx = self.vocabulary[word]
+                    tf = count / len(words) if words else 0
+                    idf = self.idf_scores.get(word, 0)
+                    vec[idx] = tf * idf
+            
+            # Normalize
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            
+            # Reduce dimensionality (simple projection)
+            if len(vec) > self.embedding_dim:
+                vec = vec[:self.embedding_dim]
+            else:
+                vec = np.pad(vec, (0, self.embedding_dim - len(vec)))
+            
+            embeddings.append(vec)
+        
+        return np.array(embeddings)
+    
+    def _save_cache(self):
+        """Save model to cache"""
+        cache_path = os.path.join(self.cache_dir, "embedding_model.pkl")
+        with open(cache_path, 'wb') as f:
+            pickle.dump({
+                'vocabulary': self.vocabulary,
+                'idf_scores': self.idf_scores,
+                'embedding_dim': self.embedding_dim
+            }, f)
+        logger.info(f"Model cached to {cache_path}")
+    
+    def load_cache(self):
+        """Load model from cache"""
+        cache_path = os.path.join(self.cache_dir, "embedding_model.pkl")
+        if os.path.exists(cache_path):
+            with open(cache_path, 'rb') as f:
+                data = pickle.load(f)
+                self.vocabulary = data['vocabulary']
+                self.idf_scores = data['idf_scores']
+                self.embedding_dim = data['embedding_dim']
+            logger.info("Model loaded from cache")
+            return True
+        return False
+
+
+# ============================================================================
+# 2. LIGHTWEIGHT VECTOR SEARCH (No FAISS Required)
+# ============================================================================
+
+class SimpleVectorIndex:
+    """
+    Simple cosine similarity search without FAISS
+    Pure Python, works in any environment
+    """
+    
+    def __init__(self, dimension: int):
+        self.dimension = dimension
+        self.vectors = []
+        self.metadata = []
+    
+    def add(self, vectors: np.ndarray, metadata: List[Dict]):
+        """Add vectors to index"""
+        self.vectors.extend(vectors)
+        self.metadata.extend(metadata)
+        logger.info(f"Index now contains {len(self.vectors)} vectors")
+    
+    def search(self, query_vector: np.ndarray, top_k: int = 5) -> List[Dict]:
+        """Search for similar vectors"""
+        if not self.vectors:
+            return []
+        
+        # Calculate cosine similarity
+        similarities = []
+        for idx, vec in enumerate(self.vectors):
+            sim = self._cosine_similarity(query_vector, vec)
+            similarities.append((idx, sim))
+        
+        # Sort by similarity
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        
+        # Return top k
+        results = []
+        for idx, sim in similarities[:top_k]:
+            result = self.metadata[idx].copy()
+            result['similarity_score'] = float(sim)
+            results.append(result)
+        
+        return results
+    
+    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Calculate cosine similarity"""
+        dot_product = np.dot(a, b)
+        norm_a = np.linalg.norm(a)
+        norm_b = np.linalg.norm(b)
+        
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        
+        return dot_product / (norm_a * norm_b)
+    
+    def save(self, filepath: str):
+        """Save index to disk"""
+        with open(filepath, 'wb') as f:
+            pickle.dump({
+                'vectors': self.vectors,
+                'metadata': self.metadata,
+                'dimension': self.dimension
+            }, f)
+        logger.info(f"Index saved to {filepath}")
+    
+    def load(self, filepath: str):
+        """Load index from disk"""
+        if os.path.exists(filepath):
+            with open(filepath, 'rb') as f:
+                data = pickle.load(f)
+                self.vectors = data['vectors']
+                self.metadata = data['metadata']
+                self.dimension = data['dimension']
+            logger.info(f"Index loaded from {filepath}")
+            return True
+        return False
+
+
+# ============================================================================
+# 3. OFFLINE PATTERN KNOWLEDGE BASE
+# ============================================================================
+
+class OfflinePatternKnowledgeBase:
+    """Offline vector store for patterns"""
+    
+    def __init__(self, pattern_config_path: str = "Pattern_Config.json", cache_dir: str = "./model_cache"):
+        self.pattern_config_path = pattern_config_path
+        self.cache_dir = cache_dir
+        self.patterns = []
+        
+        # Use offline embedding
+        self.embedding_model = OfflineEmbeddingModel(cache_dir)
+        self.index = None
+        
+        self.load_patterns()
+        self.build_vector_index()
+    
+    def load_patterns(self):
+        """Load patterns from config"""
+        with open(self.pattern_config_path, 'r', encoding='utf-8') as f:
+            config_data = json.load(f)
+        
+        entities = config_data.get('entities', [])
+        
+        for entity in entities:
+            entity_name = entity.get('name', 'Unknown')
+            entity_patterns = entity.get('patterns', [])
+            
+            for idx, pattern_str in enumerate(entity_patterns):
+                pattern_description = self._pattern_to_description(pattern_str, entity_name)
+                
+                self.patterns.append({
+                    'entity_name': entity_name,
+                    'pattern': pattern_str,
+                    'description': pattern_description,
+                    'pattern_id': f"{entity_name}_{idx+1}"
+                })
+        
+        logger.info(f"Loaded {len(self.patterns)} patterns")
+    
+    def _pattern_to_description(self, pattern: str, entity_name: str) -> str:
+        """Convert pattern to description"""
+        parts = [f"Entity: {entity_name}"]
+        
+        if r'\d' in pattern:
+            parts.append("contains digits")
+        if r'[A-Z]' in pattern or r'[a-z]' in pattern:
+            parts.append("contains letters")
+        if '(?P<' in pattern:
+            named_groups = re.findall(r'\(\?P<(\w+)>', pattern)
+            parts.append(f"extracts: {', '.join(named_groups)}")
+        
+        return " | ".join(parts)
+    
+    def build_vector_index(self):
+        """Build vector index"""
+        index_path = os.path.join(self.cache_dir, "pattern_index.pkl")
+        
+        # Try to load cached index
+        if os.path.exists(index_path):
+            self.index = SimpleVectorIndex(128)
+            if self.index.load(index_path) and self.embedding_model.load_cache():
+                logger.info("Loaded cached index and model")
+                return
+        
+        # Build new index
+        logger.info("Building new index...")
+        descriptions = [p['description'] for p in self.patterns]
+        
+        # Fit embedding model
+        self.embedding_model.fit(descriptions)
+        
+        # Generate embeddings
+        embeddings = self.embedding_model.encode(descriptions)
+        
+        # Create index
+        self.index = SimpleVectorIndex(embeddings.shape[1])
+        self.index.add(embeddings, self.patterns)
+        
+        # Save for future use
+        self.index.save(index_path)
+        
+        logger.info(f"Built index with {len(self.patterns)} patterns")
+    
+    def search_similar_patterns(self, query_text: str, top_k: int = 5) -> List[Dict]:
+        """Search for similar patterns"""
+        query_embedding = self.embedding_model.encode([query_text])[0]
+        results = self.index.search(query_embedding, top_k)
+        return results
+
+
+# ============================================================================
+# 4. RULE-BASED PATTERN GENERATION (No LLM Required)
+# ============================================================================
+
+class RuleBasedPatternGenerator:
+    """
+    Generate regex patterns using heuristics
+    No LLM required - perfect for offline/restricted environments
+    """
+    
+    def generate_pattern(self, examples: List[str]) -> Optional[str]:
+        """Generate pattern from examples using rules"""
+        if not examples:
+            return None
+        
+        # Analyze examples
+        analysis = self._analyze_examples(examples)
+        
+        # Generate pattern based on analysis
+        pattern_parts = []
+        
+        # Use first example as template
+        template = examples[0]
+        
+        for i, char in enumerate(template):
+            if char.isdigit():
+                # Check if all examples have digit here
+                if all(e[i].isdigit() if i < len(e) else False for e in examples):
+                    pattern_parts.append(r'\d')
+                else:
+                    pattern_parts.append(r'\w')
+            elif char.isalpha():
+                if char.isupper():
+                    pattern_parts.append(r'[A-Z]')
+                else:
+                    pattern_parts.append(r'[a-z]')
+            elif char.isspace():
+                pattern_parts.append(r'\s')
+            else:
+                pattern_parts.append(re.escape(char))
+        
+        # Collapse repetitions
+        pattern = ''.join(pattern_parts)
+        pattern = re.sub(r'(\\d)\1+', r'\\d+', pattern)
+        pattern = re.sub(r'(\[A-Z\])+', r'[A-Z]+', pattern)
+        pattern = re.sub(r'(\[a-z\])+', r'[a-z]+', pattern)
+        pattern = re.sub(r'(\\w)+', r'\\w+', pattern)
+        
+        return f"({pattern})"
+    
+    def _analyze_examples(self, examples: List[str]) -> Dict:
+        """Analyze example characteristics"""
+        return {
+            'min_length': min(len(e) for e in examples),
+            'max_length': max(len(e) for e in examples),
+            'has_digits': any(re.search(r'\d', e) for e in examples),
+            'has_letters': any(re.search(r'[a-zA-Z]', e) for e in examples),
+            'common_prefix': os.path.commonprefix(examples) if len(examples) > 1 else ''
+        }
+
+
+# ============================================================================
+# 5. OFFLINE PATTERN SUGGESTION ENGINE
+# ============================================================================
+
+class OfflinePatternSuggestionEngine:
+    """Pattern suggestion using offline methods only"""
+    
+    def __init__(self, knowledge_base: OfflinePatternKnowledgeBase):
+        self.knowledge_base = knowledge_base
+        self.rule_generator = RuleBasedPatternGenerator()
+    
+    def suggest_patterns(self, entity_name: str, unseen_examples: List[str]) -> List[Dict]:
+        """Generate pattern suggestions"""
+        suggestions = []
+        
+        # Get similar patterns from knowledge base
+        query = f"Entity: {entity_name}, examples: {', '.join(unseen_examples[:3])}"
+        similar_patterns = self.knowledge_base.search_similar_patterns(query, top_k=3)
+        
+        # Adapt existing patterns
+        for similar in similar_patterns:
+            suggestions.append({
+                'suggested_pattern': similar['pattern'],  # Could add adaptation here
+                'based_on_pattern_id': similar['pattern_id'],
+                'similarity_score': similar['similarity_score'],
+                'reasoning': f"Similar to {similar['entity_name']} pattern",
+                'test_examples': unseen_examples[:5],
+                'method': 'RAG_RETRIEVAL'
+            })
+        
+        # Generate new pattern using rules
+        rule_pattern = self.rule_generator.generate_pattern(unseen_examples)
+        if rule_pattern:
+            suggestions.append({
+                'suggested_pattern': rule_pattern,
+                'based_on_pattern_id': 'RULE_GENERATED',
+                'similarity_score': 0.7,
+                'reasoning': 'Generated from example structure',
+                'test_examples': unseen_examples[:5],
+                'method': 'RULE_BASED'
+            })
+        
+        return suggestions
+
+
+# ============================================================================
+# 6. MAIN INTEGRATION (Same Interface as Online Version)
+# ============================================================================
+
+class UnseenPatternDetector:
+    """Detect unseen patterns"""
+    
+    def __init__(self, pattern_manager, knowledge_base):
+        self.pattern_manager = pattern_manager
+        self.knowledge_base = knowledge_base
+        self.unseen_texts = defaultdict(list)
+    
+    def detect_unseen(self, text: str, entity_name: str, extracted_result: Dict) -> bool:
+        if not extracted_result.get('value'):
+            candidates = self._extract_candidates(text, entity_name)
+            if candidates:
+                self.unseen_texts[entity_name].extend(candidates)
+                return True
+        return False
+    
+    def _extract_candidates(self, text: str, entity_name: str) -> List[str]:
+        generic_patterns = {
+            'PackageDetails': r'\b[A-Z0-9]{6,12}\b',
+            'Currency': r'\b[A-Z]{3}\b',
+        }
+        pattern = generic_patterns.get(entity_name, r'\b\w{3,20}\b')
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        return matches[:5]
+    
+    def get_unseen_summary(self) -> Dict:
+        summary = {}
+        for entity_name, texts in self.unseen_texts.items():
+            summary[entity_name] = {
+                'count': len(texts),
+                'examples': list(set(texts))[:10]
+            }
+        return summary
+
+
+class OfflineRAGExtractor:
+    """Complete offline RAG extractor"""
+    
+    def __init__(self, pattern_manager, tracker):
+        self.pattern_manager = pattern_manager
+        self.tracker = tracker
+        
+        # Initialize offline RAG components
+        self.knowledge_base = OfflinePatternKnowledgeBase(pattern_manager.config_file)
+        self.unseen_detector = UnseenPatternDetector(pattern_manager, self.knowledge_base)
+        self.suggestion_engine = OfflinePatternSuggestionEngine(self.knowledge_base)
+        
+        self.extraction_log = []
+    
+    def extract_entity(self, text: str, entity_name: str) -> Dict:
+        """Extract entity with tracking"""
+        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        
+        result = {
+            'value': None,
+            'pattern_id': None,
+            'entity_name': entity_name,
+            'is_unseen': False
+        }
+        
+        for pattern_entry in patterns:
+            pattern_id = pattern_entry['pattern_id']
+            pattern_regex = pattern_entry['pattern']
+            
+            self.tracker.record_attempt(pattern_id)
+            
+            try:
+                match = re.search(pattern_regex, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                if match:
+                    extracted_value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                    if extracted_value:
+                        self.tracker.record_match(pattern_id, extracted_value.strip())
+                        result['value'] = extracted_value.strip()
+                        result['pattern_id'] = pattern_id
+                        break
+            except:
+                pass
+        
+        if not result['value']:
+            result['is_unseen'] = self.unseen_detector.detect_unseen(text, entity_name, result)
+        
+        return result
+    
+    def extract_all_entities(self, text: str) -> Dict[str, Dict]:
+        entity_names = self.pattern_manager.get_all_entity_names()
+        return {name: self.extract_entity(text, name) for name in entity_names}
+    
+    def save_rag_report(self, output_path: str):
+        """Save RAG report"""
+        unseen_summary = self.unseen_detector.get_unseen_summary()
+        
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            # Unseen patterns
+            unseen_data = []
+            for entity_name, data in unseen_summary.items():
+                unseen_data.append({
+                    'Entity': entity_name,
+                    'Unseen Count': data['count'],
+                    'Examples': ', '.join(data['examples'][:5])
+                })
+            
+            if unseen_data:
+                pd.DataFrame(unseen_data).to_excel(writer, sheet_name='Unseen Patterns', index=False)
+            
+            # Pattern suggestions
+            all_suggestions = []
+            for entity_name, data in unseen_summary.items():
+                suggestions = self.suggestion_engine.suggest_patterns(entity_name, data['examples'])
+                for sug in suggestions:
+                    all_suggestions.append({
+                        'Entity': entity_name,
+                        'Suggested Pattern': sug['suggested_pattern'],
+                        'Method': sug['method'],
+                        'Similarity': sug['similarity_score'],
+                        'Reasoning': sug['reasoning']
+                    })
+            
+            if all_suggestions:
+                pd.DataFrame(all_suggestions).to_excel(writer, sheet_name='Suggestions', index=False)
+        
+        logger.info(f"RAG report saved: {output_path}")
+
+
+# ============================================================================
+# DEMO
+# ============================================================================
+
+def demo_offline_rag():
+    """Demo offline RAG"""
+    from pattern_tracking import PatternManager, PatternUsageTracker
+    
+    pattern_manager = PatternManager("Pattern_Config.json")
+    tracker = PatternUsageTracker()
+    
+    logger.info("="*80)
+    logger.info("OFFLINE RAG POC - Restricted Environment")
+    logger.info("="*80)
+    
+    rag_extractor = OfflineRAGExtractor(pattern_manager, tracker)
+    
+    # Test emails
+    sample_emails = [
+        {'subject': 'Trade', 'body': 'Trade ID: ABC123\nCurrency: USD'},
+        {'subject': 'New', 'body': 'Deal: XYZ-2025-001\nCCY: EUR'}  # Unseen
+    ]
+    
+    for email in sample_emails:
+        text = f"{email['subject']}\n{email['body']}"
+        results = rag_extractor.extract_all_entities(text)
+        
+        print(f"\nEmail: {email['subject']}")
+        for entity, result in results.items():
+            status = "✓" if result['value'] else "✗ UNSEEN"
+            print(f"  {entity}: {result.get('value', 'N/A')} [{status}]")
+    
+    rag_extractor.save_rag_report("Offline_RAG_Report.xlsx")
+    print("\n✓ RAG Report: Offline_RAG_Report.xlsx")
+
+
+if __name__ == "__main__":
+    demo_offline_rag()

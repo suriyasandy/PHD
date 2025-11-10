@@ -1,0 +1,424 @@
+"""
+Email Thread Parser for Outlook
+Extracts only the latest conversation message from threaded emails
+Removes all previous replies and forwarded messages
+"""
+
+import re
+import logging
+from typing import Dict, List, Tuple
+from datetime import datetime
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# OUTLOOK EMAIL THREAD PARSER
+# ============================================================================
+
+class OutlookEmailThreadParser:
+    """
+    Parse Outlook email threads and extract only the latest message
+    
+    Key Concept:
+    - User receives email with entire thread
+    - We need ONLY the latest/current message content
+    - All previous "On X wrote:" sections should be removed
+    """
+    
+    # Thread separators (detect where conversation starts)
+    THREAD_SEPARATORS = [
+        # Outlook style
+        r'^-+\s*Original Message\s*-+',
+        r'^_+\s*From:\s*.+\nSent:\s*.+',
+        
+        # Gmail style
+        r'^On\s+.+?wrote:',
+        r'^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\s+.+?<.+?>.*:',
+        
+        # Generic forward/reply
+        r'^------+\s*Forwarded message',
+        r'------+\s*End Forwarded Message',
+        
+        # More Outlook patterns
+        r'^From:.*?Sent:.*?To:',
+        r'Subject:\s*RE:',
+        r'Subject:\s*FW:',
+    ]
+    
+    @staticmethod
+    def extract_latest_message(email_body: str) -> Dict:
+        """
+        Extract ONLY the latest conversation message
+        
+        Returns:
+        {
+            'latest_message': str,  # Only the current/latest message
+            'thread_detected': bool,
+            'thread_count': int,    # How many messages in thread
+            'separators_found': list,
+            'full_body': str        # Original body for reference
+        }
+        """
+        result = {
+            'latest_message': '',
+            'thread_detected': False,
+            'thread_count': 1,
+            'separators_found': [],
+            'full_body': email_body
+        }
+        
+        if not email_body or not email_body.strip():
+            return result
+        
+        # Find first thread separator
+        earliest_separator_pos = len(email_body)
+        separator_found = None
+        
+        for separator_pattern in OutlookEmailThreadParser.THREAD_SEPARATORS:
+            match = re.search(separator_pattern, email_body, re.MULTILINE | re.IGNORECASE)
+            
+            if match and match.start() < earliest_separator_pos:
+                earliest_separator_pos = match.start()
+                separator_found = separator_pattern
+        
+        # Extract latest message (before first separator)
+        if earliest_separator_pos < len(email_body):
+            result['thread_detected'] = True
+            result['latest_message'] = email_body[:earliest_separator_pos].strip()
+            result['separators_found'].append(separator_found)
+            
+            # Count how many thread separators exist
+            result['thread_count'] = len(re.findall(
+                r'(On\s+.+?wrote:|From:.*?Sent:|^-+\s*Original Message)',
+                email_body,
+                re.MULTILINE | re.IGNORECASE
+            )) + 1
+        else:
+            # No thread detected, entire body is latest message
+            result['latest_message'] = email_body.strip()
+            result['thread_count'] = 1
+        
+        logger.info(f"Parsed email - Thread detected: {result['thread_detected']}, "
+                   f"Messages in thread: {result['thread_count']}, "
+                   f"Latest message size: {len(result['latest_message'])} chars")
+        
+        return result
+    
+    @staticmethod
+    def extract_all_thread_messages(email_body: str) -> List[Dict]:
+        """
+        Extract ALL messages in thread (useful for analysis)
+        
+        Returns list of:
+        {
+            'message': str,
+            'position': int,  # 0 = latest, 1 = previous, etc.
+            'sender': str,    # Extracted if available
+            'date': str       # Extracted if available
+        }
+        """
+        messages = []
+        
+        # Split by known separators
+        parts = re.split(
+            r'(?:^|\n)(?:On\s+.+?wrote:|^-+\s*Original Message\s*-+|^_+\s*From:\s*.+?)',
+            email_body,
+            flags=re.MULTILINE | re.IGNORECASE
+        )
+        
+        for idx, part in enumerate(parts):
+            if part.strip():
+                messages.append({
+                    'message': part.strip(),
+                    'position': idx,
+                    'sender': OutlookEmailThreadParser._extract_sender(part),
+                    'date': OutlookEmailThreadParser._extract_date(part)
+                })
+        
+        return messages
+    
+    @staticmethod
+    def _extract_sender(text: str) -> str:
+        """Extract sender email/name from message section"""
+        # Look for "From: Name <email@domain.com>"
+        from_match = re.search(r'From:\s*(.+?)(?:\n|$)', text, re.IGNORECASE)
+        if from_match:
+            return from_match.group(1).strip()
+        
+        # Look for "Name <email@domain.com>"
+        name_match = re.search(r'([^<]+)\s*<([^>]+)>', text)
+        if name_match:
+            return name_match.group(1).strip()
+        
+        return 'Unknown'
+    
+    @staticmethod
+    def _extract_date(text: str) -> str:
+        """Extract date from message section"""
+        date_match = re.search(
+            r'(?:Sent:|Date:)\s*([^\n]+)',
+            text,
+            re.IGNORECASE
+        )
+        if date_match:
+            return date_match.group(1).strip()
+        
+        return 'Unknown'
+
+
+# ============================================================================
+# ENHANCED EMAIL DATA EXTRACTOR
+# ============================================================================
+
+class EnhancedOutlookEmailExtractor:
+    """
+    Extract email data from Outlook with thread handling
+    """
+    
+    def __init__(self):
+        self.thread_parser = OutlookEmailThreadParser()
+    
+    def extract_email_data(self, email_item) -> Dict:
+        """
+        Extract email with automatic thread separation
+        
+        From Outlook COM object:
+        email_item.Subject, email_item.Body, etc.
+        """
+        try:
+            # Get raw email data
+            subject = email_item.Subject
+            body = email_item.Body
+            sender = email_item.SenderName
+            received_time = email_item.ReceivedTime
+            
+            # Parse thread and extract latest message
+            thread_info = self.thread_parser.extract_latest_message(body)
+            
+            result = {
+                'subject': subject,
+                'sender': sender,
+                'received_time': received_time,
+                'raw_body': body,
+                'body': thread_info['latest_message'],  # ← ONLY LATEST MESSAGE
+                'is_threaded': thread_info['thread_detected'],
+                'thread_count': thread_info['thread_count'],
+                'thread_info': thread_info
+            }
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Error extracting email: {e}")
+            return None
+    
+    def extract_batch(self, email_items: List) -> List[Dict]:
+        """Extract multiple emails"""
+        results = []
+        
+        for email in email_items:
+            data = self.extract_email_data(email)
+            if data:
+                results.append(data)
+        
+        return results
+
+
+# ============================================================================
+# INTEGRATION WITH YOUR EXISTING extract_entities
+# ============================================================================
+
+class ThreadAwareEntityExtractor:
+    """
+    Your existing extract_entities + thread parsing
+    """
+    
+    def __init__(self, pattern_manager, tracker):
+        self.pattern_manager = pattern_manager
+        self.tracker = tracker
+        self.email_extractor = EnhancedOutlookEmailExtractor()
+        self.thread_parser = OutlookEmailThreadParser()
+    
+    def extract_from_outlook_email(self, email_item, rag_extractor=None) -> Dict:
+        """
+        Enhanced extraction that handles email threads
+        
+        Usage:
+        result = extractor.extract_from_outlook_email(email_item, rag_extractor)
+        """
+        
+        # Step 1: Extract email and parse thread
+        email_data = self.email_extractor.extract_email_data(email_item)
+        
+        if not email_data:
+            return {'error': 'Failed to extract email'}
+        
+        logger.info(f"Processing: {email_data['subject']}")
+        logger.info(f"  Thread detected: {email_data['is_threaded']}")
+        logger.info(f"  Messages in thread: {email_data['thread_count']}")
+        logger.info(f"  Using latest message ({len(email_data['body'])} chars)")
+        
+        # Step 2: Extract entities from LATEST MESSAGE ONLY
+        entity_names = self.pattern_manager.get_all_entity_names()
+        results = {}
+        entities = {}
+        
+        # Process only the latest message (from thread parsing)
+        body_lines = email_data['body'].splitlines()
+        body_lines = [line for line in body_lines if line.strip()]
+        
+        current_activity = None
+        
+        for line in body_lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Activity tracking
+            line_upper = line.upper()
+            # ... your existing activity tracking code ...
+            
+            # Extract entities
+            for entity_name in entity_names:
+                patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+                
+                result = {
+                    'value': None,
+                    'pattern_id': None,
+                    'entity_name': entity_name
+                }
+                
+                for pattern_entry in patterns:
+                    # ... your existing pattern matching code ...
+                    pass
+                
+                # Queue for RAG if needed (non-blocking)
+                if rag_extractor:
+                    rag_extractor.detect_unseen_and_queue(line, entity_name, result)
+                
+                results[entity_name] = result
+        
+        # Return enriched result
+        return {
+            'entities': entities,
+            'email_data': email_data,
+            'extraction_results': results,
+            'thread_info': {
+                'is_threaded': email_data['is_threaded'],
+                'thread_count': email_data['thread_count'],
+                'processed_message': 'LATEST_ONLY',
+                'message_length': len(email_data['body'])
+            }
+        }
+
+
+# ============================================================================
+# PRACTICAL EXAMPLES
+# ============================================================================
+
+# Example 1: Simple thread parsing
+def example_parse_thread():
+    """Parse a threaded email"""
+    
+    sample_email = """
+    Dear Team,
+    
+    Please confirm the trade details:
+    Trade ID: TRD20251110001
+    Currency: USD
+    Status: Pending
+    
+    --------- Original Message ---------
+    From: John Smith <john.smith@company.com>
+    Sent: Monday, November 10, 2025 10:30 AM
+    To: team@company.com
+    Subject: Trade Confirmation
+    
+    Previous discussion about the trade...
+    Trade ID: TRD20251110001
+    """
+    
+    parser = OutlookEmailThreadParser()
+    result = parser.extract_latest_message(sample_email)
+    
+    print(f"Thread Detected: {result['thread_detected']}")
+    print(f"Messages in Thread: {result['thread_count']}")
+    print(f"Latest Message:\n{result['latest_message']}")
+    
+    # Extract all messages
+    all_messages = parser.extract_all_thread_messages(sample_email)
+    print(f"\nTotal Messages: {len(all_messages)}")
+    for idx, msg in enumerate(all_messages, 1):
+        print(f"\nMessage {idx}:")
+        print(f"  Sender: {msg['sender']}")
+        print(f"  Date: {msg['date']}")
+        print(f"  Content: {msg['message'][:100]}...")
+
+
+# Example 2: Usage in your Tkinter app
+def example_outlook_integration():
+    """
+    In your Tkinter app, when processing email:
+    
+    # When user selects an email from Outlook
+    outlook = win32com.client.Dispatch("Outlook.Application")
+    mail_item = outlook.GetNamespace("MAPI").GetDefaultFolder(6).Items[0]
+    
+    # Extract with thread handling
+    extractor = ThreadAwareEntityExtractor(pattern_manager, tracker)
+    result = extractor.extract_from_outlook_email(mail_item, rag_extractor)
+    
+    # result contains:
+    # - Only latest message processed
+    # - Thread info showing it was a threaded email
+    # - All entities extracted from latest message only
+    """
+    pass
+
+
+# ============================================================================
+# KEY BENEFITS
+# ============================================================================
+
+"""
+✓ Outlook Thread Handling:
+  - Automatically detects if email is part of conversation
+  - Extracts ONLY the latest/current message
+  - Shows thread statistics (how many messages total)
+  - Can access full thread if needed (for analysis)
+
+✓ Common Thread Separators Supported:
+  - Outlook: "--------- Original Message ---------"
+  - Outlook: "From: ... Sent: ... To:"
+  - Gmail: "On [date] [sender] wrote:"
+  - Forwards: "---------- Forwarded message"
+
+✓ No Impact on Single Emails:
+  - If no thread detected, processes entire body
+  - Single emails work exactly as before
+
+✓ Integration with Existing Code:
+  - Drop-in replacement for email extraction
+  - Works with your existing entity extraction
+  - Compatible with RAG processor (non-blocking)
+
+EXAMPLE RESULT:
+{
+    'subject': 'RE: Trade Confirmation',
+    'sender': 'John Smith',
+    'body': 'Latest message only (2340 chars)',
+    'is_threaded': True,
+    'thread_count': 5,  # 5 messages in total thread
+    'entities': {
+        'TradeID': 'TRD20251110001',
+        'Currency': 'USD',
+        'Status': 'Pending'
+    },
+    'thread_info': {
+        'processed_message': 'LATEST_ONLY',
+        'message_length': 2340
+    }
+}
+"""

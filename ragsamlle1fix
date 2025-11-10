@@ -1,104 +1,270 @@
+"""
+Complete Pattern Matcher for Unseen Detection
+- Matches COMPLETE trading patterns from config
+- Detects when entire line doesn't match ANY pattern
+- Suggests closest matching pattern for unseen trades
+"""
+
+import re
+import logging
+from typing import Dict, List, Tuple
+from collections import defaultdict
+
+logger = logging.getLogger(__name__)
+
+
 # ============================================================================
-# FIXED: BackgroundRAGProcessor - Better queue management
+# PATTERN MATCHER - Match Complete Patterns
 # ============================================================================
 
-class BackgroundRAGProcessor:
-    """RAG processor with proper queue handling"""
+class CompletePatternMatcher:
+    """
+    Match complete trading patterns from config
+    Detect unseen patterns that don't match any config pattern
+    """
     
-    def __init__(self, pattern_manager, knowledge_base):
+    def __init__(self, pattern_manager):
         self.pattern_manager = pattern_manager
-        self.knowledge_base = knowledge_base
         
-        # Extract config labels
-        self.config_labels = self._extract_config_labels()
-        
-        logger.info(f"RAG Processor initialized with {len(self.config_labels)} config labels")
-        
-        # Queue for processing
-        self.unseen_queue = queue.Queue()
-        
-        # Results storage
-        self.unseen_data = defaultdict(list)
-        self.processing_complete = threading.Event()
-        
-        # Pattern validator
-        self.validator = PatternValidator()
-        
-        # Background thread
-        self.processor_thread = None
-        self.is_running = False
+        # Build complete patterns library
+        self.complete_patterns = self._build_complete_patterns()
+        logger.info(f"Loaded {len(self.complete_patterns)} complete patterns from config")
     
-    def _extract_config_labels(self) -> Dict[str, str]:
-        """Extract all unique labels from config"""
-        unique_labels = {}
+    def _build_complete_patterns(self) -> Dict[str, Dict]:
+        """
+        Build library of complete patterns from config
+        
+        Returns:
+        {
+            'PKG_PTN001': {
+                'pattern': r'(?P<TradeID>\d{7,8}).*?(?P<Currency>[A-Z]{3})',
+                'entity_name': 'PackageDetails',
+                'labels': ['TradeID', 'Currency'],
+                'pattern_id': 'PKG_PTN001'
+            },
+            ...
+        }
+        """
+        patterns_library = {}
         
         for entity_name in self.pattern_manager.get_all_entity_names():
             patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
             
             for pattern_info in patterns:
+                pattern_id = pattern_info.get('pattern_id', 'UNKNOWN')
                 pattern_str = pattern_info.get('pattern', '')
                 
-                # Find named groups
-                named_group_pattern = r'\(\?P<(\w+)>([^)]+(?:\([^)]*\))*[^)]*)\)'
+                if not pattern_str:
+                    continue
                 
-                for match in re.finditer(named_group_pattern, pattern_str):
-                    label_name = match.group(1)
-                    label_regex = match.group(2)
+                # Extract all labels from pattern
+                labels = re.findall(r'\(\?P<(\w+)>', pattern_str)
+                
+                patterns_library[pattern_id] = {
+                    'pattern': pattern_str,
+                    'pattern_id': pattern_id,
+                    'entity_name': entity_name,
+                    'labels': labels,
+                    'compiled': re.compile(pattern_str, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                }
+        
+        return patterns_library
+    
+    def match_line_to_pattern(self, line: str) -> Dict:
+        """
+        Try to match a line to existing patterns
+        
+        Returns:
+        {
+            'matched': True/False,
+            'pattern_id': 'PKG_PTN001' or None,
+            'extracted_data': {label: value},
+            'confidence': 0.0-1.0
+        }
+        """
+        best_match = {
+            'matched': False,
+            'pattern_id': None,
+            'extracted_data': {},
+            'confidence': 0.0
+        }
+        
+        # Try each complete pattern
+        for pattern_id, pattern_info in self.complete_patterns.items():
+            try:
+                match = pattern_info['compiled'].search(line)
+                
+                if match:
+                    # Extract all named groups
+                    groupdict = match.groupdict()
                     
-                    if label_name not in unique_labels:
-                        unique_labels[label_name] = label_regex
+                    # Check how many labels were extracted
+                    extracted_labels = sum(1 for v in groupdict.values() if v)
+                    total_labels = len(pattern_info['labels'])
+                    
+                    # Confidence = ratio of extracted labels
+                    confidence = extracted_labels / total_labels if total_labels > 0 else 0
+                    
+                    # Check if this is the best match
+                    if confidence > best_match['confidence']:
+                        best_match = {
+                            'matched': True,
+                            'pattern_id': pattern_id,
+                            'extracted_data': groupdict,
+                            'confidence': confidence
+                        }
+                
+            except Exception as e:
+                logger.debug(f"Pattern {pattern_id} error: {e}")
         
-        return unique_labels
+        return best_match
     
-    def start(self):
-        """Start background processing"""
-        if self.is_running:
-            return
+    def find_closest_patterns(self, line: str, top_k: int = 5) -> List[Dict]:
+        """
+        Find closest matching patterns using fuzzy matching
+        For unseen lines, find which patterns are ALMOST matching
+        """
+        closest_patterns = []
         
-        self.is_running = True
-        self.processing_complete.clear()
+        # Try partial matching using difflib
+        from difflib import SequenceMatcher
         
-        self.processor_thread = threading.Thread(
-            target=self._process_queue,
-            daemon=True,
-            name="RAG-Processor"
-        )
-        self.processor_thread.start()
-        logger.info("Background RAG processor started")
+        for pattern_id, pattern_info in self.complete_patterns.items():
+            # Extract sample values from pattern description
+            pattern_str = pattern_info['pattern']
+            
+            # Calculate similarity using sequence matching
+            similarity = SequenceMatcher(None, line, pattern_str).ratio()
+            
+            closest_patterns.append({
+                'pattern_id': pattern_id,
+                'pattern': pattern_str,
+                'entity_name': pattern_info['entity_name'],
+                'similarity': similarity,
+                'labels': pattern_info['labels']
+            })
+        
+        # Sort by similarity and return top-k
+        closest_patterns.sort(key=lambda x: x['similarity'], reverse=True)
+        return closest_patterns[:top_k]
+
+
+# ============================================================================
+# UNSEEN PATTERN DETECTOR - Complete Pattern Based
+# ============================================================================
+
+class UnseenPatternDetector:
+    """
+    Detect unseen complete patterns
+    Track lines that don't match any config pattern
+    """
     
-    def add_unseen_text(self, entity_name: str, text: str):
-        """Add unseen text for processing"""
-        if not text or not text.strip():
+    def __init__(self, pattern_matcher, knowledge_base):
+        self.pattern_matcher = pattern_matcher
+        self.knowledge_base = knowledge_base
+        
+        # Store unseen patterns
+        self.unseen_patterns = defaultdict(list)  # entity -> list of unseen lines
+        self.pattern_suggestions = defaultdict(list)  # unseen_pattern -> suggested patterns
+    
+    def detect_unseen_line(self, line: str, entity_name: str) -> Dict:
+        """
+        Detect if a line is unseen (doesn't match any complete pattern)
+        
+        Returns:
+        {
+            'is_unseen': True/False,
+            'best_match': {...},
+            'closest_patterns': [...],
+            'confidence': float
+        }
+        """
+        result = {
+            'line': line,
+            'entity_name': entity_name,
+            'is_unseen': False,
+            'best_match': None,
+            'closest_patterns': [],
+            'confidence': 0.0
+        }
+        
+        # Try to match against config patterns
+        best_match = self.pattern_matcher.match_line_to_pattern(line)
+        result['best_match'] = best_match
+        result['confidence'] = best_match['confidence']
+        
+        # Consider as UNSEEN if:
+        # 1. No pattern matched at all, OR
+        # 2. Partial match but with LOW confidence (< 0.7)
+        if not best_match['matched'] or best_match['confidence'] < 0.7:
+            result['is_unseen'] = True
+            
+            # Store for later analysis
+            self.unseen_patterns[entity_name].append({
+                'line': line,
+                'best_match': best_match,
+                'timestamp': datetime.now()
+            })
+            
+            # Find closest patterns for suggestion
+            closest = self.pattern_matcher.find_closest_patterns(line, top_k=5)
+            result['closest_patterns'] = closest
+            
+            logger.info(f"Unseen pattern detected for {entity_name}: {line[:60]}...")
+            logger.info(f"  Closest patterns: {[p['pattern_id'] for p in closest[:3]]}")
+        
+        return result
+
+
+# ============================================================================
+# ENHANCED RAG PROCESSOR - Complete Pattern Detection
+# ============================================================================
+
+class EnhancedRAGProcessor(BackgroundRAGProcessor):
+    """
+    Enhanced RAG processor that tracks complete patterns
+    Not individual labels
+    """
+    
+    def __init__(self, pattern_manager, knowledge_base):
+        super().__init__(pattern_manager, knowledge_base)
+        
+        # Initialize pattern matcher
+        self.pattern_matcher = CompletePatternMatcher(pattern_manager)
+        self.unseen_detector = UnseenPatternDetector(self.pattern_matcher, knowledge_base)
+    
+    def add_unseen_pattern(self, line: str, entity_name: str):
+        """Queue complete unseen pattern for analysis"""
+        if not line or not line.strip():
             return
         
         self.unseen_queue.put({
             'entity_name': entity_name,
-            'text': text.strip(),
+            'text': line.strip(),
+            'type': 'complete_pattern',
             'timestamp': datetime.now()
         })
     
     def _process_queue(self):
-        """Background thread: process unseen texts"""
+        """Background thread: process unseen COMPLETE patterns"""
         logger.info("RAG processor thread running...")
         processed_count = 0
         
         while self.is_running:
             try:
-                # Get item with timeout
                 item = self.unseen_queue.get(timeout=0.5)
                 
                 entity_name = item['entity_name']
                 text = item['text']
                 
-                logger.debug(f"Processing unseen text for {entity_name}: {text[:50]}...")
+                logger.debug(f"Processing complete pattern for {entity_name}")
                 
-                # Analyze using config labels
-                analysis = self._analyze_with_config_labels(text, entity_name)
+                # Analyze as complete pattern
+                analysis = self._analyze_complete_pattern(text, entity_name)
                 
                 if analysis:
                     self.unseen_data[entity_name].append(analysis)
                     processed_count += 1
-                    logger.debug(f"Processed {processed_count} unseen texts")
                 
                 self.unseen_queue.task_done()
                 
@@ -107,392 +273,162 @@ class BackgroundRAGProcessor:
             except Exception as e:
                 logger.error(f"Error in RAG processor: {e}", exc_info=True)
     
-    def _analyze_with_config_labels(self, text: str, entity_name: str) -> Dict:
-        """Analyze unseen text using config labels"""
+    def _analyze_complete_pattern(self, line: str, entity_name: str) -> Dict:
+        """Analyze complete pattern and suggest closest matching patterns"""
+        
+        # Detect if unseen
+        detection = self.unseen_detector.detect_unseen_line(line, entity_name)
+        
         analysis = {
-            'text': text,
-            'candidates': [],
+            'text': line,
+            'entity_name': entity_name,
+            'is_unseen': detection['is_unseen'],
+            'best_match': detection['best_match'],
+            'confidence': detection['confidence'],
+            'closest_patterns': detection['closest_patterns'],
             'suggested_patterns': []
         }
         
-        # Extract candidates using config labels
-        candidates = self._extract_with_config_labels(text, entity_name)
-        analysis['candidates'] = candidates
-        
-        # Generate pattern suggestions if candidates found
-        if candidates:
-            candidate_values = [c['value'] for c in candidates]
-            suggestions = self._generate_and_test_suggestions(entity_name, candidate_values, candidates, text)
+        # If unseen, suggest patterns
+        if detection['is_unseen']:
+            suggestions = self._suggest_patterns_for_unseen(
+                line,
+                entity_name,
+                detection['closest_patterns']
+            )
             analysis['suggested_patterns'] = suggestions
         
         return analysis
     
-    def _extract_with_config_labels(self, text: str, entity_name: str) -> List[Dict]:
-        """Extract values using config labels"""
-        candidates = []
-        seen_values = set()
-        
-        for label_name, label_regex in self.config_labels.items():
-            search_pattern = f"(?P<{label_name}>{label_regex})"
-            
-            try:
-                matches = re.finditer(search_pattern, text, re.IGNORECASE | re.MULTILINE)
-                
-                for match in matches:
-                    value = match.group(label_name)
-                    
-                    if value and value.strip() and value not in seen_values:
-                        candidates.append({
-                            'value': value.strip(),
-                            'label': label_name,
-                            'label_regex': label_regex,
-                            'method': 'config_label_pattern'
-                        })
-                        seen_values.add(value)
-            except:
-                pass
-        
-        return candidates
-    
-    def _generate_and_test_suggestions(self, entity_name: str, examples: List[str], 
-                                      candidates: List[Dict], text: str) -> List[Dict]:
-        """Generate pattern suggestions AND test them"""
+    def _suggest_patterns_for_unseen(self, line: str, entity_name: str, 
+                                     closest_patterns: List[Dict]) -> List[Dict]:
+        """Suggest patterns for unseen complete patterns"""
         suggestions = []
         
-        # Strategy 1: RAG similarity matching
-        query = f"Entity: {entity_name}, examples: {', '.join(examples[:3])}"
-        similar_patterns = self.knowledge_base.search_similar_patterns(query, top_k=5)
-        
-        for similar in similar_patterns:
-            pattern = similar['pattern']
-            test_result = self.validator.test_pattern(pattern, text)
-            
+        # Strategy 1: Suggest closest patterns from config
+        for closest in closest_patterns[:3]:
             suggestions.append({
-                'pattern': pattern[:150],
-                'pattern_id': similar['pattern_id'],
-                'similarity': similar['similarity_score'],
-                'method': 'RAG_SIMILARITY',
-                'reasoning': f"Similar to {similar['entity_name']} pattern",
-                'tested_on_text': text[:120],
-                'pattern_works': test_result['matches'],
-                'extracted_by_pattern': str(test_result['extracted_values']) if test_result['matches'] else 'N/A',
-                'match_count': test_result['match_count']
+                'pattern': closest['pattern'][:150],
+                'pattern_id': closest['pattern_id'],
+                'entity_name': closest['entity_name'],
+                'method': 'CLOSEST_CONFIG_PATTERN',
+                'similarity': closest['similarity'],
+                'labels': closest['labels'],
+                'reasoning': f"Closest matching pattern (similarity: {closest['similarity']:.2%})",
+                'tested_on_text': line[:120],
+                'pattern_works': self._test_pattern(closest['pattern'], line),
             })
         
-        # Strategy 2: Create new combinations
-        detected_labels = set(c['label'] for c in candidates)
+        # Strategy 2: RAG-based suggestions
+        rag_suggestions = self.knowledge_base.search_similar_patterns(
+            f"Entity: {entity_name}, example: {line[:100]}",
+            top_k=3
+        )
         
-        if len(detected_labels) >= 2:
-            combined_pattern = self._create_combined_pattern(list(detected_labels))
-            
-            if combined_pattern:
-                test_result = self.validator.test_pattern(combined_pattern, text)
-                
-                suggestions.append({
-                    'pattern': combined_pattern,
-                    'pattern_id': 'CONFIG_COMBINATION',
-                    'similarity': 0.75,
-                    'method': 'CONFIG_LABEL_COMBINATION',
-                    'reasoning': f"Combination of labels: {', '.join(detected_labels)}",
-                    'tested_on_text': text[:120],
-                    'pattern_works': test_result['matches'],
-                    'extracted_by_pattern': str(test_result['extracted_values']) if test_result['matches'] else 'N/A',
-                    'match_count': test_result['match_count']
-                })
+        for rag_result in rag_suggestions:
+            suggestions.append({
+                'pattern': rag_result['pattern'][:150],
+                'pattern_id': rag_result['pattern_id'],
+                'entity_name': rag_result.get('entity_name', 'N/A'),
+                'method': 'RAG_SIMILARITY',
+                'similarity': rag_result['similarity_score'],
+                'labels': [],
+                'reasoning': f"RAG-based suggestion (score: {rag_result['similarity_score']:.2%})",
+                'tested_on_text': line[:120],
+                'pattern_works': self._test_pattern(rag_result['pattern'], line),
+            })
         
         return suggestions
     
-    def _create_combined_pattern(self, labels: List[str]) -> str:
-        """Combine detected labels into a new pattern"""
-        if not labels or len(labels) < 2:
-            return None
-        
-        pattern_parts = []
-        for label in labels[:3]:
-            if label in self.config_labels:
-                label_regex = self.config_labels[label]
-                pattern_parts.append(f"(?P<{label}>{label_regex})")
-        
-        if len(pattern_parts) >= 2:
-            return r'.*?'.join(pattern_parts)
-        
-        return None
-    
-    def stop_and_wait(self, timeout: float = 5.0):
-        """Stop processor and wait for all items to be processed"""
-        logger.info(f"Stopping RAG processor (timeout: {timeout}s)...")
-        
-        # Wait for queue to be processed
+    def _test_pattern(self, pattern: str, text: str) -> bool:
+        """Test if pattern works on unseen text"""
         try:
-            self.unseen_queue.join()
-            logger.info("Queue processing complete")
-        except Exception as e:
-            logger.warning(f"Queue join error: {e}")
-        
-        # Stop processing
-        self.is_running = False
-        
-        # Wait for thread with timeout
-        if self.processor_thread and self.processor_thread.is_alive():
-            self.processor_thread.join(timeout=timeout)
-        
-        self.processing_complete.set()
-        logger.info(f"RAG processor stopped. Total unseen entries: {sum(len(v) for v in self.unseen_data.values())}")
-    
-    def get_results(self) -> Dict:
-        """Get processed results"""
-        return dict(self.unseen_data)
-    
-    def save_rag_report(self, output_path: str):
-        """Save comprehensive RAG report with ALL sheets"""
-        logger.info(f"Generating RAG report: {output_path}")
-        
-        results = self.get_results()
-        
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            
-            # Sheet 1: Config Labels Library
-            labels_data = []
-            for label_name, label_regex in self.config_labels.items():
-                labels_data.append({
-                    'Label Name': label_name,
-                    'Label Regex': label_regex[:120],
-                    'Full Regex': label_regex
-                })
-            
-            if labels_data:
-                pd.DataFrame(labels_data).to_excel(writer, sheet_name='Config Labels', index=False)
-                logger.info(f"  ✓ Config Labels: {len(labels_data)} labels")
-            
-            # Sheet 2: Unseen Texts Overview
-            overview_data = []
-            for entity, analyses in results.items():
-                total_texts = len(analyses)
-                total_candidates = sum(len(a['candidates']) for a in analyses)
-                
-                overview_data.append({
-                    'Entity': entity,
-                    'Unseen Texts': total_texts,
-                    'Total Candidates': total_candidates,
-                    'Suggested Patterns': sum(len(a['suggested_patterns']) for a in analyses)
-                })
-            
-            if overview_data:
-                pd.DataFrame(overview_data).to_excel(writer, sheet_name='Unseen Overview', index=False)
-                logger.info(f"  ✓ Unseen Overview: {len(overview_data)} entities")
-            
-            # Sheet 3: Unseen Text Details
-            unseen_text_data = []
-            for entity, analyses in results.items():
-                for idx, analysis in enumerate(analyses, 1):
-                    unseen_text_data.append({
-                        'Entity': entity,
-                        'Text ID': f"{entity}_{idx}",
-                        'Unseen Text': analysis['text'][:200],
-                        'Full Text': analysis['text'],
-                        'Candidates Found': len(analysis['candidates']),
-                        'Patterns Suggested': len(analysis['suggested_patterns'])
-                    })
-            
-            if unseen_text_data:
-                pd.DataFrame(unseen_text_data).to_excel(writer, sheet_name='Unseen Texts', index=False)
-                logger.info(f"  ✓ Unseen Texts: {len(unseen_text_data)} texts")
-            
-            # Sheet 4: Candidate Details
-            candidate_data = []
-            for entity, analyses in results.items():
-                for idx, analysis in enumerate(analyses, 1):
-                    for candidate in analysis['candidates']:
-                        candidate_data.append({
-                            'Entity': entity,
-                            'Text ID': f"{entity}_{idx}",
-                            'Unseen Text': analysis['text'][:80],
-                            'Value': candidate['value'],
-                            'Config Label': candidate['label'],
-                            'Detection Method': candidate['method']
-                        })
-            
-            if candidate_data:
-                pd.DataFrame(candidate_data).to_excel(writer, sheet_name='Candidates', index=False)
-                logger.info(f"  ✓ Candidates: {len(candidate_data)} candidates")
-            
-            # Sheet 5: Pattern Suggestions with Test Results
-            suggestion_data = []
-            for entity, analyses in results.items():
-                for idx, analysis in enumerate(analyses, 1):
-                    for suggestion in analysis['suggested_patterns']:
-                        suggestion_data.append({
-                            'Entity': entity,
-                            'Text ID': f"{entity}_{idx}",
-                            'Unseen Text': suggestion['tested_on_text'],
-                            'Suggested Pattern': suggestion['pattern'],
-                            'Method': suggestion['method'],
-                            'Similarity': suggestion['similarity'],
-                            '✓ Pattern Works?': 'YES' if suggestion['pattern_works'] else 'NO',
-                            'Extracted Values': suggestion['extracted_by_pattern'],
-                            'Match Count': suggestion['match_count'],
-                            'Reasoning': suggestion['reasoning']
-                        })
-            
-            if suggestion_data:
-                pd.DataFrame(suggestion_data).to_excel(writer, sheet_name='Pattern Suggestions', index=False)
-                logger.info(f"  ✓ Pattern Suggestions: {len(suggestion_data)} suggestions")
-            
-            # Sheet 6: Working Patterns Only
-            working_patterns = [s for s in suggestion_data if s['✓ Pattern Works?'] == 'YES']
-            
-            if working_patterns:
-                pd.DataFrame(working_patterns).to_excel(writer, sheet_name='Working Patterns', index=False)
-                logger.info(f"  ✓ Working Patterns: {len(working_patterns)} patterns")
-            
-            # Sheet 7: Summary
-            total_suggestions = sum(len(a['suggested_patterns']) for analyses in results.values() for a in analyses)
-            working_count = sum(1 for analyses in results.values() for a in analyses for s in a['suggested_patterns'] if s['pattern_works'])
-            
-            summary_data = [
-                {'Metric': 'Config Labels Available', 'Value': len(self.config_labels)},
-                {'Metric': 'Entities Analyzed', 'Value': len(results)},
-                {'Metric': 'Total Unseen Texts', 'Value': sum(len(analyses) for analyses in results.values())},
-                {'Metric': 'Total Candidates Found', 'Value': sum(sum(len(a['candidates']) for a in analyses) for analyses in results.values())},
-                {'Metric': 'Total Pattern Suggestions', 'Value': total_suggestions},
-                {'Metric': 'Working Patterns', 'Value': working_count},
-                {'Metric': 'Success Rate', 'Value': f"{(working_count/total_suggestions*100):.1f}%" if total_suggestions > 0 else '0%'}
-            ]
-            
-            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
-            logger.info(f"  ✓ Summary: {len(summary_data)} metrics")
-        
-        logger.info(f"✓ RAG report saved: {output_path}")
+            match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+            return match is not None
+        except:
+            return False
 
 
 # ============================================================================
-# FIXED: extract_entities - Better RAG integration
+# INTEGRATION WITH extract_entities
 # ============================================================================
 
 def extract_entities(self):
-    """Extract entities with proper RAG integration"""
+    """Extract with complete pattern detection"""
     
     if self.selected_email is None:
-        messagebox.showwarning("No Selection", "Please select an email from the chain first")
+        messagebox.showwarning("No Selection", "Please select an email")
         return
     
     try:
         entity_json = self.entity_text.get(1.0, tk.END).strip()
         self.entity_definitions = json.loads(entity_json)
-    
     except json.JSONDecodeError as e:
         messagebox.showerror("JSON Error", f"Invalid JSON: {str(e)}")
         return
     
     try:
-        # Clear previous results
         self.clear_results()
         
-        # ===== INITIALIZE RAG ONCE (not each time) =====
+        # Initialize enhanced RAG (only once)
         if not hasattr(self, 'rag_extractor') or self.rag_extractor is None:
-            logger.info("Initializing RAG processor...")
+            logger.info("Initializing Enhanced RAG processor...")
             self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
         
         entity_names = self.pattern_manager.get_all_entity_names()
         email_data = self.selected_email
         results = {}
         entities = {}
+        unseen_count = 0
         
         logger.info(f"Processing: {email_data['subject']}")
         
-        # Process email body
+        # Process email body line by line
         email_lines = email_data['body'].splitlines()
         email_lines = list(filter(None, email_lines))
-        
-        current_activity = None
-        unseen_count = 0
         
         for line in email_lines:
             line = line.strip()
             if not line:
                 continue
             
-            # Check for activity keywords
-            line_upper = line.upper()
-            for keyword in self.activity_keywords:
-                if keyword in line_upper:
-                    current_activity = line_upper
-                    break
+            # ===== TRY TO MATCH COMPLETE PATTERN =====
+            pattern_match = self.rag_extractor.rag_processor.pattern_matcher.match_line_to_pattern(line)
             
-            # Extract entities
-            for entity_name in entity_names:
-                patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+            if pattern_match['matched'] and pattern_match['confidence'] >= 0.7:
+                # ✓ Line matches a complete pattern from config
+                logger.info(f"✓ Matched pattern {pattern_match['pattern_id']}: {line[:50]}")
                 
-                result = {
-                    'value': None,
-                    'pattern_id': None,
-                    'entity_name': entity_name
-                }
+                # Extract data
+                for k, v in pattern_match['extracted_data'].items():
+                    if v:
+                        entities.setdefault(k, []).append(f"{v}")
                 
-                for pattern_entry in patterns:
-                    entity_type = pattern_entry.get('entity_type', 'pattern')
-                    
-                    if entity_type == "pattern":
-                        pattern_id = pattern_entry['pattern_id']
-                        pattern_regex = pattern_entry['pattern']
-                        
-                        self.usage_tracker.record_attempt(pattern_id)
-                        
-                        try:
-                            match = re.search(pattern_regex, line, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-                            if match:
-                                groupdict = match.groupdict()
-                                
-                                if current_activity:
-                                    groupdict['ActivityType'] = current_activity
-                                
-                                for k, v in groupdict.items():
-                                    if v:
-                                        entities.setdefault(k, []).append(f"{v} (Body)")
-                                
-                                self.usage_tracker.record_match(pattern_id, line)
-                                result['value'] = line
-                                result['pattern_id'] = pattern_id
-                                break
-                        
-                        except Exception as e:
-                            logger.debug(f"Pattern error: {e}")
+            else:
+                # ✗ Line is UNSEEN - doesn't match any complete pattern
+                logger.info(f"✗ Unseen pattern: {line[:50]}...")
+                unseen_count += 1
                 
-                # ===== QUEUE FOR RAG IF UNSEEN =====
-                if not result['value'] and self.rag_extractor:
-                    self.rag_extractor.detect_unseen_and_queue(line, entity_name, result)
-                    unseen_count += 1
-                
-                results[entity_name] = result
+                # Queue for RAG analysis
+                self.rag_extractor.rag_processor.add_unseen_pattern(line, "PackageDetails")
         
         # Display results
         self.entity_result_text.delete(1.0, tk.END)
-        
         if entities:
-            for entity_name, vals in entities.items():
-                self.entity_result_text.insert(tk.END, f"{entity_name}:\n")
-                for v in vals:
-                    self.entity_result_text.insert(tk.END, f"  - {v}\n")
-                self.entity_result_text.insert(tk.END, "\n")
+            for k, vals in entities.items():
+                self.entity_result_text.insert(tk.END, f"{k}: {', '.join(vals)}\n")
         else:
-            self.entity_result_text.insert(tk.END, "No entities found")
+            self.entity_result_text.insert(tk.END, "No matching patterns found")
         
-        logger.info(f"Extraction complete. Unseen texts queued: {unseen_count}")
-        logger.info("Waiting for RAG analysis to complete...")
+        logger.info(f"Complete extraction. Unseen patterns: {unseen_count}")
         
-        # ===== WAIT FOR RAG ANALYSIS =====
+        # Generate RAG report
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
         
-        try:
-            rag_results = self.rag_extractor.finish_and_generate_report(rag_report_path)
-            logger.info(f"✓ RAG report generated: {rag_report_path}")
-            messagebox.showinfo("Success", f"Complete!\nReport: {rag_report_path}")
-        
-        except Exception as rag_error:
-            logger.error(f"RAG error: {str(rag_error)}")
-            messagebox.showwarning("Warning", f"Extraction done.\nRAG error: {str(rag_error)}")
+        rag_results = self.rag_extractor.finish_and_generate_report(rag_report_path)
+        messagebox.showinfo("Success", f"Complete!\nReport: {rag_report_path}")
     
     except Exception as e:
-        logger.error(f"Extraction error: {str(e)}", exc_info=True)
+        logger.error(f"Error: {str(e)}", exc_info=True)
         messagebox.showerror("Error", f"Failed: {str(e)}")

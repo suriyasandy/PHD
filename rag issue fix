@@ -1,0 +1,194 @@
+def extract_entities(self):
+    """Extract entities with proper cleanup and RAG reset"""
+    
+    if self.selected_email is None:
+        messagebox.showwarning("No Selection", "Please select an email from the chain first")
+        return
+    
+    try:
+        # ===== FIX 1: RESET RAG PROCESSOR =====
+        if hasattr(self, 'rag_extractor') and self.rag_extractor:
+            logger.info("Stopping previous RAG processor...")
+            self.rag_extractor.rag_processor.stop_and_wait(timeout=2.0)
+            self.rag_extractor = None  # Reset for new run
+        
+        entity_json = self.entity_text.get(1.0, tk.END).strip()
+        self.entity_definitions = json.loads(entity_json)
+    
+    except json.JSONDecodeError as e:
+        messagebox.showerror("JSON Error", f"Invalid JSON format: {str(e)}")
+        return
+    
+    try:
+        # ===== FIX 2: CLEAR RESULTS COMPLETELY =====
+        self.clear_results()
+        
+        # ===== CRITICAL: Clear Treeview completely =====
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        
+        entity_names = self.pattern_manager.get_all_entity_names()
+        email_data = self.selected_email
+        results = {}
+        entities = {}
+        
+        # Log selected email info
+        logger.info(f"Processing email: {email_data['subject']}")
+        logger.info(f"  Threaded: {email_data.get('is_threaded', False)}")
+        logger.info(f"  Body size: {len(email_data['body'])} chars")
+        
+        # Process email body (already cleaned of threads)
+        email_lines = email_data['body'].splitlines()
+        email_lines = list(filter(None, email_lines))  # Remove empty lines
+        
+        current_activity = None
+        
+        for line in email_lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for activity keywords
+            line_upper = line.upper()
+            for keyword in self.activity_keywords:
+                if keyword in line_upper:
+                    current_activity = line_upper
+                    logger.info(f"Activity changed to: {current_activity}")
+                    break
+            
+            # Extract entities from line
+            for entity_name in entity_names:
+                patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+                
+                result = {
+                    'value': None,
+                    'pattern_id': None,
+                    'entity_name': entity_name
+                }
+                
+                for pattern_entry in patterns:
+                    entity_type = pattern_entry.get('entity_type', 'pattern')
+                    
+                    if entity_type == "pattern":
+                        pattern_id = pattern_entry['pattern_id']
+                        pattern_regex = pattern_entry['pattern']
+                        
+                        self.usage_tracker.record_attempt(pattern_id)
+                        
+                        try:
+                            match = re.search(pattern_regex, line, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                            if match:
+                                groupdict = match.groupdict()
+                                
+                                # Add activity type
+                                if current_activity:
+                                    groupdict['ActivityType'] = current_activity
+                                
+                                # Extract all named groups
+                                for k, v in groupdict.items():
+                                    if v:
+                                        entities.setdefault(k, []).append(f"{v} (Body)")
+                                
+                                self.usage_tracker.record_match(pattern_id, line)
+                                result['value'] = line
+                                result['pattern_id'] = pattern_id
+                                break
+                        
+                        except re.error as regex_error:
+                            logger.error(f"Regex error in pattern {pattern_id}: {regex_error}")
+                            pass
+                    
+                    elif entity_type == "gazetteer":
+                        # Your gazetteer extraction code
+                        gazetteer_vals = entity_def.get("values", [])
+                        subject_vals = self.extract_with_gazetteer(email_data['subject'], gazetteer_vals)
+                        body_vals = self.extract_with_gazetteer(line, gazetteer_vals)
+                        all_vals = []
+                        
+                        for v in subject_vals:
+                            all_vals.append(f"{v} (Subject)")
+                        for v in body_vals:
+                            all_vals.append(f"{v} (Body)")
+                        
+                        if all_vals:
+                            entities[entity_name] = all_vals
+                
+                # ===== QUEUE FOR RAG (Non-blocking) =====
+                if hasattr(self, 'rag_extractor') and self.rag_extractor:
+                    self.rag_extractor.detect_unseen_and_queue(line, entity_name, result)
+                
+                results[entity_name] = result
+        
+        # ===== DISPLAY RESULTS =====
+        self.entity_result_text.delete(1.0, tk.END)
+        
+        if entities:
+            for entity_name, vals in entities.items():
+                self.entity_result_text.insert(tk.END, f"{entity_name}:\n")
+                for v in vals:
+                    self.entity_result_text.insert(tk.END, f"  - {v}\n")
+                self.entity_result_text.insert(tk.END, "\n")
+        else:
+            self.entity_result_text.insert(tk.END, "No entities found in this email")
+        
+        # ===== FIX 3: INITIALIZE RAG ONLY ONCE =====
+        if not hasattr(self, 'rag_extractor') or self.rag_extractor is None:
+            logger.info("Initializing RAG processor...")
+            self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
+        
+        # ===== FIX 4: GENERATE RAG REPORT WITH TIMEOUT =====
+        logger.info("Waiting for RAG analysis...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
+        
+        try:
+            # Finish RAG with extended timeout for second+ runs
+            rag_results = self.rag_extractor.finish_and_generate_report(rag_report_path)
+            logger.info(f"✓ RAG report: {rag_report_path}")
+            messagebox.showinfo("Success", f"Extraction complete!\nRAG Report: {rag_report_path}")
+        
+        except Exception as rag_error:
+            logger.error(f"RAG report error: {str(rag_error)}")
+            messagebox.showwarning("RAG Warning", f"Extraction done but RAG report failed: {str(rag_error)}")
+    
+    except Exception as e:
+        logger.error(f"Error in extraction: {str(e)}", exc_info=True)
+        messagebox.showerror("Extraction Error", f"Failed to extract entities: {str(e)}")
+
+
+def clear_results(self):
+    """Completely clear all results"""
+    logger.info("Clearing previous results...")
+    
+    # Clear entity text
+    self.entity_result_text.delete(1.0, tk.END)
+    
+    # ===== CLEAR TREEVIEW COMPLETELY =====
+    for item in self.tree.get_children():
+        self.tree.delete(item)
+    
+    # Reset lists
+    self.emails = []
+    self.unfound_trades = []
+    
+    logger.info("Results cleared")
+
+
+# ===== HELPER: Clear selection when extracting new email =====
+def on_treeview_select(self, event):
+    """When user selects email, prepare for extraction"""
+    selection = self.tree.selection()
+    
+    if not selection:
+        return
+    
+    item_id = selection[0]
+    
+    # Find corresponding email
+    for entry in self.emails:
+        for idx, mail in enumerate(enumerate(entry['emails']), 1):
+            # Set as selected
+            self.selected_email = mail
+            logger.info(f"Selected email: {mail['subject']}")
+            break
+

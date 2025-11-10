@@ -1,14 +1,16 @@
 """
-Optimized RAG Pattern Detection with Email Thread Filtering
-- Fast extraction (only processes email body, excludes threads)
-- Smart pattern detection with label-aware RAG
-- Suggests pattern combinations
+Parallel RAG with Config-Only Labels
+- Uses unique labels from your actual config patterns
+- Auto-generates patterns with those same labels in new combinations
+- Zero generic patterns
 """
 
 import os
 import re
 import json
 import logging
+import threading
+import queue
 from typing import Dict, List, Set
 from collections import defaultdict
 from datetime import datetime
@@ -19,569 +21,461 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# EMAIL THREAD CLEANER - Remove Previous Email Threads
+# CONFIG LABEL EXTRACTOR
 # ============================================================================
 
-class EmailThreadCleaner:
-    """Clean email body to remove previous threads/headers/footers"""
-    
-    # Common email thread separators
-    THREAD_MARKERS = [
-        r'From:.*?Sent:.*?To:',  # Outlook style
-        r'On.*?wrote:',  # Gmail style
-        r'_{5,}',  # Horizontal lines
-        r'Original Message',
-        r'Forwarded message',
-        r'---------- Forwarded message',
-    ]
+class ConfigLabelExtractor:
+    """Extract all unique labels from your config patterns"""
     
     @staticmethod
-    def clean_email_body(body: str) -> str:
+    def extract_all_labels(pattern_manager) -> Dict[str, str]:
         """
-        Extract only the current email body, remove threads
+        Extract all unique labels and their regex patterns from config
         
-        Returns the text BEFORE first email thread marker
+        Returns:
+        {
+            'TradeID': r'(?P<TradeID>\\d{7,8})',
+            'Currency_1': r'(?P<Currency_1>[A-Z]{3})',
+            'Notional_1': r'(?P<Notional_1>\\$?\\d+(?:,\\d{3})*)',
+            ...
+        }
         """
-        if not body:
-            return ""
+        unique_labels = {}
         
-        # Find earliest thread marker
-        earliest_pos = len(body)
+        # Get all patterns from config
+        for entity_name in pattern_manager.get_all_entity_names():
+            patterns = pattern_manager.get_patterns_for_entity(entity_name)
+            
+            for pattern_info in patterns:
+                pattern_str = pattern_info.get('pattern', '')
+                
+                # Find all named groups in pattern
+                named_group_pattern = r'\(\?P<(\w+)>([^)]+(?:\([^)]*\))*[^)]*)\)'
+                
+                for match in re.finditer(named_group_pattern, pattern_str):
+                    label_name = match.group(1)
+                    label_regex = match.group(2)
+                    
+                    # Store first occurrence of each label
+                    if label_name not in unique_labels:
+                        unique_labels[label_name] = label_regex
+                        logger.info(f"Found label: {label_name} = {label_regex[:80]}")
         
-        for marker_pattern in EmailThreadCleaner.THREAD_MARKERS:
-            match = re.search(marker_pattern, body, re.IGNORECASE | re.MULTILINE)
-            if match and match.start() < earliest_pos:
-                earliest_pos = match.start()
-        
-        # Return text before thread
-        clean_body = body[:earliest_pos].strip()
-        
-        logger.info(f"Cleaned email: {len(body)} → {len(clean_body)} chars")
-        return clean_body
+        logger.info(f"Total unique labels from config: {len(unique_labels)}")
+        return unique_labels
 
 
 # ============================================================================
-# OPTIMIZED UNSEEN PATTERN DETECTOR
+# BACKGROUND RAG PROCESSOR - Config Labels Only
 # ============================================================================
 
-class OptimizedUnseenPatternDetector:
+class BackgroundRAGProcessor:
     """
-    Fast pattern detector with:
-    1. Only checks entity's own patterns (not all patterns)
-    2. Extracts label-specific patterns for RAG
-    3. Suggests pattern combinations
+    Runs RAG analysis using ONLY config labels
+    Auto-generates patterns with same labels in different combinations
     """
     
     def __init__(self, pattern_manager, knowledge_base):
         self.pattern_manager = pattern_manager
         self.knowledge_base = knowledge_base
-        self.unseen_texts = defaultdict(list)
         
-        # Build label-to-pattern mapping
-        self.label_to_patterns = self._build_label_pattern_map()
+        # Extract ALL unique labels from config
+        self.config_labels = ConfigLabelExtractor.extract_all_labels(pattern_manager)
         
-        # Store all config patterns for library
-        self.all_config_patterns = self._load_all_patterns()
+        logger.info(f"RAG Processor initialized with {len(self.config_labels)} config labels:")
+        for label_name in self.config_labels.keys():
+            logger.info(f"  - {label_name}")
+        
+        # Queue for processing
+        self.unseen_queue = queue.Queue()
+        
+        # Results storage
+        self.unseen_data = defaultdict(list)
+        self.processing_complete = threading.Event()
+        
+        # Background thread
+        self.processor_thread = None
+        self.is_running = False
     
-    def _load_all_patterns(self) -> List[Dict]:
-        """Load all patterns for library"""
-        all_patterns = []
-        for entity_name in self.pattern_manager.get_all_entity_names():
-            patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
-            all_patterns.extend(patterns)
-        return all_patterns
+    def start(self):
+        """Start background processing thread"""
+        if self.is_running:
+            return
+        
+        self.is_running = True
+        self.processing_complete.clear()
+        
+        self.processor_thread = threading.Thread(
+            target=self._process_queue,
+            daemon=True,
+            name="RAG-Processor"
+        )
+        self.processor_thread.start()
+        logger.info("Background RAG processor started")
     
-    def _build_label_pattern_map(self) -> Dict[str, List[Dict]]:
+    def add_unseen_text(self, entity_name: str, text: str):
+        """Add unseen text for RAG processing (non-blocking)"""
+        self.unseen_queue.put({
+            'entity_name': entity_name,
+            'text': text,
+            'timestamp': datetime.now()
+        })
+    
+    def _process_queue(self):
+        """Background thread: process unseen texts using config labels"""
+        logger.info("RAG processor thread running...")
+        
+        while self.is_running:
+            try:
+                item = self.unseen_queue.get(timeout=1.0)
+                
+                entity_name = item['entity_name']
+                text = item['text']
+                
+                # Analyze using config labels only
+                analysis = self._analyze_with_config_labels(text, entity_name)
+                
+                if analysis:
+                    self.unseen_data[entity_name].append(analysis)
+                
+                self.unseen_queue.task_done()
+                
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"Error in RAG processor: {e}")
+    
+    def _analyze_with_config_labels(self, text: str, entity_name: str) -> Dict:
         """
-        Build map of label → patterns that extract it
-        
-        Example:
-        {
-            'TradeID': [
-                {'pattern': '(?P<TradeID>\\d{7,8})', 'pattern_id': 'PKG_PTN001'},
-                {'pattern': '(?P<TradeID>\\w{8})', 'pattern_id': 'PKG_PTN002'}
-            ],
-            'Currency_1': [...]
+        Analyze unseen text using ONLY config labels
+        """
+        analysis = {
+            'text': text,
+            'candidates': [],
+            'suggested_patterns': []
         }
-        """
-        label_map = defaultdict(list)
         
-        for entity_name in self.pattern_manager.get_all_entity_names():
-            patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
-            
-            for pattern_info in patterns:
-                pattern_str = pattern_info.get('pattern', '')
-                pattern_id = pattern_info.get('pattern_id', 'UNKNOWN')
-                
-                # Extract named groups (labels) from pattern
-                named_groups = re.findall(r'\(\?P<(\w+)>', pattern_str)
-                
-                for label in named_groups:
-                    label_map[label].append({
-                        'label': label,
-                        'pattern': pattern_str,
-                        'pattern_id': pattern_id,
-                        'entity_name': entity_name
-                    })
+        # Try to match using each config label pattern
+        candidates = self._extract_with_config_labels(text, entity_name)
+        analysis['candidates'] = candidates
         
-        logger.info(f"Built label map with {len(label_map)} labels")
-        return label_map
+        # Generate pattern suggestions using same labels
+        if candidates:
+            candidate_values = [c['value'] for c in candidates]
+            suggestions = self._generate_config_based_suggestions(entity_name, candidate_values, candidates)
+            analysis['suggested_patterns'] = suggestions
+        
+        return analysis
     
-    def detect_unseen(self, text: str, entity_name: str, extracted_result: Dict) -> bool:
-        """Detect unseen patterns (FAST: only tries entity's patterns)"""
-        if not extracted_result.get('value'):
-            # Only try patterns for THIS entity (not all patterns)
-            candidates = self._extract_candidates_fast(text, entity_name)
-            
-            if candidates:
-                self.unseen_texts[entity_name].extend(candidates)
-                return True
-        
-        return False
-    
-    def _extract_candidates_fast(self, text: str, entity_name: str) -> List[Dict]:
+    def _extract_with_config_labels(self, text: str, entity_name: str) -> List[Dict]:
         """
-        FAST candidate extraction:
-        - Only tries patterns for the specific entity
-        - Extracts by label for better RAG suggestions
+        Extract values using existing label patterns from config
         """
         candidates = []
         seen_values = set()
         
-        # Only get patterns for THIS entity
-        entity_patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        logger.debug(f"Trying {len(self.config_labels)} config labels on text...")
         
-        logger.info(f"Trying {len(entity_patterns)} patterns for {entity_name}...")
-        
-        for pattern_info in entity_patterns:
-            pattern_id = pattern_info.get('pattern_id', 'UNKNOWN')
-            pattern_str = pattern_info.get('pattern', '')
-            
-            if not pattern_str:
-                continue
+        # Try each config label pattern
+        for label_name, label_regex in self.config_labels.items():
+            # Create a searchable pattern from the label regex
+            search_pattern = f"(?P<{label_name}>{label_regex})"
             
             try:
-                # Try pattern
-                matches = re.finditer(pattern_str, text, re.IGNORECASE | re.MULTILINE | re.DOTALL)
+                matches = re.finditer(search_pattern, text, re.IGNORECASE | re.MULTILINE)
                 
                 for match in matches:
-                    # Extract named groups
-                    group_dict = match.groupdict()
+                    value = match.group(label_name)
                     
-                    if group_dict:
-                        # Extract each named group
-                        for label, value in group_dict.items():
-                            if value and value.strip() and value not in seen_values:
-                                candidates.append({
-                                    'value': value.strip(),
-                                    'label': label,
-                                    'pattern_id': pattern_id,
-                                    'pattern_used': pattern_str[:80],
-                                    'entity_name': entity_name,
-                                    'extraction_method': 'label_extraction'
-                                })
-                                seen_values.add(value)
-                    else:
-                        # No named groups - use group 1 or full match
-                        value = None
-                        if match.lastindex and match.lastindex >= 1:
-                            value = match.group(1).strip()
-                        else:
-                            value = match.group(0).strip()
-                        
-                        if value and value not in seen_values:
-                            candidates.append({
-                                'value': value,
-                                'label': 'FULL_MATCH',
-                                'pattern_id': pattern_id,
-                                'pattern_used': pattern_str[:80],
-                                'entity_name': entity_name,
-                                'extraction_method': 'full_match'
-                            })
-                            seen_values.add(value)
+                    if value and value.strip() and value not in seen_values:
+                        candidates.append({
+                            'value': value.strip(),
+                            'label': label_name,
+                            'label_regex': label_regex,
+                            'method': 'config_label_pattern'
+                        })
+                        seen_values.add(value)
+                        logger.debug(f"  ✓ Matched {label_name}: {value[:50]}")
             
             except Exception as e:
-                logger.debug(f"Pattern {pattern_id} error: {e}")
+                logger.debug(f"Label {label_name} error: {e}")
         
-        logger.info(f"Found {len(candidates)} candidates for {entity_name}")
         return candidates
     
-    def get_unseen_summary(self) -> Dict:
-        """Get summary for report"""
-        summary = {}
-        
-        for entity_name, candidate_list in self.unseen_texts.items():
-            # Group by label
-            by_label = defaultdict(lambda: {'values': [], 'patterns_used': set()})
-            
-            for candidate in candidate_list:
-                if isinstance(candidate, dict):
-                    label = candidate.get('label', 'UNKNOWN')
-                    value = candidate.get('value', str(candidate))
-                    pattern = candidate.get('pattern_used', 'N/A')
-                    
-                    by_label[label]['values'].append(value)
-                    by_label[label]['patterns_used'].add(pattern)
-            
-            summary[entity_name] = {
-                'total_count': len(candidate_list),
-                'by_label': {
-                    label: {
-                        'count': len(data['values']),
-                        'examples': list(set(data['values']))[:10],
-                        'pattern_count': len(data['patterns_used']),
-                        'patterns_used': list(data['patterns_used'])[:3]
-                    }
-                    for label, data in by_label.items()
-                }
-            }
-        
-        return summary
-    
-    # For report compatibility
-    @property
-    def label_pattern_library(self):
-        """Convert label_to_patterns to library format for report"""
-        library = {}
-        for label, patterns in self.label_to_patterns.items():
-            library[label] = patterns
-        return library
-    
-    @property
-    def all_config_patterns(self):
-        """Return all patterns for report"""
-        return self._all_config_patterns
-    
-    @all_config_patterns.setter
-    def all_config_patterns(self, value):
-        self._all_config_patterns = value
-
-
-# ============================================================================
-# ENHANCED PATTERN SUGGESTION ENGINE
-# ============================================================================
-
-class EnhancedPatternSuggestionEngine:
-    """
-    Enhanced engine that:
-    1. Suggests existing patterns by label similarity
-    2. Suggests new pattern combinations
-    """
-    
-    def __init__(self, knowledge_base, label_to_patterns):
-        self.knowledge_base = knowledge_base
-        self.label_to_patterns = label_to_patterns
-    
-    def suggest_patterns(self, entity_name: str, unseen_examples: List[str]) -> List[Dict]:
-        """Generate smart pattern suggestions"""
+    def _generate_config_based_suggestions(self, entity_name: str, examples: List[str], 
+                                          candidates: List[Dict]) -> List[Dict]:
+        """
+        Generate pattern suggestions by:
+        1. Finding similar patterns from RAG
+        2. Creating new combinations of config labels
+        """
         suggestions = []
         
-        # Strategy 1: Find similar patterns from RAG knowledge base
-        query = f"Entity: {entity_name}, examples: {', '.join(unseen_examples[:3])}"
+        # Strategy 1: RAG similarity matching
+        query = f"Entity: {entity_name}, examples: {', '.join(examples[:3])}"
         similar_patterns = self.knowledge_base.search_similar_patterns(query, top_k=5)
         
         for similar in similar_patterns:
             suggestions.append({
-                'suggested_pattern': similar['pattern'][:150],
+                'pattern': similar['pattern'][:150],
                 'pattern_id': similar['pattern_id'],
+                'similarity': similar['similarity_score'],
                 'method': 'RAG_SIMILARITY',
-                'similarity_score': similar['similarity_score'],
-                'based_on_pattern_id': similar['pattern_id'],
-                'reasoning': f"Similar to {similar['entity_name']} patterns",
-                'test_examples': unseen_examples[:3]
+                'reasoning': f"Similar to {similar['entity_name']} pattern"
             })
         
-        # Strategy 2: Suggest pattern combinations
-        # Analyze which labels might need to be combined
-        combination_suggestions = self._suggest_pattern_combinations(entity_name, unseen_examples)
-        suggestions.extend(combination_suggestions)
+        # Strategy 2: Create new combinations of config labels
+        detected_labels = set(c['label'] for c in candidates)
         
-        return suggestions
-    
-    def _suggest_pattern_combinations(self, entity_name: str, examples: List[str]) -> List[Dict]:
-        """
-        Suggest new combinations of existing label patterns
-        
-        Example: If we have TradeID pattern and Currency pattern separately,
-        suggest combining them into one composite pattern
-        """
-        suggestions = []
-        
-        # Detect which labels might be present in examples
-        potential_labels = self._detect_potential_labels(examples)
-        
-        if len(potential_labels) >= 2:
-            # Suggest combining patterns
-            combined_pattern_parts = []
-            used_pattern_ids = []
+        if len(detected_labels) >= 2:
+            # Suggest new pattern combining detected labels
+            combined_pattern = self._create_combined_pattern(list(detected_labels))
             
-            for label in potential_labels[:3]:  # Combine up to 3 labels
-                if label in self.label_to_patterns:
-                    # Get one pattern for this label
-                    pattern_info = self.label_to_patterns[label][0]
-                    # Extract just the named group part
-                    named_group_match = re.search(r'\(\?P<' + label + r'>([^)]+)\)', pattern_info['pattern'])
-                    if named_group_match:
-                        combined_pattern_parts.append(f"(?P<{label}>{named_group_match.group(1)})")
-                        used_pattern_ids.append(pattern_info['pattern_id'])
-            
-            if len(combined_pattern_parts) >= 2:
-                # Create combined pattern
-                combined = r'.*?'.join(combined_pattern_parts)
-                
+            if combined_pattern:
                 suggestions.append({
-                    'suggested_pattern': combined[:150],
-                    'pattern_id': 'COMBINATION_' + '_'.join(potential_labels[:2]),
-                    'method': 'PATTERN_COMBINATION',
-                    'similarity_score': 0.75,
-                    'based_on_pattern_id': ', '.join(used_pattern_ids),
-                    'reasoning': f"Combination of {', '.join(potential_labels)} patterns",
-                    'test_examples': examples[:3]
+                    'pattern': combined_pattern,
+                    'pattern_id': 'CONFIG_COMBINATION',
+                    'similarity': 0.75,
+                    'method': 'CONFIG_LABEL_COMBINATION',
+                    'reasoning': f"New combination of config labels: {', '.join(detected_labels)}"
+                })
+        
+        # Strategy 3: Generate pattern with detected labels in different order
+        if len(detected_labels) >= 2:
+            # Try alternative arrangement of same labels
+            alt_pattern = self._create_alternative_label_pattern(list(detected_labels))
+            
+            if alt_pattern:
+                suggestions.append({
+                    'pattern': alt_pattern,
+                    'pattern_id': 'CONFIG_REARRANGED',
+                    'similarity': 0.70,
+                    'method': 'CONFIG_LABEL_REARRANGEMENT',
+                    'reasoning': f"Rearranged order of config labels: {', '.join(detected_labels)}"
                 })
         
         return suggestions
     
-    def _detect_potential_labels(self, examples: List[str]) -> List[str]:
-        """Detect which labels might be present in unseen examples"""
-        potential_labels = []
+    def _create_combined_pattern(self, labels: List[str]) -> str:
+        """
+        Combine detected labels into a new pattern
+        Example: If we found TradeID and Currency, create pattern combining both
+        """
+        if not labels or len(labels) < 2:
+            return None
         
-        # Try each label's patterns on examples
-        for label, pattern_list in self.label_to_patterns.items():
-            for pattern_info in pattern_list[:2]:  # Try first 2 patterns per label
-                pattern_str = pattern_info['pattern']
+        pattern_parts = []
+        
+        for label in labels[:3]:  # Combine up to 3 labels
+            if label in self.config_labels:
+                label_regex = self.config_labels[label]
+                # Wrap in named group
+                pattern_parts.append(f"(?P<{label}>{label_regex})")
+        
+        if len(pattern_parts) >= 2:
+            # Join with flexible separator
+            combined = r'.*?'.join(pattern_parts)
+            return combined
+        
+        return None
+    
+    def _create_alternative_label_pattern(self, labels: List[str]) -> str:
+        """
+        Create alternative arrangement of same config labels
+        Example: TradeID-Currency vs Currency-TradeID
+        """
+        if not labels or len(labels) < 2:
+            return None
+        
+        # Reverse order
+        reversed_labels = list(reversed(labels[:3]))
+        
+        pattern_parts = []
+        for label in reversed_labels:
+            if label in self.config_labels:
+                label_regex = self.config_labels[label]
+                pattern_parts.append(f"(?P<{label}>{label_regex})")
+        
+        if len(pattern_parts) >= 2:
+            alternative = r'.*?'.join(pattern_parts)
+            return alternative
+        
+        return None
+    
+    def stop_and_wait(self, timeout: float = 5.0):
+        """Stop processor and wait for completion"""
+        self.is_running = False
+        
+        # Wait for queue to empty
+        self.unseen_queue.join()
+        
+        # Wait for thread
+        if self.processor_thread:
+            self.processor_thread.join(timeout=timeout)
+        
+        self.processing_complete.set()
+        logger.info("RAG processor stopped")
+    
+    def get_results(self) -> Dict:
+        """Get processed results"""
+        return dict(self.unseen_data)
+    
+    def save_rag_report(self, output_path: str):
+        """Save comprehensive RAG report"""
+        logger.info(f"Generating RAG report: {output_path}")
+        
+        results = self.get_results()
+        
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            
+            # Sheet 1: Config Labels Library
+            labels_data = []
+            for label_name, label_regex in self.config_labels.items():
+                labels_data.append({
+                    'Label Name': label_name,
+                    'Label Regex': label_regex[:120],
+                    'Full Regex': label_regex
+                })
+            
+            if labels_data:
+                pd.DataFrame(labels_data).to_excel(writer, sheet_name='Config Labels', index=False)
+            
+            # Sheet 2: Unseen Texts Overview
+            overview_data = []
+            for entity, analyses in results.items():
+                total_texts = len(analyses)
+                total_candidates = sum(len(a['candidates']) for a in analyses)
+                sample_values = []
+                for a in analyses[:3]:
+                    sample_values.extend([c['value'] for c in a['candidates'][:2]])
                 
-                try:
-                    for example in examples[:5]:
-                        if re.search(pattern_str, example, re.IGNORECASE):
-                            if label not in potential_labels:
-                                potential_labels.append(label)
-                            break
-                except:
-                    pass
+                overview_data.append({
+                    'Entity': entity,
+                    'Unseen Texts': total_texts,
+                    'Total Candidates': total_candidates,
+                    'Sample Values': ', '.join(sample_values[:5])
+                })
+            
+            if overview_data:
+                pd.DataFrame(overview_data).to_excel(writer, sheet_name='Unseen Overview', index=False)
+            
+            # Sheet 3: Candidate Details by Label
+            candidate_data = []
+            for entity, analyses in results.items():
+                for analysis in analyses:
+                    for candidate in analysis['candidates']:
+                        candidate_data.append({
+                            'Entity': entity,
+                            'Value': candidate['value'],
+                            'Config Label': candidate['label'],
+                            'Label Regex': candidate['label_regex'][:80],
+                            'Detection Method': candidate['method']
+                        })
+            
+            if candidate_data:
+                pd.DataFrame(candidate_data).to_excel(writer, sheet_name='Candidates', index=False)
+            
+            # Sheet 4: Pattern Suggestions (Using Config Labels)
+            suggestion_data = []
+            for entity, analyses in results.items():
+                for analysis in analyses:
+                    for suggestion in analysis['suggested_patterns']:
+                        suggestion_data.append({
+                            'Entity': entity,
+                            'Suggested Pattern': suggestion['pattern'][:150],
+                            'Method': suggestion['method'],
+                            'Similarity': suggestion['similarity'],
+                            'Reasoning': suggestion['reasoning']
+                        })
+            
+            if suggestion_data:
+                pd.DataFrame(suggestion_data).to_excel(writer, sheet_name='Suggestions', index=False)
+            
+            # Sheet 5: Summary
+            summary_data = [
+                {'Metric': 'Config Labels Available', 'Value': len(self.config_labels)},
+                {'Metric': 'Entities Analyzed', 'Value': len(results)},
+                {'Metric': 'Total Unseen Texts', 'Value': sum(len(analyses) for analyses in results.values())},
+                {'Metric': 'Total Candidates Found', 'Value': sum(sum(len(a['candidates']) for a in analyses) for analyses in results.values())}
+            ]
+            
+            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
         
-        return potential_labels
+        logger.info(f"✓ RAG report saved: {output_path}")
 
 
 # ============================================================================
-# COMPLETE EXTRACTOR (UPDATED)
+# RAG ENABLED EXTRACTOR WRAPPER
 # ============================================================================
 
-class CompleteOfflineRAGExtractor:
-    """Complete RAG extractor with all optimizations"""
+class RAGEnabledExtractor:
+    """Wrapper adding parallel RAG to existing extraction"""
     
     def __init__(self, pattern_manager, tracker):
         self.pattern_manager = pattern_manager
         self.tracker = tracker
-        self.email_cleaner = EmailThreadCleaner()
         
-        # Initialize components
         from offline_rag import OfflinePatternKnowledgeBase
         
         self.knowledge_base = OfflinePatternKnowledgeBase(pattern_manager.config_file)
-        self.unseen_detector = OptimizedUnseenPatternDetector(pattern_manager, self.knowledge_base)
-        self.suggestion_engine = EnhancedPatternSuggestionEngine(
-            self.knowledge_base,
-            self.unseen_detector.label_to_patterns
-        )
+        self.rag_processor = BackgroundRAGProcessor(pattern_manager, self.knowledge_base)
+        
+        # Start background processor
+        self.rag_processor.start()
     
-    def extract_entities(self, email_data: Dict) -> Dict:
-        """
-        Extract entities from email (matching your function signature)
-        
-        Args:
-            email_data: Dict with 'body', 'subject', etc.
-        
-        Returns:
-            Dict with extraction results
-        """
-        # Clean email body (remove threads)
-        raw_body = email_data.get('body', '')
-        clean_body = self.email_cleaner.clean_email_body(raw_body)
-        
-        # Get entity names
-        entity_names = self.pattern_manager.get_all_entity_names()
-        
-        results = {}
-        entities = {}
-        
-        # Track current activity (from your code)
-        current_activity = None
-        
-        # Process line by line (matching your existing logic)
-        lines = clean_body.splitlines()
-        lines = list(filter(None, lines))  # Remove empty lines
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Check for activity keywords (from your code)
-            line_upper = line.upper()
-            for keyword in getattr(self, 'activity_keywords', []):
-                if keyword in line_upper:
-                    current_activity = line_upper
-                    break
-            
-            # Extract entities from line
-            for entity_name in entity_names:
-                patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
-                
-                result = {
-                    'value': None,
-                    'pattern_id': None,
-                    'entity_name': entity_name
-                }
-                
-                for pattern_entry in patterns:
-                    pattern_id = pattern_entry['pattern_id']
-                    pattern_regex = pattern_entry['pattern']
-                    
-                    self.tracker.record_attempt(pattern_id)
-                    
-                    try:
-                        match = re.search(pattern_regex, line, re.IGNORECASE | re.MULTILINE | re.DOTALL)
-                        if match:
-                            groupdict = match.groupdict()
-                            
-                            # Add activity type to extracted data
-                            if current_activity:
-                                groupdict['ActivityType'] = current_activity
-                            
-                            # Extract values
-                            for k, v in groupdict.items():
-                                if v:
-                                    entities.setdefault(k, []).append(f"{v} (Body)")
-                            
-                            self.tracker.record_match(pattern_id, line)
-                            result['value'] = line
-                            result['pattern_id'] = pattern_id
-                            break
-                    except Exception as e:
-                        logger.debug(f"Pattern {pattern_id} error: {e}")
-                
-                # Detect unseen patterns
-                if not result['value']:
-                    result['is_unseen'] = self.unseen_detector.detect_unseen(line, entity_name, result)
-                
-                results[entity_name] = result
-        
-        return {'results': results, 'entities': entities}
+    def detect_unseen_and_queue(self, line: str, entity_name: str, result: Dict):
+        """Queue unseen text for RAG processing (non-blocking)"""
+        if not result.get('value'):
+            # Queue for background processing - returns instantly
+            self.rag_processor.add_unseen_text(entity_name, line)
+            result['is_unseen'] = True
     
-    def save_comprehensive_rag_report(self, output_path: str):
-        """Save comprehensive RAG report (unchanged)"""
-        logger.info(f"Generating comprehensive RAG report: {output_path}")
+    def finish_and_generate_report(self, report_path: str = None):
+        """Wait for RAG completion and generate report"""
+        logger.info("Waiting for RAG analysis to complete...")
+        self.rag_processor.stop_and_wait(timeout=10.0)
         
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            self._save_label_library_sheet(writer)
-            self._save_unseen_overview_sheet(writer)
-            self._save_candidates_by_label_sheet(writer)
-            self._save_pattern_suggestions_sheet(writer)
-            self._save_extraction_summary_sheet(writer)
+        if report_path:
+            self.rag_processor.save_rag_report(report_path)
         
-        logger.info(f"✓ RAG report saved: {output_path}")
-    
-    # [All _save_* methods remain the same as previous version]
-    
-    def _save_label_library_sheet(self, writer):
-        """Sheet 1: Label-to-Pattern Library"""
-        library_data = []
-        
-        for label, pattern_list in self.unseen_detector.label_to_patterns.items():
-            for pattern_info in pattern_list:
-                library_data.append({
-                    'Label': label,
-                    'Pattern ID': pattern_info['pattern_id'],
-                    'Entity': pattern_info['entity_name'],
-                    'Pattern': pattern_info['pattern'][:100]
-                })
-        
-        if library_data:
-            pd.DataFrame(library_data).to_excel(writer, sheet_name='Label Patterns', index=False)
-    
-    def _save_unseen_overview_sheet(self, writer):
-        """Sheet 2: Unseen Overview"""
-        unseen_summary = self.unseen_detector.get_unseen_summary()
-        overview_data = []
-        
-        for entity_name, data in unseen_summary.items():
-            labels = ', '.join(data.get('by_label', {}).keys())
-            all_examples = []
-            for label_data in data.get('by_label', {}).values():
-                all_examples.extend(label_data['examples'][:3])
-            
-            overview_data.append({
-                'Entity': entity_name,
-                'Total Candidates': data['total_count'],
-                'Labels Found': labels,
-                'Sample Values': ', '.join(all_examples[:5])
-            })
-        
-        if overview_data:
-            pd.DataFrame(overview_data).to_excel(writer, sheet_name='Unseen Overview', index=False)
-    
-    def _save_candidates_by_label_sheet(self, writer):
-        """Sheet 3: Candidates Detail"""
-        unseen_summary = self.unseen_detector.get_unseen_summary()
-        detailed_data = []
-        
-        for entity_name, data in unseen_summary.items():
-            for label, label_data in data.get('by_label', {}).items():
-                for example in label_data['examples']:
-                    detailed_data.append({
-                        'Entity': entity_name,
-                        'Label': label,
-                        'Candidate Value': example,
-                        'Count': label_data['count'],
-                        'Patterns Used': label_data['pattern_count']
-                    })
-        
-        if detailed_data:
-            pd.DataFrame(detailed_data).to_excel(writer, sheet_name='Candidates Detail', index=False)
-    
-    def _save_pattern_suggestions_sheet(self, writer):
-        """Sheet 4: RAG Suggestions"""
-        unseen_summary = self.unseen_detector.get_unseen_summary()
-        suggestions_data = []
-        
-        for entity_name, data in unseen_summary.items():
-            all_examples = []
-            for label_data in data.get('by_label', {}).values():
-                all_examples.extend(label_data['examples'][:5])
-            
-            if all_examples:
-                suggestions = self.suggestion_engine.suggest_patterns(entity_name, all_examples)
-                
-                for sug in suggestions:
-                    suggestions_data.append({
-                        'Entity': entity_name,
-                        'Suggested Pattern': sug['suggested_pattern'],
-                        'Method': sug['method'],
-                        'Similarity': sug['similarity_score'],
-                        'Based On': sug['based_on_pattern_id'],
-                        'Reasoning': sug['reasoning']
-                    })
-        
-        if suggestions_data:
-            pd.DataFrame(suggestions_data).to_excel(writer, sheet_name='RAG Suggestions', index=False)
-    
-    def _save_extraction_summary_sheet(self, writer):
-        """Sheet 5: Summary"""
-        unseen_summary = self.unseen_detector.get_unseen_summary()
-        
-        total_entities = len(unseen_summary)
-        total_candidates = sum(d['total_count'] for d in unseen_summary.values())
-        
-        summary_data = [
-            {'Metric': 'Entities with Unseen Patterns', 'Value': total_entities},
-            {'Metric': 'Total Candidates', 'Value': total_candidates},
-            {'Metric': 'Config Patterns', 'Value': len(self.unseen_detector.all_config_patterns)}
-        ]
-        
-        pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
+        return self.rag_processor.get_results()
 
 
-# Usage in your existing code:
-# extractor = CompleteOfflineRAGExtractor(pattern_manager, tracker)
-# result = extractor.extract_entities(email_data)
-# extractor.save_comprehensive_rag_report("report.xlsx")
+# ============================================================================
+# USAGE IN YOUR extract_entities FUNCTION
+# ============================================================================
+
+"""
+INTEGRATION EXAMPLE:
+
+# At top of class or module (initialize once)
+rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
+
+# In your existing extract_entities loop:
+for line in email_lines:
+    for entity_name in entity_names:
+        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        
+        result = {'value': None, 'pattern_id': None}
+        
+        # ... your existing extraction code ...
+        for pattern_entry in patterns:
+            # pattern matching logic
+            if match:
+                result['value'] = extracted_value
+                result['pattern_id'] = pattern_id
+                break
+        
+        # ADD THIS: Non-blocking RAG queue (one line!)
+        rag_extractor.detect_unseen_and_queue(line, entity_name, result)
+        
+        results[entity_name] = result
+
+# After extraction complete and CSV exported:
+# Generate RAG report
+print("Generating RAG report...")
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
+rag_extractor.finish_and_generate_report(rag_report_path)
+print(f"✓ RAG report: {rag_report_path}")
+"""

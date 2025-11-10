@@ -65,206 +65,203 @@ class EmailThreadParser:
 # MAIN MAIL HARVESTER CLASS (UPDATED)
 # ============================================================================
 
-class MailHarvester:
-    """Enhanced Mail Harvester with thread parsing"""
+def extract_email_chain_from_outlook(self):
+    """Modified to use thread parser"""
+    trade_ids_str = None
+    df = pd.DataFrame(columns=self.selected_columns)
     
-    def __init__(self, ...existing params...):
-        # ... existing initialization ...
-        self.thread_parser = EmailThreadParser()  # ADD THIS
+    if hasattr(self, "trade_ids_var") or isinstance(self.trade_ids_var, tk.StringVar):
+        trade_ids_str = self.trade_ids_var.get().strip()
     
-    # ... all existing methods unchanged ...
+    if not trade_ids_str:
+        file_path = self.file_path_var.get().strip()
+        if not file_path or not os.path.exists(file_path):
+            messagebox.showwarning("Input Error", "Please upload a valid file/input trade_id")
+            return
+        self.trade_ids_var.set(self.process_trade_file(file_path))
+        trade_ids_str = self.trade_ids_var.get().strip()
     
-    # MODIFIED: extract_email_chain_from_outlook
-    def extract_email_chain_from_outlook(self):
-        """Modified to use thread parser"""
-        trade_ids_str = None
-        df = pd.DataFrame(columns=self.selected_columns)
+    trade_ids = [tid.strip() for tid in re.split(",|\\s+", trade_ids_str) if tid.strip()]
+    logger.info(f"Input TradeIds: {trade_ids}")
+    
+    self.progress.start()
+    self.clear_results()
+    self.emails = []
+    self.unfound_trades = []
+    
+    def worker():
+        error_msg = None  # ← INITIALIZE ERROR VARIABLE HERE
         
-        if hasattr(self, "trade_ids_var") or isinstance(self.trade_ids_var, tk.StringVar):
-            trade_ids_str = self.trade_ids_var.get().strip()
-        
-        if not trade_ids_str:
-            file_path = self.file_path_var.get().strip()
-            if not file_path or not os.path.exists(file_path):
-                messagebox.showwarning("Input Error", "Please upload a valid file/input trade_id")
+        pythoncom.CoInitialize()
+        try:
+            folder = self.connect_to_outlook()
+            if not folder:
+                self.root.after(0, lambda: self.finish_extraction([], "Could not connect to folder"))
                 return
-            self.trade_ids_var.set(self.process_trade_file(file_path))
-            trade_ids_str = self.trade_ids_var.get().strip()
-        
-        trade_ids = [tid.strip() for tid in re.split(",|\\s+", trade_ids_str) if tid.strip()]
-        logger.info(f"Input TradeIds: {trade_ids}")
-        
-        self.progress.start()
-        self.clear_results()
-        self.emails = []
-        self.unfound_trades = []
-        
-        def worker():
-            pythoncom.CoInitialize()
-            try:
-                folder = self.connect_to_outlook()
-                if not folder:
-                    self.root.after(0, lambda: self.finish_extraction([], "Could not connect to folder"))
-                    return
+            
+            today = datetime.now() + timedelta(days=-1)
+            today = datetime.strptime(self.date_var.get(), "%Y-%m-%d") + timedelta(days=-1)
+            
+            days_back = 2
+            checked_days = 0
+            days_ago = 1
+            date_fmt, use_ampm = self.get_region_dateformat_ampm()
+            
+            logger.info(f"Detected locale dateformat: {date_fmt}, Use AM/PM: {use_ampm}")
+            all_items = []
+            
+            while checked_days < days_back:
+                d = today - timedelta(days=days_ago)
+                days_ago += 1
                 
-                today = datetime.now() + timedelta(days=-1)
-                today = datetime.strptime(self.date_var.get(), "%Y-%m-%d") + timedelta(days=-1)
+                if d.weekday() >= 5:
+                    continue
                 
-                days_back = 2
-                checked_days = 0
-                days_ago = 1
-                date_fmt, use_ampm = self.get_region_dateformat_ampm()
+                checked_days += 1
+                start_time, end_time = self.restrict_datetime_strings(d, date_fmt, use_ampm)
+                filter_str = f"[ReceivedTime] >= '{start_time}' AND [ReceivedTime] <= '{end_time}'"
                 
-                logger.info(f"Detected locale dateformat: {date_fmt}, Use AM/PM: {use_ampm}")
-                all_items = []
+                logger.info(f"Trying filter: {filter_str}")
                 
-                while checked_days < days_back:
-                    d = today - timedelta(days=days_ago)
-                    days_ago += 1
-                    
-                    if d.weekday() >= 5:
-                        continue
-                    
-                    checked_days += 1
-                    start_time, end_time = self.restrict_datetime_strings(d, date_fmt, use_ampm)
-                    filter_str = f"[ReceivedTime] >= '{start_time}' AND [ReceivedTime] <= '{end_time}'"
-                    
-                    logger.info(f"Trying filter: {filter_str}")
-                    
-                    items = folder.Items.Restrict(filter_str)
+                items = folder.Items.Restrict(filter_str)
+                items_list = self.process_items_in_batches(items, batch_size=150)
+                
+                if items_list and use_ampm:
+                    pm_l = d.replace(hour=13).strftime('%p').lower()
+                    pm_l_alt = d.replace(hour=13).strftime('%p').lower()
+                    start_time_l = f"{d.strftime(date_fmt)} 12:00:00 {am_l}"
+                    end_time_l = f"{d.strftime(date_fmt)} 11:59:59 {pm_l}"
+                    filter_str_l = f"[ReceivedTime] >= '{start_time_l}' AND [ReceivedTime] <= '{end_time_l}'"
+                    logger.info(f"Trying filter (lowercase): {filter_str_l}")
+                    items = folder.Items.Restrict(filter_str_l)
                     items_list = self.process_items_in_batches(items, batch_size=150)
-                    
-                    if items_list and use_ampm:
-                        pm_l = d.replace(hour=13).strftime('%p').lower()
-                        pm_l_alt = d.replace(hour=13).strftime('%p').lower()
-                        start_time_l = f"{d.strftime(date_fmt)} 12:00:00 {am_l}"
-                        end_time_l = f"{d.strftime(date_fmt)} 11:59:59 {pm_l}"
-                        filter_str_l = f"[ReceivedTime] >= '{start_time_l}' AND [ReceivedTime] <= '{end_time_l}'"
-                        logger.info(f"Trying filter (lowercase): {filter_str_l}")
-                        items = folder.Items.Restrict(filter_str_l)
-                        items_list = self.process_items_in_batches(items, batch_size=150)
-                    
-                    if items_list:
-                        logger.info(f"Found {len(items_list)} emails for {d.strftime(date_fmt)}")
-                        all_items.extend([entry["items"] for entry in items_list])
+                
+                if items_list:
+                    logger.info(f"Found {len(items_list)} emails for {d.strftime(date_fmt)}")
+                    all_items.extend([entry["items"] for entry in items_list])
+                else:
+                    logger.info(f"No emails for {d.strftime(date_fmt)}")
+            
+            # =============== CRITICAL: GROUP & SORT BY TRADE ID ===============
+            tid_re = re.compile("|".join(re.escape(tid) for tid in trade_ids), re.IGNORECASE)
+            matches_by_tradeid = {tid: [] for tid in trade_ids}
+            all_emails = []
+            
+            for item in all_items:
+                try:
+                    if getattr(item, "Class", None) == 43:
+                        subject = item.Subject or ""
+                        body = item.Body or ""
+                        html_body = ""
+                        try:
+                            html_body = item.HTMLBody
+                        except Exception:
+                            pass
+                        
+                        search_zone = f"{subject}\n{body}\n{html_body}"
+                        found_tids = set(m.lower() for m in tid_re.findall(search_zone))
+                        
+                        for orig_tid in trade_ids:
+                            if orig_tid.lower() in found_tids:
+                                # ============ THREAD PARSING ============
+                                thread_info = self.thread_parser.extract_latest_message(body)
+                                
+                                email_obj = {
+                                    'trade_id': orig_tid,
+                                    'subject': subject,
+                                    'sender': getattr(item, "SenderName", ""),
+                                    'recipient': getattr(item, "To", ""),
+                                    'date': item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S") if item.ReceivedTime else "",
+                                    'body': thread_info['latest_message'],  # ← LATEST ONLY
+                                    'is_threaded': thread_info['is_threaded'],
+                                    'thread_count': thread_info['thread_count'],
+                                    'raw_body': body
+                                }
+                                
+                                matches_by_tradeid[orig_tid].append(email_obj)
+                                all_emails.append(email_obj)
+                
+                except Exception as item_error:  # ← CAPTURE IN INNER TRY
+                    logger.warning(f"Error processing item: {str(item_error)}")
+                    pass
+            
+            gc.collect()
+            
+            # Sort each trade's emails by date (newest first)
+            for trade_id in sorted(matches_by_tradeid.keys()):
+                matches_by_tradeid[trade_id].sort(
+                    key=lambda x: parser.parse(x['date']) if x['date'] else datetime.min,
+                    reverse=True
+                )
+            
+            # Rebuild self.emails in sorted order
+            self.emails = []
+            for trade_id in sorted(matches_by_tradeid.keys()):
+                self.emails.append({"trade_id": trade_id, "emails": matches_by_tradeid[trade_id]})
+            
+            # Highlight for latest emails
+            self.tree.tag_configure('latest', background='#99ee99')
+            
+            # Populate Treeview
+            idx = 0
+            for entry in self.emails:
+                trade_emails = entry['emails']
+                for email_idx, mail in enumerate(trade_emails):
+                    if email_idx == 0:
+                        mail_type = "Latest"
                     else:
-                        logger.info(f"No emails for {d.strftime(date_fmt)}")
-                
-                # =============== CRITICAL: GROUP & SORT BY TRADE ID ===============
-                tid_re = re.compile("|".join(re.escape(tid) for tid in trade_ids), re.IGNORECASE)
-                matches_by_tradeid = {tid: [] for tid in trade_ids}
-                all_emails = []
-                
-                for item in all_items:
-                    try:
-                        if getattr(item, "Class", None) == 43:
-                            subject = item.Subject or ""
-                            body = item.Body or ""
-                            html_body = ""
-                            try:
-                                html_body = item.HTMLBody
-                            except Exception:
-                                pass
-                            
-                            search_zone = f"{subject}\n{body}\n{html_body}"
-                            found_tids = set(m.lower() for m in tid_re.findall(search_zone))
-                            
-                            for orig_tid in trade_ids:
-                                if orig_tid.lower() == found_tid:
-                                    # ============ ADD THREAD PARSING HERE ============
-                                    thread_info = self.thread_parser.extract_latest_message(body)
-                                    
-                                    email_obj = {
-                                        'trade_id': orig_tid,
-                                        'subject': subject,
-                                        'sender': getattr(item, "SenderName", ""),
-                                        'recipient': getattr(item, "To", ""),
-                                        'date': item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S") if item.ReceivedTime else "",
-                                        'body': thread_info['latest_message'],  # ← USE LATEST MESSAGE ONLY
-                                        'is_threaded': thread_info['is_threaded'],
-                                        'thread_count': thread_info['thread_count'],
-                                        'raw_body': body  # Keep for reference if needed
-                                    }
-                                    
-                                    matches_by_tradeid[orig_tid].append(email_obj)
-                                    all_emails.append(email_obj)
-                        
-                    except Exception:
-                        pass
-                
-                gc.collect()
-                
-                # Sort each trade's emails by date (newest first)
-                for trade_id in sorted(matches_by_tradeid.keys()):
-                    matches_by_tradeid[trade_id].sort(
-                        key=lambda x: parser.parse(x['date']) if x['date'] else datetime.min,
-                        reverse=True
-                    )
-                
-                # Rebuild self.emails in sorted order
-                self.emails = []
-                for trade_id in sorted(matches_by_tradeid.keys()):
-                    self.emails.append({"trade_id": trade_id, "emails": matches_by_tradeid[trade_id]})
-                
-                # Highlight for latest emails
-                self.tree.tag_configure('latest', background='#99ee99')
-                
-                # Populate Treeview using same structure
-                idx = 0
-                for entry in self.emails:
-                    trade_emails = entry['emails']
-                    for email_idx, mail in enumerate(trade_emails):
-                        if email_idx == 0:
-                            mail_type = "Latest"
+                        subj = mail['subject'].lower()
+                        if "re:" in subj or "re :" in subj:
+                            mail_type = f"Reply ({email_idx})"
+                        elif "fw:" in subj or "fwd:" in subj:
+                            mail_type = f"Forward ({email_idx})"
                         else:
-                            subj = mail['subject'].lower()
-                            if "re:" in subj or "re :" in subj:
-                                mail_type = f"Reply ({email_idx})"
-                            elif "fw:" in subj or "fwd:" in subj:
-                                mail_type = f"Forward ({email_idx})"
-                            else:
-                                mail_type = f"Email ({email_idx})"
-                        
-                        if mail_type == "Latest":
-                            self.tree.insert('', 'end', iid=str(idx), tags=tags, values=(
-                                mail['trade_id'],
-                                mail['subject'][:30] + "..." if len(mail['subject']) > 30 else mail['subject'],
-                                mail['date'][:-3] + "..." if len(mail['sender']) > 20 else mail['sender'],
-                                mail['recipient'][:20] + "..." if len(mail['recipient']) > 20 else mail['recipient'],
-                                mail_type,
-                                f"{'🧵' if mail['is_threaded'] else '📧'} {mail['thread_count']}"
-                            ))
-                        else:
-                            self.tree.insert('', 'end', iid=str(idx), tags=tags, values=(
-                                mail['trade_id'],
-                                mail['subject'][:30] + "..." if len(mail['subject']) > 30 else mail['subject'],
-                                mail['date'][:-3] + "..." if len(mail['sender']) > 20 else mail['sender'],
-                                mail['recipient'][:20] + "..." if len(mail['recipient']) > 20 else mail['recipient'],
-                                mail_type,
-                                f"{'🧵' if mail['is_threaded'] else '📧'} {mail['thread_count']}"
-                            ))
-                        idx += 1
-                
-                found_trade_ids = set(mail['trade_id'] for mail in all_emails)
-                if self.unfound_trades:
-                    for tid in self.unfound_trades:
-                        tid_from_list = [t for t in trade_ids if t.lower() == tid.lower()]
-                        if tid_from_list:
-                            self.unfound_trades.append(tid_from_list[0])
-                
-                logger.info(f"Unfound TradeIds: {self.unfound_trades} - Not Found In Email")
-                
+                            mail_type = f"Email ({email_idx})"
+                    
+                    if mail_type == "Latest":
+                        self.tree.insert('', 'end', iid=str(idx), tags='latest', values=(
+                            mail['trade_id'],
+                            mail['subject'][:30] + "..." if len(mail['subject']) > 30 else mail['subject'],
+                            mail['sender'][:20] + "..." if len(mail['sender']) > 20 else mail['sender'],
+                            mail['recipient'][:20] + "..." if len(mail['recipient']) > 20 else mail['recipient'],
+                            mail_type,
+                            f"{'🧵' if mail['is_threaded'] else '📧'} {mail['thread_count']}"
+                        ))
+                    else:
+                        self.tree.insert('', 'end', iid=str(idx), values=(
+                            mail['trade_id'],
+                            mail['subject'][:30] + "..." if len(mail['subject']) > 30 else mail['subject'],
+                            mail['sender'][:20] + "..." if len(mail['sender']) > 20 else mail['sender'],
+                            mail['recipient'][:20] + "..." if len(mail['recipient']) > 20 else mail['recipient'],
+                            mail_type,
+                            f"{'🧵' if mail['is_threaded'] else '📧'} {mail['thread_count']}"
+                        ))
+                    idx += 1
+            
+            found_trade_ids = set(mail['trade_id'] for mail in all_emails)
+            if self.unfound_trades:
                 for tid in self.unfound_trades:
-                    filename = f"{tid}_email_entities_export_{datetime.now().strftime('%m_%d_%Y')}.csv"
-                    out_file = os.path.join(self.temp_path, filename)
-                    df.to_csv(out_file, index=False)
-                
-                self.root.after(0, lambda: self.finish_extraction(all_emails, None))
-                
-            except Exception as e:
-                gc.collect()
-                self.root.after(0, lambda: self.finish_extraction([], str(e)))
+                    tid_from_list = [t for t in trade_ids if t.lower() == tid.lower()]
+                    if tid_from_list:
+                        self.unfound_trades.append(tid_from_list[0])
+            
+            logger.info(f"Unfound TradeIds: {self.unfound_trades} - Not Found In Email")
+            
+            for tid in self.unfound_trades:
+                filename = f"{tid}_email_entities_export_{datetime.now().strftime('%m_%d_%Y')}.csv"
+                out_file = os.path.join(self.temp_path, filename)
+                df.to_csv(out_file, index=False)
+            
+            # SUCCESS - finish extraction
+            self.root.after(0, lambda: self.finish_extraction(all_emails, None))
         
-        threading.Thread(target=worker, daemon=True).start()
+        except Exception as e:
+            # ← OUTER TRY-EXCEPT NOW CATCHES ALL
+            error_msg = str(e)
+            logger.error(f"Error in extraction: {error_msg}")
+            gc.collect()
+            
+            # ← USE error_msg VARIABLE (NOT e IN LAMBDA)
+            self.root.after(0, lambda msg=error_msg: self.finish_extraction([], msg))
     
-    # ... all other existing methods unchanged ...
+    threading.Thread(target=worker, daemon=True).start()

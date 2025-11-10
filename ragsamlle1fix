@@ -1,9 +1,8 @@
 """
-OPTIMIZED: Simple & Efficient Extraction
-- Uses already-cleaned body from thread parser (no extra processing)
-- No signature removal needed (thread parser handles it)
-- Keeps your existing extraction logic 100% intact
-- Lightweight RAG background processing
+DEADLOCK-FREE RAG Processor
+- Uses non-blocking queue handling
+- Proper thread lifecycle management
+- No queue.join() waiting on busy threads
 """
 
 import re
@@ -19,11 +18,11 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# SIMPLE RAG BACKGROUND PROCESSOR
+# DEADLOCK-FREE RAG PROCESSOR
 # ============================================================================
 
 class SimpleRAGProcessor:
-    """Lightweight RAG - just tracks unseen patterns"""
+    """Lightweight RAG - NO DEADLOCK"""
     
     def __init__(self, pattern_manager, knowledge_base):
         self.pattern_manager = pattern_manager
@@ -33,13 +32,16 @@ class SimpleRAGProcessor:
         self.config_patterns = self._extract_config_patterns()
         logger.info(f"Loaded {len(self.config_patterns)} patterns")
         
-        # Queue and storage
-        self.unseen_queue = queue.Queue()
+        # Queue and storage with maxsize to prevent blocking
+        self.unseen_queue = queue.Queue(maxsize=500)
         self.unseen_data = defaultdict(list)
         
         # Thread control
         self.is_running = False
         self.processor_thread = None
+        
+        # Stop event
+        self.stop_event = threading.Event()
     
     def _extract_config_patterns(self) -> Dict:
         """Extract all patterns from config"""
@@ -67,9 +69,12 @@ class SimpleRAGProcessor:
     def start(self):
         """Start background thread"""
         if self.is_running:
+            logger.info("RAG processor already running")
             return
         
         self.is_running = True
+        self.stop_event.clear()
+        
         self.processor_thread = threading.Thread(
             target=self._process_queue,
             daemon=True,
@@ -79,21 +84,29 @@ class SimpleRAGProcessor:
         logger.info("RAG processor started")
     
     def add_unseen_pattern(self, line: str, entity_name: str):
-        """Queue unseen line"""
+        """Queue unseen line - NON-BLOCKING"""
         if not line or not line.strip():
             return
         
-        self.unseen_queue.put({
-            'line': line.strip(),
-            'entity_name': entity_name,
-            'timestamp': datetime.now()
-        })
+        # Don't block if queue is full
+        try:
+            self.unseen_queue.put_nowait({
+                'line': line.strip(),
+                'entity_name': entity_name,
+                'timestamp': datetime.now()
+            })
+        except queue.Full:
+            logger.warning("RAG queue full - dropping item")
     
     def _process_queue(self):
-        """Background thread: process unseen patterns"""
+        """Background thread: process unseen patterns - NON-BLOCKING"""
+        logger.info("RAG processor thread running...")
+        processed = 0
+        
         while self.is_running:
             try:
-                item = self.unseen_queue.get(timeout=0.5)
+                # Non-blocking get with timeout
+                item = self.unseen_queue.get(timeout=0.2)
                 
                 line = item['line']
                 entity_name = item['entity_name']
@@ -109,12 +122,18 @@ class SimpleRAGProcessor:
                         'timestamp': item['timestamp']
                     })
                 
+                processed += 1
+                
+                # Mark task as done (but don't wait for join)
                 self.unseen_queue.task_done()
                 
             except queue.Empty:
+                # No items in queue - that's OK
                 continue
             except Exception as e:
                 logger.debug(f"RAG error: {e}")
+        
+        logger.info(f"RAG processor stopped (processed {processed} items)")
     
     def _find_closest_patterns(self, line: str, top_k: int = 3) -> List[Dict]:
         """Find closest matching patterns"""
@@ -142,21 +161,49 @@ class SimpleRAGProcessor:
         matches.sort(key=lambda x: x['confidence'], reverse=True)
         return matches[:top_k]
     
-    def stop_and_wait(self, timeout: float = 3.0):
-        """Stop processor"""
+    def stop_and_wait(self, timeout: float = 2.0):
+        """Stop processor - NO DEADLOCK"""
         logger.info("Stopping RAG processor...")
         
-        try:
-            self.unseen_queue.join()
-        except:
-            pass
-        
+        # Signal stop
         self.is_running = False
+        self.stop_event.set()
         
+        # Drain remaining items quickly (non-blocking)
+        drained = 0
+        while True:
+            try:
+                item = self.unseen_queue.get_nowait()
+                line = item['line']
+                entity_name = item['entity_name']
+                closest = self._find_closest_patterns(line)
+                
+                if closest:
+                    self.unseen_data[entity_name].append({
+                        'line': line,
+                        'closest_patterns': closest,
+                        'timestamp': item['timestamp']
+                    })
+                
+                drained += 1
+                self.unseen_queue.task_done()
+            
+            except queue.Empty:
+                break
+            except Exception as e:
+                logger.debug(f"Drain error: {e}")
+                break
+        
+        logger.info(f"Drained {drained} remaining items")
+        
+        # Wait for thread with timeout (not on queue.join)
         if self.processor_thread and self.processor_thread.is_alive():
             self.processor_thread.join(timeout=timeout)
+            
+            if self.processor_thread.is_alive():
+                logger.warning("RAG processor thread still alive (will exit as daemon)")
         
-        logger.info(f"RAG stopped. Unseen entries: {sum(len(v) for v in self.unseen_data.values())}")
+        logger.info(f"RAG stopped. Total unseen: {sum(len(v) for v in self.unseen_data.values())}")
     
     def get_results(self) -> Dict:
         """Get unseen data"""
@@ -168,64 +215,70 @@ class SimpleRAGProcessor:
         
         results = self.get_results()
         
-        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-            
-            # Sheet 1: Config Patterns
-            patterns_data = [
-                {
-                    'Pattern ID': pattern_id,
-                    'Entity': pattern_info['entity'],
-                    'Pattern': pattern_info['pattern'][:150]
-                }
-                for pattern_id, pattern_info in self.config_patterns.items()
-            ]
-            
-            if patterns_data:
-                pd.DataFrame(patterns_data).to_excel(writer, sheet_name='Config Patterns', index=False)
-            
-            # Sheet 2: Unseen Patterns Detected
-            unseen_data = []
-            for entity, analyses in results.items():
-                for analysis in analyses:
-                    unseen_data.append({
-                        'Entity': entity,
-                        'Unseen Line': analysis['line'][:80],
-                        'Full Line': analysis['line'],
-                    })
-            
-            if unseen_data:
-                pd.DataFrame(unseen_data).to_excel(writer, sheet_name='Unseen Patterns', index=False)
-            
-            # Sheet 3: Suggestions
-            suggestions_data = []
-            for entity, analyses in results.items():
-                for analysis in analyses:
-                    for closest in analysis['closest_patterns']:
-                        suggestions_data.append({
-                            'Unseen Line': analysis['line'][:60],
-                            'Suggested Pattern': closest['pattern_id'],
-                            'Confidence': f"{closest['confidence']:.1%}",
-                            'Extracted': str(closest['extracted'])[:100]
+        try:
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                
+                # Sheet 1: Config Patterns
+                patterns_data = [
+                    {
+                        'Pattern ID': pattern_id,
+                        'Entity': pattern_info['entity'],
+                        'Pattern': pattern_info['pattern'][:150]
+                    }
+                    for pattern_id, pattern_info in self.config_patterns.items()
+                ]
+                
+                if patterns_data:
+                    pd.DataFrame(patterns_data).to_excel(writer, sheet_name='Config Patterns', index=False)
+                
+                # Sheet 2: Unseen Patterns Detected
+                unseen_data = []
+                for entity, analyses in results.items():
+                    for analysis in analyses:
+                        unseen_data.append({
+                            'Entity': entity,
+                            'Unseen Line': analysis['line'][:80],
+                            'Full Line': analysis['line'],
                         })
+                
+                if unseen_data:
+                    pd.DataFrame(unseen_data).to_excel(writer, sheet_name='Unseen Patterns', index=False)
+                
+                # Sheet 3: Suggestions
+                suggestions_data = []
+                for entity, analyses in results.items():
+                    for analysis in analyses:
+                        for closest in analysis['closest_patterns']:
+                            suggestions_data.append({
+                                'Unseen Line': analysis['line'][:60],
+                                'Suggested Pattern': closest['pattern_id'],
+                                'Confidence': f"{closest['confidence']:.1%}",
+                                'Extracted': str(closest['extracted'])[:100]
+                            })
+                
+                if suggestions_data:
+                    pd.DataFrame(suggestions_data).to_excel(writer, sheet_name='Suggestions', index=False)
+                
+                # Sheet 4: Summary
+                summary_data = [
+                    {'Metric': 'Total Config Patterns', 'Value': len(self.config_patterns)},
+                    {'Metric': 'Unseen Patterns Found', 'Value': sum(len(v) for v in results.values())},
+                ]
+                
+                pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
             
-            if suggestions_data:
-                pd.DataFrame(suggestions_data).to_excel(writer, sheet_name='Suggestions', index=False)
-            
-            # Sheet 4: Summary
-            summary_data = [
-                {'Metric': 'Total Config Patterns', 'Value': len(self.config_patterns)},
-                {'Metric': 'Unseen Patterns Found', 'Value': sum(len(v) for v in results.values())},
-            ]
-            
-            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
+            logger.info(f"✓ Report saved: {output_path}")
+        
+        except Exception as e:
+            logger.error(f"Report save error: {e}")
 
 
 # ============================================================================
-# RAG WRAPPER
+# RAG WRAPPER - NO DEADLOCK
 # ============================================================================
 
 class RAGEnabledExtractor:
-    """RAG wrapper"""
+    """RAG wrapper - deadlock-free"""
     
     def __init__(self, pattern_manager, tracker):
         self.pattern_manager = pattern_manager
@@ -239,16 +292,20 @@ class RAGEnabledExtractor:
         
         self.rag_processor = SimpleRAGProcessor(pattern_manager, knowledge_base)
         self.rag_processor.start()
+        logger.info("RAGEnabledExtractor initialized")
     
     def queue_unseen(self, line: str, entity_name: str):
-        """Queue unseen line"""
+        """Queue unseen line - non-blocking"""
         self.rag_processor.add_unseen_pattern(line, entity_name)
     
     def finish_and_generate_report(self, report_path: str = None):
-        """Finish and generate report"""
-        logger.info("Finalizing RAG analysis...")
-        self.rag_processor.stop_and_wait(timeout=3.0)
+        """Finish and generate report - no deadlock"""
+        logger.info("Finalizing RAG...")
         
+        # Stop processor (with short timeout)
+        self.rag_processor.stop_and_wait(timeout=1.5)
+        
+        # Generate report
         if report_path:
             self.rag_processor.save_rag_report(report_path)
         
@@ -256,11 +313,11 @@ class RAGEnabledExtractor:
 
 
 # ============================================================================
-# MAIN EXTRACTION - KEEP YOUR EXISTING FLOW 100%
+# EXTRACTION - DEADLOCK-FREE
 # ============================================================================
 
 def extract_entities(self):
-    """Extract entities - YOUR EXISTING FLOW PRESERVED"""
+    """Extract entities - DEADLOCK-FREE"""
     
     if self.selected_email is None:
         messagebox.showwarning("No Selection", "Please select an email")
@@ -276,9 +333,15 @@ def extract_entities(self):
     try:
         self.clear_results()
         
-        # Initialize RAG once
-        if not hasattr(self, 'rag_extractor') or self.rag_extractor is None:
-            self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
+        # IMPORTANT: Stop previous RAG and create new one
+        if hasattr(self, 'rag_extractor') and self.rag_extractor:
+            logger.info("Stopping previous RAG processor...")
+            self.rag_extractor.rag_processor.stop_and_wait(timeout=1.0)
+            self.rag_extractor = None
+        
+        # Create fresh RAG processor for this extraction
+        logger.info("Creating new RAG processor...")
+        self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
         
         # Get email data
         email_data = self.selected_email
@@ -289,8 +352,7 @@ def extract_entities(self):
         logger.info(f"Processing: {email_data['subject']}")
         print(f"\n[1/2] Extracting entities...")
         
-        # ===== USE BODY AS-IS (already cleaned by thread parser) =====
-        # The 'body' key already has threads/signatures removed
+        # Process email body
         email_lines = email_data['body'].splitlines()
         email_lines = list(filter(None, email_lines))
         
@@ -310,7 +372,7 @@ def extract_entities(self):
                     current_activity = line_upper
                     break
             
-            # ===== YOUR EXISTING EXTRACTION LOGIC =====
+            # YOUR EXISTING EXTRACTION LOGIC
             extracted_from_line = False
             
             for entity_name in entity_names:
@@ -332,7 +394,6 @@ def extract_entities(self):
                         self.usage_tracker.record_attempt(pattern_id)
                         
                         try:
-                            # Your existing pattern check
                             if self.attribute_count_check(pattern_regex, line):
                                 regex = re.compile(pattern_regex, re.IGNORECASE)
                                 matches = regex.finditer(line)
@@ -358,7 +419,6 @@ def extract_entities(self):
                             logger.error(f"Regex error {pattern_id}: {regex_error}")
                     
                     elif entity_type == "gazetteer":
-                        # Your gazetteer extraction
                         entity_def = self.entity_definitions.get(entity_name, {})
                         gazetteer_vals = entity_def.get("values", [])
                         subject_vals = self.extract_with_gazetteer(email_data['subject'], gazetteer_vals)
@@ -372,7 +432,7 @@ def extract_entities(self):
                 
                 results[entity_name] = result
             
-            # ===== If no pattern matched, queue for RAG =====
+            # If no pattern matched, queue for RAG (non-blocking)
             if not extracted_from_line:
                 unseen_count += 1
                 self.rag_extractor.queue_unseen(line, "Trade")
@@ -397,18 +457,27 @@ def extract_entities(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
         
-        rag_results = self.rag_extractor.finish_and_generate_report(rag_report_path)
+        try:
+            rag_results = self.rag_extractor.finish_and_generate_report(rag_report_path)
+            
+            print(f"✓ Complete!")
+            print(f"  Matched: {matched_count}")
+            print(f"  Unseen: {unseen_count}")
+            print(f"  Report: {rag_report_path}")
+            
+            messagebox.showinfo("Success", 
+                f"Extraction complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"Report: {rag_report_path}")
         
-        print(f"✓ Complete!")
-        print(f"  Matched: {matched_count}")
-        print(f"  Unseen: {unseen_count}")
-        print(f"  Report: {rag_report_path}")
-        
-        messagebox.showinfo("Success", 
-            f"Extraction complete!\n\n"
-            f"Matched: {matched_count}\n"
-            f"Unseen: {unseen_count}\n\n"
-            f"Report: {rag_report_path}")
+        except Exception as rag_error:
+            logger.error(f"RAG error: {rag_error}")
+            messagebox.showwarning("Warning",
+                f"Extraction complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"RAG report error: {str(rag_error)}")
     
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)

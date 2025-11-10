@@ -1,0 +1,54 @@
+import openpyxl
+import os
+
+# Directory where the files are located
+folder_path = "."
+
+# Identify files
+consolidated_file = None
+unseen_file = None
+
+for file_name in os.listdir(folder_path):
+    if file_name.lower().startswith("consolidated") and file_name.lower().endswith(".xlsx"):
+        consolidated_file = os.path.join(folder_path, file_name)
+    elif "unseen_patterns_" in file_name.lower() and file_name.lower().endswith(".xlsx"):
+        unseen_file = os.path.join(folder_path, file_name)
+
+# Validate existence
+if not consolidated_file:
+    raise FileNotFoundError("No consolidated file found in the folder.")
+if not unseen_file:
+    raise FileNotFoundError("No unseen_patterns file found in the folder.")
+
+print(f"Consolidated File: {consolidated_file}")
+print(f"Unseen File: {unseen_file}")
+
+# Load workbooks
+consolidated_wb = openpyxl.load_workbook(consolidated_file)
+unseen_wb = openpyxl.load_workbook(unseen_file)
+
+# Copy sheets from unseen to consolidated
+for sheet_name in unseen_wb.sheetnames:
+    unseen_sheet = unseen_wb[sheet_name]
+
+    # If the sheet already exists, delete it first
+    if sheet_name in consolidated_wb.sheetnames:
+        del consolidated_wb[sheet_name]
+
+    # Create new sheet
+    new_sheet = consolidated_wb.create_sheet(title=sheet_name)
+
+    # Copy cell values
+    for row in unseen_sheet.iter_rows():
+        for cell in row:
+            new_sheet[cell.coordinate].value = cell.value
+
+# Save and close
+consolidated_wb.save(consolidated_file)
+consolidated_wb.close()
+unseen_wb.close()
+
+# Delete unseen file
+os.remove(unseen_file)
+print(f"Deleted {unseen_file}")
+print("Sheets copied successfully to consolidated workbook.")

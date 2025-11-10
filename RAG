@@ -1,0 +1,755 @@
+# Technical Workflow Document: RAG-Enhanced Email Entity Extraction System
+
+**Document Version:** 1.0  
+**Date:** November 10, 2025  
+**System:** Trade Surveillance Email Parser with RAG Pattern Discovery  
+**Author:** AI/ML Development Team
+
+---
+
+## Table of Contents
+
+1. [Executive Summary](#executive-summary)
+2. [System Overview](#system-overview)
+3. [Architecture Components](#architecture-components)
+4. [Technical Workflow](#technical-workflow)
+5. [Data Flow Diagrams](#data-flow-diagrams)
+6. [Implementation Details](#implementation-details)
+7. [RAG Pattern Discovery Pipeline](#rag-pattern-discovery-pipeline)
+8. [Performance Metrics](#performance-metrics)
+9. [Deployment Strategy](#deployment-strategy)
+10. [Maintenance & Monitoring](#maintenance--monitoring)
+
+---
+
+## 1. Executive Summary
+
+### Purpose
+Transform the existing regex-based email entity extraction system into an intelligent, self-learning platform using Retrieval-Augmented Generation (RAG) to automatically discover and suggest new extraction patterns for unseen email formats.
+
+### Key Objectives
+- **Reduce Manual Configuration**: Eliminate 80% of manual pattern creation effort
+- **Improve Coverage**: Increase entity extraction success rate from 75% to 95%+
+- **Enable Continuous Learning**: System learns from extraction failures and suggests improvements
+- **Maintain Explainability**: All pattern suggestions include reasoning and source attribution
+
+### Technology Stack
+| Component | Technology | Version |
+|-----------|-----------|---------|
+| Language | Python | 3.9+ |
+| Vector Database | FAISS | Latest |
+| Embedding Model | SentenceTransformers | all-MiniLM-L6-v2 |
+| Pattern Generation | Transformers (CodeGen) | 350M |
+| Email Integration | win32com (MAPI) | Latest |
+| Data Storage | JSON, Pandas, Excel | - |
+
+---
+
+## 2. System Overview
+
+### High-Level Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    EMAIL EXTRACTION PIPELINE                     │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  1. OUTLOOK EMAIL INGESTION                                      │
+│     - Connect to MAPI                                            │
+│     - Date-filtered retrieval                                    │
+│     - Subject + Body extraction                                  │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  2. PATTERN-BASED EXTRACTION (Existing Regex)                   │
+│     - Load Pattern_Config.json                                   │
+│     - Apply regex patterns by entity type                        │
+│     - Track pattern usage & success metrics                      │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                    ┌─────────┴──────────┐
+                    │ Extraction Success? │
+                    └─────────┬──────────┘
+                   YES│       │NO
+                      │       │
+                      │       ▼
+                      │  ┌────────────────────────────────────────┐
+                      │  │  3. UNSEEN PATTERN DETECTOR            │
+                      │  │     - Flag extraction failure          │
+                      │  │     - Extract candidate values         │
+                      │  │     - Store in unseen_texts database   │
+                      │  └────────────────────────────────────────┘
+                      │                    │
+                      │                    ▼
+                      │  ┌────────────────────────────────────────┐
+                      │  │  4. RAG PATTERN KNOWLEDGE BASE         │
+                      │  │     - Embed pattern descriptions       │
+                      │  │     - Semantic search (FAISS)          │
+                      │  │     - Retrieve similar patterns        │
+                      │  └────────────────────────────────────────┘
+                      │                    │
+                      │                    ▼
+                      │  ┌────────────────────────────────────────┐
+                      │  │  5. PATTERN SUGGESTION ENGINE          │
+                      │  │     - Analyze unseen examples          │
+                      │  │     - Adapt existing patterns          │
+                      │  │     - Generate new patterns (LLM)      │
+                      │  └────────────────────────────────────────┘
+                      │                    │
+                      ▼                    ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  6. CONSOLIDATED OUTPUT & REPORTS                                │
+│     - Extracted entities CSV/Excel                               │
+│     - Pattern usage metrics (MI Report)                          │
+│     - Unseen pattern summary                                     │
+│     - Pattern suggestions for review                             │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 3. Architecture Components
+
+### 3.1 Pattern Knowledge Base (PKB)
+
+**Purpose:** Vector-based storage and retrieval of existing regex patterns
+
+**Components:**
+- **Pattern Loader**: Parses `Pattern_Config.json` entities structure
+- **Embedding Generator**: Converts patterns to semantic embeddings using SentenceTransformers
+- **Vector Index**: FAISS L2 index for similarity search
+- **Pattern Metadata**: Stores entity name, regex, description, usage stats
+
+**Implementation:**
+```python
+class PatternKnowledgeBase:
+    - patterns: List[Dict]              # Pattern metadata
+    - pattern_embeddings: np.ndarray    # 384-dim embeddings
+    - index: faiss.IndexFlatL2          # FAISS index
+    - embedding_model: SentenceTransformer
+    
+    Methods:
+    - load_patterns()                   # Load from config
+    - build_vector_index()              # Create FAISS index
+    - search_similar_patterns(query, k) # Semantic search
+```
+
+**Data Flow:**
+```
+Pattern_Config.json → Load Patterns → Generate Embeddings → Build FAISS Index → Query Interface
+```
+
+---
+
+### 3.2 Unseen Pattern Detector (UPD)
+
+**Purpose:** Identify and catalog extraction failures
+
+**Detection Logic:**
+```python
+if extraction_result['value'] is None:
+    # Flag as unseen
+    candidates = extract_candidates_using_generic_patterns(text)
+    unseen_texts[entity_name].append(candidates)
+```
+
+**Generic Pattern Fallbacks:**
+| Entity Type | Fallback Pattern | Purpose |
+|-------------|------------------|---------|
+| TradeID | `\b[A-Z0-9]{6,12}\b` | Alphanumeric identifiers |
+| Currency | `\b[A-Z]{3}\b` | 3-letter currency codes |
+| Date | `\d{1,2}[/-]\d{1,2}[/-]\d{2,4}` | Common date formats |
+| Amount | `\$?\d+(?:,\d{3})*(?:\.\d{2})?` | Numeric amounts |
+| Status | `\b(Confirmed|Pending|Rejected)\b` | Known status values |
+
+**Output:**
+```json
+{
+  "TradeID": {
+    "count": 15,
+    "examples": ["XYZ-2025-001", "DEF_998877", "PKG2025110701"]
+  }
+}
+```
+
+---
+
+### 3.3 Pattern Suggestion Engine (PSE)
+
+**Purpose:** Generate new regex patterns using RAG approach
+
+**Workflow:**
+
+```
+Step 1: RETRIEVE
+  Query: "Entity: TradeID, examples: XYZ-2025-001, DEF_998877"
+  ↓
+  Semantic search in PKB → Top 3 similar patterns
+  
+Step 2: ANALYZE
+  Unseen examples → Statistical analysis
+  - Common prefix/suffix
+  - Length distribution
+  - Character type patterns
+  - Position of delimiters
+  
+Step 3: ADAPT
+  Base pattern: (?<TradeID>\d{7,8})[A-Za-z]
+  ↓
+  Adaptation rules:
+  - Adjust length quantifiers
+  - Add optional prefix
+  - Generalize character classes
+  ↓
+  Adapted pattern: ([A-Z]{3}-\d{4}-\d{3})
+  
+Step 4: GENERATE (Optional)
+  LLM prompt: "Generate regex for: XYZ-2025-001"
+  ↓
+  CodeGen model → New pattern suggestion
+```
+
+**Example Analysis:**
+```python
+analyze_examples(["XYZ-2025-001", "DEF-2025-002"]) →
+{
+  'min_length': 12,
+  'max_length': 12,
+  'has_digits': True,
+  'has_letters': True,
+  'has_special_chars': True,  # Hyphen
+  'common_prefix': '',
+  'delimiter_pattern': '-'
+}
+```
+
+---
+
+## 4. Technical Workflow
+
+### Phase 1: Email Ingestion & Extraction
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant GUI
+    participant OutlookExtractor
+    participant PatternManager
+    participant Tracker
+    
+    User->>GUI: Select mailbox, folder, date
+    GUI->>OutlookExtractor: connect_to_folder()
+    OutlookExtractor->>OutlookExtractor: Fetch emails (date filtered)
+    OutlookExtractor->>GUI: Return email list
+    
+    loop For each email
+        GUI->>PatternManager: get_patterns_for_entity("TradeID")
+        PatternManager->>GUI: Return pattern list
+        GUI->>Tracker: record_attempt(pattern_id)
+        GUI->>GUI: Apply regex pattern
+        alt Match found
+            GUI->>Tracker: record_match(pattern_id, value)
+        else No match
+            GUI->>UnseenDetector: detect_unseen(text, entity)
+        end
+    end
+```
+
+### Phase 2: Unseen Pattern Detection
+
+```python
+# Pseudo-code workflow
+for email in emails:
+    for entity_name in entity_types:
+        result = extract_entity(email.text, entity_name)
+        
+        if not result['value']:
+            # Extraction failed - unseen pattern
+            candidates = extract_candidates(email.text, entity_name)
+            unseen_detector.store(entity_name, candidates)
+            
+            # Tag email for review
+            result['is_unseen'] = True
+            result['candidates'] = candidates
+```
+
+### Phase 3: RAG Pattern Discovery
+
+```python
+# At end of extraction run
+unseen_summary = unseen_detector.get_summary()
+
+for entity_name, data in unseen_summary.items():
+    examples = data['examples']
+    
+    # Step 1: Retrieve similar patterns
+    query = f"Entity: {entity_name}, examples: {examples[:3]}"
+    similar = knowledge_base.search_similar_patterns(query, k=3)
+    
+    # Step 2: Analyze examples
+    analysis = analyze_examples(examples)
+    
+    # Step 3: Generate suggestions
+    suggestions = []
+    for base_pattern in similar:
+        adapted = adapt_pattern(base_pattern, analysis)
+        suggestions.append({
+            'pattern': adapted,
+            'based_on': base_pattern['id'],
+            'similarity': base_pattern['score']
+        })
+    
+    # Step 4: Test suggestions
+    for suggestion in suggestions:
+        test_results = test_pattern_on_examples(
+            suggestion['pattern'],
+            examples
+        )
+        suggestion['matches'] = test_results['match_count']
+        suggestion['accuracy'] = test_results['accuracy']
+```
+
+---
+
+## 5. Data Flow Diagrams
+
+### 5.1 Pattern Embedding Flow
+
+```
+Pattern_Config.json
+       |
+       v
+[Load Patterns] → List of pattern objects
+       |
+       v
+[Generate Descriptions] → Human-readable pattern descriptions
+       |                  "Entity: TradeID | contains digits | complex pattern"
+       v
+[SentenceTransformer] → 384-dimensional embeddings
+       |                [0.123, -0.456, 0.789, ...]
+       v
+[FAISS Index] → Vector database for similarity search
+       |
+       v
+[Query Interface] ← User query: "TradeID with hyphens"
+```
+
+### 5.2 Suggestion Generation Flow
+
+```
+Unseen Examples
+  ["XYZ-2025-001", "DEF-2025-002"]
+       |
+       v
+[Statistical Analysis]
+  - Length: 12 chars
+  - Pattern: 3 letters + hyphen + 4 digits + hyphen + 3 digits
+       |
+       v
+[Semantic Search in PKB] → Top 3 similar patterns
+  1. TradeID pattern (similarity: 0.85)
+  2. Reference pattern (similarity: 0.72)
+  3. Deal ID pattern (similarity: 0.68)
+       |
+       v
+[Pattern Adaptation]
+  Base: (?<TradeID>\d{7,8})[A-Za-z]
+  Adapted: ([A-Z]{3}-\d{4}-\d{3})
+       |
+       v
+[Validation Testing] → Test on unseen examples
+  Match rate: 95% (19/20)
+       |
+       v
+[Output Suggestion] → Excel report with reasoning
+```
+
+---
+
+## 6. Implementation Details
+
+### 6.1 Pattern Configuration Structure
+
+**Input Format (Pattern_Config.json):**
+```json
+{
+  "entities": [
+    {
+      "name": "PackageDetails",
+      "type": "pattern",
+      "patterns": [
+        "(?<TradeID>\\d{7,8})[A-Za-z]...",
+        "(?<TradeID>\\w{8})[\\-\\s]+(?<Currency_1>[A-Z]{3})..."
+      ]
+    }
+  ]
+}
+```
+
+**Enhanced Format with IDs (Auto-generated):**
+```json
+{
+  "entities": [
+    {
+      "name": "PackageDetails",
+      "type": "pattern",
+      "patterns": [
+        {
+          "pattern_id": "PACKAGEDETAILS_PTN001",
+          "pattern": "(?<TradeID>\\d{7,8})[A-Za-z]...",
+          "priority": 1,
+          "usage_count": 450,
+          "success_rate": 0.92
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 6.2 Embedding Generation
+
+**Model:** `all-MiniLM-L6-v2` (SentenceTransformers)
+- **Dimension:** 384
+- **Max Sequence Length:** 256 tokens
+- **Inference Speed:** ~2000 sentences/sec (CPU)
+
+**Pattern Description Template:**
+```python
+def pattern_to_description(pattern, entity_name):
+    template = f"Entity: {entity_name}"
+    
+    # Feature extraction
+    features = []
+    if r'\d' in pattern:
+        features.append("contains digits")
+    if r'[A-Z]' in pattern:
+        features.append("uppercase letters")
+    if len(pattern) > 100:
+        features.append("complex pattern")
+    
+    return " | ".join([template] + features)
+```
+
+**Example Embeddings:**
+```
+Pattern 1: "Entity: TradeID | contains digits | simple pattern"
+Embedding: [0.123, -0.456, 0.789, ..., 0.234]  (384-dim)
+
+Pattern 2: "Entity: Currency | uppercase letters | simple pattern"
+Embedding: [0.111, -0.333, 0.555, ..., 0.222]  (384-dim)
+```
+
+### 6.3 FAISS Index Configuration
+
+```python
+import faiss
+
+# Index parameters
+dimension = 384
+nlist = 100  # Number of Voronoi cells (for IVF index)
+
+# For small datasets (<10K patterns): Use flat index
+index = faiss.IndexFlatL2(dimension)
+
+# For large datasets (>10K patterns): Use IVF index
+# quantizer = faiss.IndexFlatL2(dimension)
+# index = faiss.IndexIVFFlat(quantizer, dimension, nlist)
+
+# Add embeddings
+index.add(pattern_embeddings.astype('float32'))
+
+# Search
+k = 5  # Top 5 results
+distances, indices = index.search(query_embedding, k)
+```
+
+---
+
+## 7. RAG Pattern Discovery Pipeline
+
+### 7.1 Pattern Adaptation Algorithm
+
+**Input:**
+- Base pattern from PKB
+- Statistical analysis of unseen examples
+- Entity metadata
+
+**Adaptation Rules:**
+
+| Rule | Condition | Action |
+|------|-----------|--------|
+| Length Adjustment | Analysis shows fixed length | Replace `{m,n}` with `{exact}` |
+| Prefix Addition | Common prefix detected | Prepend `(?:prefix)?` |
+| Delimiter Generalization | Multiple delimiters found | Replace `-` with `[\-_\s]` |
+| Character Class Expansion | Mixed case detected | Replace `[A-Z]` with `[A-Za-z]` |
+| Optional Groups | Partial matches | Wrap sections in `(?:...)?` |
+
+**Example Adaptation:**
+
+```python
+# Base pattern
+base = r'(?<TradeID>\d{7,8})[A-Za-z]+'
+
+# Analysis
+analysis = {
+    'min_length': 12,
+    'max_length': 15,
+    'has_prefix': 'TRD',
+    'delimiter': '-'
+}
+
+# Adapted pattern
+adapted = r'(?:TRD\-)?(?<TradeID>\d{7,8})[A-Za-z]+'
+```
+
+### 7.2 LLM-Based Pattern Generation
+
+**Model:** Salesforce CodeGen-350M-mono
+
+**Prompt Template:**
+```python
+prompt = f"""
+Generate a Python regex pattern to extract {entity_name} from emails.
+
+Examples of {entity_name}:
+- {example1}
+- {example2}
+- {example3}
+
+The pattern should:
+1. Capture the entire {entity_name} value
+2. Use named capture group: (?P<{entity_name}>...)
+3. Be as specific as possible
+
+Regex pattern:
+"""
+```
+
+**Output Processing:**
+```python
+llm_output = generate(prompt)
+# Extract pattern from output
+pattern = extract_pattern_from_text(llm_output)
+# Validate regex syntax
+if is_valid_regex(pattern):
+    return pattern
+```
+
+---
+
+## 8. Performance Metrics
+
+### 8.1 System Performance Targets
+
+| Metric | Current (Regex Only) | Target (RAG-Enhanced) |
+|--------|---------------------|----------------------|
+| Entity Extraction Success Rate | 75% | 95%+ |
+| Unseen Pattern Coverage | 0% (manual fix) | 85% auto-suggested |
+| Pattern Suggestion Accuracy | N/A | 80%+ |
+| Processing Speed (per email) | 50ms | 150ms |
+| False Positive Rate | 5% | <3% |
+
+### 8.2 RAG Component Performance
+
+**Embedding Generation:**
+- **Speed:** 2000 patterns/sec (CPU), 10000 patterns/sec (GPU)
+- **Memory:** ~1.5GB for 10K patterns
+
+**FAISS Search:**
+- **Latency:** <5ms for top-5 search (10K patterns)
+- **Accuracy:** 98% recall@5 for similar patterns
+
+**Pattern Suggestion:**
+- **Generation Time:** 200-500ms per suggestion
+- **Accuracy:** 80% of suggestions match ≥90% of examples
+
+### 8.3 Monitoring Metrics
+
+**Daily Metrics:**
+- Total emails processed
+- Successful extractions per entity type
+- Unseen pattern count
+- Pattern suggestion acceptance rate
+
+**Weekly Metrics:**
+- Pattern usage trends
+- Top 10 most-used patterns
+- Pattern suggestion effectiveness
+- New patterns added to config
+
+**Monthly Metrics:**
+- Overall extraction accuracy improvement
+- Reduction in manual pattern creation
+- System uptime and reliability
+
+---
+
+## 9. Deployment Strategy
+
+### 9.1 Phased Rollout
+
+**Phase 1: Pilot (Weeks 1-2)**
+- Deploy to 5 test users
+- Monitor extraction accuracy
+- Collect feedback on suggested patterns
+- Validate pattern suggestion quality
+
+**Phase 2: Beta (Weeks 3-4)**
+- Expand to 20 users
+- Enable pattern suggestion review workflow
+- Train users on accepting/rejecting suggestions
+- Monitor system performance
+
+**Phase 3: Production (Week 5+)**
+- Full deployment to all users
+- Automated pattern suggestion pipeline
+- Weekly pattern review sessions
+- Continuous model fine-tuning
+
+### 9.2 Infrastructure Requirements
+
+**Development Environment:**
+- Python 3.9+
+- 8GB RAM minimum
+- CPU-only deployment supported
+
+**Production Environment:**
+- **Compute:** 16GB RAM, 4 CPU cores
+- **Storage:** 10GB for models + data
+- **GPU (Optional):** Speeds up embedding generation 5x
+
+**Dependencies:**
+```bash
+pip install sentence-transformers==2.2.2
+pip install faiss-cpu==1.7.4  # or faiss-gpu
+pip install transformers==4.30.0
+pip install torch==2.0.1
+pip install pandas==2.0.3
+pip install openpyxl==3.1.2
+pip install pywin32==306
+```
+
+### 9.3 Configuration Management
+
+**Config Files:**
+```
+project/
+├── Pattern_Config.json           # Existing patterns
+├── Pattern_Config_with_IDs.json  # Enhanced with IDs
+├── pattern_usage_metrics.json    # Usage tracking
+├── vector_index.faiss            # FAISS index
+├── pattern_embeddings.npy        # Numpy embeddings
+└── unseen_patterns_db.json       # Unseen pattern store
+```
+
+---
+
+## 10. Maintenance & Monitoring
+
+### 10.1 Pattern Review Workflow
+
+**Weekly Review Session:**
+1. **Generate Report:** Run RAG system, export suggestions Excel
+2. **Review Suggestions:** Team reviews top 20 suggestions
+3. **Validate Patterns:** Test patterns on historical emails
+4. **Approve & Deploy:** Add approved patterns to config
+5. **Monitor Impact:** Track extraction rate improvement
+
+**Acceptance Criteria:**
+- Pattern matches ≥90% of unseen examples
+- No false positives on test dataset
+- Pattern is maintainable (not overly complex)
+
+### 10.2 Model Updates
+
+**Embedding Model:**
+- **Frequency:** Quarterly
+- **Trigger:** New domain-specific requirements
+- **Process:** Fine-tune SentenceTransformer on email corpus
+
+**LLM Pattern Generator:**
+- **Frequency:** Bi-annually
+- **Trigger:** Poor suggestion quality (<70% accuracy)
+- **Process:** Upgrade to larger model or fine-tune
+
+### 10.3 Monitoring Dashboard
+
+**Key Metrics to Track:**
+
+```python
+{
+  "daily_stats": {
+    "emails_processed": 1250,
+    "entities_extracted": 8500,
+    "unseen_patterns": 45,
+    "suggestions_generated": 12
+  },
+  "accuracy": {
+    "overall_success_rate": 0.94,
+    "by_entity": {
+      "TradeID": 0.98,
+      "Currency": 0.96,
+      "Amount": 0.92
+    }
+  },
+  "pattern_performance": {
+    "top_patterns": [
+      {"id": "TRADEID_PTN001", "usage": 450, "success_rate": 0.95},
+      {"id": "CURRENCY_PTN002", "usage": 380, "success_rate": 0.97}
+    ]
+  }
+}
+```
+
+**Alerting Rules:**
+- Extraction success rate drops below 90% → Alert team
+- Unseen patterns exceed 100/day → Review patterns
+- System latency exceeds 500ms/email → Investigate performance
+
+---
+
+## 11. Appendix
+
+### A. Sample Pattern Suggestion Report
+
+| Entity | Unseen Count | Suggested Pattern | Similarity | Test Accuracy |
+|--------|-------------|-------------------|------------|---------------|
+| TradeID | 15 | `([A-Z]{3}-\d{4}-\d{3})` | 0.85 | 93% (14/15) |
+| Currency | 8 | `(?:CCY|Ccy):\s*([A-Z]{3})` | 0.92 | 100% (8/8) |
+| Amount | 22 | `([\d,]+(?:\.\d{2})?\s*(?:MM|M))` | 0.78 | 86% (19/22) |
+
+### B. Glossary
+
+- **RAG:** Retrieval-Augmented Generation - combining retrieval of existing knowledge with generation of new content
+- **FAISS:** Facebook AI Similarity Search - vector database for efficient similarity search
+- **Embedding:** Dense vector representation of text for semantic comparison
+- **Pattern Adaptation:** Modifying existing regex patterns to match new formats
+- **Knowledge Base:** Vector store of existing patterns with metadata
+
+### C. References
+
+- SentenceTransformers: https://www.sbert.net/
+- FAISS Documentation: https://faiss.ai/
+- Regex Best Practices: https://www.regular-expressions.info/
+- Transformers Library: https://huggingface.co/docs/transformers/
+
+---
+
+**Document Control**
+
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 1.0 | 2025-11-10 | AI/ML Team | Initial release |
+
+**Approval**
+
+- [ ] Technical Lead: __________________
+- [ ] Product Owner: __________________
+- [ ] Security Review: __________________
+
+**END OF DOCUMENT**

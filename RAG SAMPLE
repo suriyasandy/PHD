@@ -146,7 +146,7 @@ class SimpleVectorIndex:
         self.vectors = []
         self.metadata = []
     
-    def add(self, vectors: np.ndarray, meta List[Dict]):
+    def add(self, vectors: np.ndarray, metadata: List[Dict]):
         """Add vectors to index"""
         self.vectors.extend(vectors)
         self.metadata.extend(metadata)
@@ -513,7 +513,7 @@ class OfflineRAGExtractor:
                     'Examples': ', '.join(data['examples'][:5])
                 })
             
-            if unseen_
+            if unseen_data:
                 pd.DataFrame(unseen_data).to_excel(writer, sheet_name='Unseen Patterns', index=False)
             
             # Pattern suggestions

@@ -265,3 +265,290 @@ def extract_email_chain_from_outlook(self):
             self.root.after(0, lambda msg=error_msg: self.finish_extraction([], msg))
     
     threading.Thread(target=worker, daemon=True).start()
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+email fix:
+
+"""
+Enhanced Email Thread Parser - Extracts ONLY Current Message
+Removes all previous conversations from the same thread
+"""
+
+import re
+import logging
+from typing import Dict
+
+logger = logging.getLogger(__name__)
+
+
+class AdvancedEmailThreadParser:
+    """
+    Extract ONLY the current message body, completely removing all previous conversations
+    
+    Email Structure:
+    ┌─────────────────────────────┐
+    │  CURRENT MESSAGE (Extract)  │ ← WE WANT THIS ONLY
+    ├─────────────────────────────┤
+    │ -----Original Message-----  │ ← REMOVE EVERYTHING BELOW
+    ├─────────────────────────────┤
+    │  PREVIOUS REPLY 2           │ ← REMOVE
+    ├─────────────────────────────┤
+    │  PREVIOUS REPLY 1           │ ← REMOVE
+    ├─────────────────────────────┤
+    │  ORIGINAL MESSAGE           │ ← REMOVE
+    └─────────────────────────────┘
+    """
+    
+    # More aggressive separators - catches ALL thread markers
+    THREAD_SEPARATORS = [
+        # Outlook separators (most common)
+        (r'^-{5,}\s*Original Message\s*-{5,}', 'OUTLOOK_ORIGINAL'),
+        (r'^_{5,}\s*From:', 'OUTLOOK_UNDERLINE'),
+        (r'^From:\s+.+\nSent:\s+.+\nTo:\s+', 'OUTLOOK_HEADER'),
+        
+        # Gmail separators
+        (r'^On\s+\w+,\s+\w+\s+\d{1,2},\s+\d{4}\s+at\s+\d{1,2}:\d{2}\s*(?:AM|PM|am|pm)?,\s*.*?wrote:', 'GMAIL_DATETIME'),
+        (r'^On\s+.+?wrote:', 'GMAIL_GENERIC'),
+        
+        # Forwarded message markers
+        (r'^-{5,}\s*Forwarded Message\s*-{5,}', 'FORWARDED'),
+        (r'^-{5,}\s*End Forwarded Message\s*-{5,}', 'END_FORWARDED'),
+        
+        # Microsoft Teams style
+        (r'<div.*?class.*?email-quote.*?>', 'TEAMS_QUOTE'),
+        
+        # Generic separators
+        (r'^-{10,}', 'GENERIC_SEPARATOR'),
+        (r'^_{10,}', 'GENERIC_UNDERLINE'),
+        
+        # Subject: RE:/FW: patterns (start of previous conversation)
+        (r'^\s*Subject:\s*(RE:|FW:|Fwd:)', 'SUBJECT_MARKER'),
+        
+        # "Sent:" markers
+        (r'^\s*Sent:\s+\d{1,2}/\d{1,2}/\d{4}', 'SENT_DATE'),
+        (r'^\s*Date:\s+\w+,\s+\w+\s+\d{1,2},\s+\d{4}', 'DATE_MARKER'),
+    ]
+    
+    @staticmethod
+    def extract_current_message_only(body: str) -> Dict:
+        """
+        Extract ONLY the current message, removing ALL previous conversations
+        
+        Returns:
+        {
+            'current_message': str,      # ONLY current message (clean)
+            'is_threaded': bool,         # Was it a threaded email?
+            'thread_count': int,         # How many messages total
+            'separator_type': str,       # Which separator was detected
+            'raw_body': str              # Original for reference
+        }
+        """
+        result = {
+            'current_message': body if body else '',
+            'is_threaded': False,
+            'thread_count': 1,
+            'separator_type': None,
+            'raw_body': body
+        }
+        
+        if not body or not body.strip():
+            return result
+        
+        # Find the earliest/first thread separator
+        earliest_pos = len(body)
+        separator_type = None
+        
+        # Try each separator pattern
+        for pattern, sep_type in AdvancedEmailThreadParser.THREAD_SEPARATORS:
+            try:
+                match = re.search(
+                    pattern,
+                    body,
+                    re.MULTILINE | re.IGNORECASE | re.DOTALL
+                )
+                
+                if match and match.start() < earliest_pos:
+                    earliest_pos = match.start()
+                    separator_type = sep_type
+                    logger.debug(f"Found separator: {sep_type} at position {match.start()}")
+            
+            except re.error as e:
+                logger.warning(f"Regex error for pattern {sep_type}: {e}")
+        
+        # Extract only text BEFORE the first separator
+        if earliest_pos < len(body):
+            result['is_threaded'] = True
+            result['separator_type'] = separator_type
+            result['current_message'] = body[:earliest_pos].strip()
+            
+            # Count total messages in thread
+            thread_matches = 0
+            for pattern, _ in AdvancedEmailThreadParser.THREAD_SEPARATORS:
+                try:
+                    thread_matches += len(re.findall(pattern, body, re.MULTILINE | re.IGNORECASE))
+                except:
+                    pass
+            
+            result['thread_count'] = max(thread_matches + 1, 2)
+        else:
+            result['current_message'] = body.strip()
+        
+        # Clean up common artifacts
+        result['current_message'] = AdvancedEmailThreadParser._cleanup_message(
+            result['current_message']
+        )
+        
+        logger.info(
+            f"Extracted message - "
+            f"Threaded: {result['is_threaded']}, "
+            f"Messages: {result['thread_count']}, "
+            f"Size: {len(result['current_message'])} chars"
+        )
+        
+        return result
+    
+    @staticmethod
+    def _cleanup_message(text: str) -> str:
+        """
+        Remove common artifacts that might remain after thread separation
+        """
+        if not text:
+            return text
+        
+        # Remove trailing "-----Original Message-----" and similar
+        text = re.sub(r'\s*-{5,}\s*(?:Original Message|Forwarded Message|End.*?Message)\s*-{5,}\s*$', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\s*_{5,}\s*From:.*$', '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Remove "Sent:" lines at the end
+        text = re.sub(r'\s*(?:Sent|Date):\s+.*?\n.*?To:.*?$', '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # Remove quoted text markers (starts with >)
+        lines = text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            # Skip lines that are clearly part of previous message
+            if line.strip().startswith('>'):
+                continue  # Skip quoted lines
+            if re.match(r'^\s*From:\s+', line, re.IGNORECASE):
+                break  # Stop at "From:" line
+            if re.match(r'^\s*Sent:\s+', line, re.IGNORECASE):
+                break  # Stop at "Sent:" line
+            if re.match(r'^\s*Date:\s+', line, re.IGNORECASE):
+                break  # Stop at "Date:" line
+            
+            cleaned_lines.append(line)
+        
+        text = '\n'.join(cleaned_lines).strip()
+        
+        # Remove multiple consecutive blank lines
+        text = re.sub(r'\n\n\n+', '\n\n', text)
+        
+        return text
+    
+    @staticmethod
+    def extract_all_messages_in_thread(body: str) -> list:
+        """
+        Extract ALL messages in the thread (useful for debugging/analysis)
+        """
+        messages = []
+        
+        # Split by main separators
+        parts = re.split(
+            r'(?:^|\n)(?:' +
+            '|'.join([p[0] for p in AdvancedEmailThreadParser.THREAD_SEPARATORS]) +
+            r')',
+            body,
+            flags=re.MULTILINE | re.IGNORECASE | re.DOTALL
+        )
+        
+        for idx, part in enumerate(parts):
+            if part.strip():
+                messages.append({
+                    'message_num': idx,
+                    'content': part.strip(),
+                    'length': len(part.strip())
+                })
+        
+        return messages
+
+
+# ============================================================================
+# UPDATED INTEGRATION WITH EXISTING CODE
+# ============================================================================
+
+# In your extract_email_chain_from_outlook method, update like this:
+
+def extract_email_chain_from_outlook(self):
+    """Modified with ADVANCED thread parsing"""
+    
+    # ... existing setup code ...
+    
+    def worker():
+        error_msg = None
+        pythoncom.CoInitialize()
+        
+        try:
+            # ... existing code for folder, dates, etc ...
+            
+            for item in all_items:
+                try:
+                    if getattr(item, "Class", None) == 43:
+                        subject = item.Subject or ""
+                        body = item.Body or ""
+                        html_body = ""
+                        
+                        try:
+                            html_body = item.HTMLBody
+                        except Exception:
+                            pass
+                        
+                        search_zone = f"{subject}\n{body}\n{html_body}"
+                        found_tids = set(m.lower() for m in tid_re.findall(search_zone))
+                        
+                        for orig_tid in trade_ids:
+                            if orig_tid.lower() in found_tids:
+                                # ===== UPDATED: Use advanced thread parser =====
+                                thread_info = AdvancedEmailThreadParser.extract_current_message_only(body)
+                                
+                                email_obj = {
+                                    'trade_id': orig_tid,
+                                    'subject': subject,
+                                    'sender': getattr(item, "SenderName", ""),
+                                    'recipient': getattr(item, "To", ""),
+                                    'date': item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S") if item.ReceivedTime else "",
+                                    
+                                    # ===== EXTRACT ONLY CURRENT MESSAGE =====
+                                    'body': thread_info['current_message'],
+                                    
+                                    # Thread metadata
+                                    'is_threaded': thread_info['is_threaded'],
+                                    'thread_count': thread_info['thread_count'],
+                                    'separator_type': thread_info['separator_type'],
+                                    
+                                    # Keep raw for debugging if needed
+                                    'raw_body': body
+                                }
+                                
+                                matches_by_tradeid[orig_tid].append(email_obj)
+                                all_emails.append(email_obj)
+                
+                except Exception as item_error:
+                    logger.warning(f"Error processing item: {str(item_error)}")
+                    pass
+            
+            gc.collect()
+            
+            # ... rest of existing code ...
+            
+            self.root.after(0, lambda: self.finish_extraction(all_emails, None))
+        
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error: {error_msg}")
+            gc.collect()
+            self.root.after(0, lambda msg=error_msg: self.finish_extraction([], msg))
+    
+    threading.Thread(target=worker, daemon=True).start()
+

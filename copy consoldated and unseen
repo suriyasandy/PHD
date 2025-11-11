@@ -1,3 +1,66 @@
+import openpyxl
+import os
+
+# Folder where the Excel files are stored
+folder_path = "."
+
+# Detect files
+consolidated_file = None
+unseen_file = None
+
+for file_name in os.listdir(folder_path):
+    if file_name.lower().startswith("consolidated") and file_name.lower().endswith(".xlsx"):
+        consolidated_file = os.path.join(folder_path, file_name)
+    elif "unseen_patterns_" in file_name.lower() and file_name.lower().endswith(".xlsx"):
+        unseen_file = os.path.join(folder_path, file_name)
+
+# Validate
+if not consolidated_file:
+    raise FileNotFoundError("No consolidated workbook found in the folder.")
+if not unseen_file:
+    raise FileNotFoundError("No unseen_patterns workbook found in the folder.")
+
+print(f"Consolidated File: {consolidated_file}")
+print(f"Unseen File: {unseen_file}")
+
+# Load workbooks
+consolidated_wb = openpyxl.load_workbook(consolidated_file)
+unseen_wb = openpyxl.load_workbook(unseen_file)
+
+# Append sheets from unseen to consolidated
+for sheet_name in unseen_wb.sheetnames:
+    unseen_sheet = unseen_wb[sheet_name]
+    new_sheet_name = sheet_name
+
+    # If the sheet name already exists, create a unique name
+    counter = 1
+    while new_sheet_name in consolidated_wb.sheetnames:
+        counter += 1
+        new_sheet_name = f"{sheet_name}_{counter}"
+
+    # Create new sheet in consolidated file
+    new_sheet = consolidated_wb.create_sheet(title=new_sheet_name)
+
+    # Copy all values
+    for row in unseen_sheet.iter_rows():
+        for cell in row:
+            new_sheet[cell.coordinate].value = cell.value
+
+    print(f"✅ Added sheet '{new_sheet_name}'")
+
+# Save updates
+consolidated_wb.save(consolidated_file)
+consolidated_wb.close()
+unseen_wb.close()
+
+# Delete unseen file
+os.remove(unseen_file)
+print(f"🗑️ Deleted file: {unseen_file}")
+print("✅ All sheets appended successfully to the consolidated workbook.")
+
+
+
+
 """
 Complete RAG Report with ALL sheets
 - Always creates all sheets (even if empty)

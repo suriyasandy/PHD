@@ -1,0 +1,280 @@
+"""
+RAG Report Consolidator - UPDATED
+- Skips empty sheets (just passes)
+- Only appends if data exists
+- Handles all edge cases gracefully
+"""
+
+import os
+import shutil
+import logging
+from datetime import datetime
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+
+logger = logging.getLogger(__name__)
+
+
+class RAGReportConsolidator:
+    """Consolidate RAG reports - skip empty sheets"""
+    
+    def __init__(self, shared_path: str, consolidated_filename: str = "RAG_Consolidated_Master.xlsx"):
+        """
+        Initialize consolidator
+        
+        Args:
+            shared_path: Path to shared folder
+            consolidated_filename: Name of consolidated master file
+        """
+        self.shared_path = Path(shared_path)
+        self.consolidated_file = self.shared_path / consolidated_filename
+        
+        # Sheet names - RAG will write to these sheets (Sheet2-6)
+        self.rag_sheets = [
+            'Config Patterns',
+            'Matched Patterns',
+            'Unseen Patterns',
+            'Suggestions',
+            'Summary'
+        ]
+        
+        # Create shared path if doesn't exist
+        self.shared_path.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize consolidated file if doesn't exist
+        if not self.consolidated_file.exists():
+            self._initialize_consolidated_file()
+            logger.info(f"Created new consolidated file: {self.consolidated_file}")
+    
+    def _initialize_consolidated_file(self):
+        """Create new consolidated file with empty sheets"""
+        logger.info("Initializing consolidated master file...")
+        
+        with pd.ExcelWriter(self.consolidated_file, engine='openpyxl') as writer:
+            
+            # Sheet 1: Reserved
+            pd.DataFrame({
+                'Notes': ['Sheet1 reserved for other data'],
+                'Description': ['RAG reports will append to Sheet2 onwards']
+            }).to_excel(writer, sheet_name='Sheet1', index=False)
+            
+            # Sheet 2: Config Patterns
+            pd.DataFrame(columns=[
+                'Pattern ID', 'Entity', 'Pattern', 'Full Pattern', 'Source File', 'Timestamp'
+            ]).to_excel(writer, sheet_name='Config Patterns', index=False)
+            
+            # Sheet 3: Matched Patterns
+            pd.DataFrame(columns=[
+                'Line', 'Full Line', 'Pattern ID', 'Entity', 'Extracted Labels', 
+                'Confidence', 'Source File', 'Timestamp'
+            ]).to_excel(writer, sheet_name='Matched Patterns', index=False)
+            
+            # Sheet 4: Unseen Patterns
+            pd.DataFrame(columns=[
+                'Entity', 'Unseen Line', 'Full Line', 'Timestamp', 'Source File'
+            ]).to_excel(writer, sheet_name='Unseen Patterns', index=False)
+            
+            # Sheet 5: Suggestions
+            pd.DataFrame(columns=[
+                'Unseen Line', 'Suggested Pattern ID', 'Suggested Entity', 
+                'Confidence', 'Extracted Values', 'Source File', 'Timestamp'
+            ]).to_excel(writer, sheet_name='Suggestions', index=False)
+            
+            # Sheet 6: Summary
+            pd.DataFrame(columns=[
+                'Source File', 'Timestamp', 'Total Config Patterns', 'Matched Patterns',
+                'Unseen Patterns', 'Total Lines', 'Match Rate'
+            ]).to_excel(writer, sheet_name='Summary', index=False)
+        
+        logger.info("✓ Consolidated file initialized")
+    
+    def copy_and_consolidate(self, local_rag_report: str, run_timestamp: str = None):
+        """
+        Copy RAG report to shared path and append to consolidated file
+        
+        Args:
+            local_rag_report: Path to local RAG report
+            run_timestamp: Timestamp of the run
+        
+        Returns:
+            str: Path to copied report in shared location
+        """
+        if run_timestamp is None:
+            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        try:
+            # Step 1: Copy to shared path
+            local_file = Path(local_rag_report)
+            if not local_file.exists():
+                logger.error(f"Local report not found: {local_rag_report}")
+                return None
+            
+            shared_file = self.shared_path / f"RAG_Report_{run_timestamp}.xlsx"
+            shutil.copy2(local_file, shared_file)
+            logger.info(f"✓ Copied to shared: {shared_file}")
+            
+            # Step 2: Append to consolidated file (skip empty sheets)
+            self._append_to_consolidated(shared_file, run_timestamp)
+            
+            logger.info(f"✓ Consolidated successfully")
+            return str(shared_file)
+        
+        except Exception as e:
+            logger.error(f"Consolidation error: {e}", exc_info=True)
+            return None
+    
+    def _append_to_consolidated(self, source_file: Path, run_timestamp: str):
+        """
+        Append data from source file to consolidated file
+        SKIP EMPTY SHEETS - only append if data exists
+        """
+        logger.info(f"Appending to consolidated: {source_file.name}")
+        
+        source_filename = source_file.name
+        
+        # Load consolidated file
+        consolidated_wb = load_workbook(self.consolidated_file)
+        
+        # Load source file
+        source_wb = load_workbook(source_file, read_only=True)
+        
+        sheets_processed = 0
+        sheets_skipped = 0
+        
+        try:
+            # Process each RAG sheet
+            for sheet_name in self.rag_sheets:
+                
+                # Check if sheet exists in source
+                if sheet_name not in source_wb.sheetnames:
+                    logger.warning(f"  ⚠ Sheet '{sheet_name}' not found in source - skipping")
+                    sheets_skipped += 1
+                    continue
+                
+                # Check if sheet exists in consolidated
+                if sheet_name not in consolidated_wb.sheetnames:
+                    logger.warning(f"  ⚠ Sheet '{sheet_name}' not found in consolidated - skipping")
+                    sheets_skipped += 1
+                    continue
+                
+                logger.info(f"  Processing: {sheet_name}")
+                
+                # Read source sheet
+                source_sheet = source_wb[sheet_name]
+                consolidated_sheet = consolidated_wb[sheet_name]
+                
+                # ===== CHECK IF SHEET HAS DATA =====
+                data = []
+                headers = []
+                
+                for idx, row in enumerate(source_sheet.iter_rows(values_only=True)):
+                    if idx == 0:
+                        # First row = headers
+                        headers = list(row)
+                    else:
+                        # Data rows
+                        if any(cell is not None and str(cell).strip() for cell in row):
+                            data.append(list(row))
+                
+                # ===== SKIP IF NO DATA =====
+                if not data or len(data) == 0:
+                    logger.info(f"    → No data found - SKIPPED")
+                    sheets_skipped += 1
+                    continue
+                
+                # ===== APPEND DATA =====
+                try:
+                    # Create dataframe
+                    df = pd.DataFrame(data, columns=headers)
+                    
+                    # Add metadata columns
+                    if 'Source File' not in df.columns:
+                        df['Source File'] = source_filename
+                    if 'Timestamp' not in df.columns:
+                        df['Timestamp'] = run_timestamp
+                    
+                    # Get current max row
+                    start_row = consolidated_sheet.max_row + 1
+                    
+                    # Append rows
+                    for row_idx, row_data in enumerate(dataframe_to_rows(df, index=False, header=False)):
+                        for col_idx, value in enumerate(row_data, 1):
+                            consolidated_sheet.cell(row=start_row + row_idx, column=col_idx, value=value)
+                    
+                    logger.info(f"    ✓ Appended {len(data)} rows")
+                    sheets_processed += 1
+                
+                except Exception as append_error:
+                    logger.error(f"    ✗ Error appending  {append_error}")
+                    sheets_skipped += 1
+            
+            # Save consolidated file
+            consolidated_wb.save(self.consolidated_file)
+            
+            logger.info(f"✓ Consolidated file saved")
+            logger.info(f"  Sheets processed: {sheets_processed}")
+            logger.info(f"  Sheets skipped (empty): {sheets_skipped}")
+        
+        except Exception as e:
+            logger.error(f"Error during consolidation: {e}", exc_info=True)
+        
+        finally:
+            consolidated_wb.close()
+            source_wb.close()
+
+
+# ============================================================================
+# INTEGRATION
+# ============================================================================
+
+def extract_entities(self):
+    """Extract entities with auto-consolidation"""
+    
+    # ... [Your existing extraction code] ...
+    
+    try:
+        # ... [extraction logic] ...
+        
+        # Generate RAG report
+        print(f"\n[2/3] Generating RAG report...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
+        
+        rag_results = self.rag_extractor.finish_and_generate_report(
+            rag_report_path,
+            matched_data=matched_patterns
+        )
+        
+        print(f"✓ RAG report: {rag_report_path}")
+        
+        # ===== CONSOLIDATE (SKIP EMPTY SHEETS) =====
+        print(f"\n[3/3] Consolidating to shared location...")
+        
+        shared_path = r"\\shared\path\to\RAG_Reports"  # UPDATE THIS PATH
+        
+        consolidator = RAGReportConsolidator(shared_path)
+        shared_file = consolidator.copy_and_consolidate(rag_report_path, timestamp)
+        
+        if shared_file:
+            print(f"✓ Consolidated to: {shared_file}")
+            print(f"  (Empty sheets were skipped)")
+            
+            messagebox.showinfo("Success", 
+                f"Extraction complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"Local: {rag_report_path}\n"
+                f"Shared: {shared_file}\n"
+                f"Consolidated: RAG_Consolidated_Master.xlsx\n\n"
+                f"Note: Empty sheets were skipped")
+        else:
+            messagebox.showwarning("Warning",
+                f"Extraction complete!\n\n"
+                f"Report: {rag_report_path}\n"
+                f"(Consolidation failed)")
+    
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed: {str(e)}")

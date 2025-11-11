@@ -1,54 +1,356 @@
-import openpyxl
-import os
+"""
+Complete RAG Report with ALL sheets
+- Always creates all sheets (even if empty)
+- Includes matched patterns sheet
+- Includes unseen patterns sheet
+- Ready for consolidation/appending
+"""
 
-# Directory where the files are located
-folder_path = "."
+def save_rag_report(self, output_path: str, matched_ List[Dict] = None):
+    """
+    Save comprehensive RAG report with ALL sheets
+    
+    Args:
+        output_path: Output file path
+        matched_ List of matched patterns (passed from extraction)
+    """
+    logger.info(f"Saving complete RAG report: {output_path}")
+    
+    results = self.get_results()
+    
+    try:
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            
+            # =====================================================
+            # SHEET 1: Config Patterns (Always present)
+            # =====================================================
+            patterns_data = [
+                {
+                    'Pattern ID': pattern_id,
+                    'Entity': pattern_info['entity'],
+                    'Pattern': pattern_info['pattern'][:150],
+                    'Full Pattern': pattern_info['pattern']
+                }
+                for pattern_id, pattern_info in self.config_patterns.items()
+            ]
+            
+            if patterns_
+                pd.DataFrame(patterns_data).to_excel(writer, sheet_name='Config Patterns', index=False)
+                logger.info(f"  ✓ Config Patterns: {len(patterns_data)} patterns")
+            else:
+                # Empty sheet if no patterns
+                pd.DataFrame(columns=['Pattern ID', 'Entity', 'Pattern', 'Full Pattern']).to_excel(
+                    writer, sheet_name='Config Patterns', index=False
+                )
+            
+            # =====================================================
+            # SHEET 2: Matched Patterns (Always present, may be empty)
+            # =====================================================
+            if matched_
+                matched_df_data = []
+                for match in matched_
+                    matched_df_data.append({
+                        'Line': match.get('line', '')[:80],
+                        'Full Line': match.get('line', ''),
+                        'Pattern ID': match.get('pattern_id', ''),
+                        'Entity': match.get('entity_name', ''),
+                        'Extracted Labels': ', '.join(match.get('extracted_labels', [])),
+                        'Confidence': match.get('confidence', 'N/A')
+                    })
+                
+                pd.DataFrame(matched_df_data).to_excel(writer, sheet_name='Matched Patterns', index=False)
+                logger.info(f"  ✓ Matched Patterns: {len(matched_df_data)} matches")
+            else:
+                # Empty sheet with headers
+                pd.DataFrame(columns=[
+                    'Line', 'Full Line', 'Pattern ID', 'Entity', 'Extracted Labels', 'Confidence'
+                ]).to_excel(writer, sheet_name='Matched Patterns', index=False)
+                logger.info(f"  ✓ Matched Patterns: 0 matches (empty sheet)")
+            
+            # =====================================================
+            # SHEET 3: Unseen Patterns (Always present, may be empty)
+            # =====================================================
+            unseen_data = []
+            for entity, analyses in results.items():
+                for analysis in analyses:
+                    unseen_data.append({
+                        'Entity': entity,
+                        'Unseen Line': analysis['line'][:80],
+                        'Full Line': analysis['line'],
+                        'Timestamp': analysis.get('timestamp', '')
+                    })
+            
+            if unseen_
+                pd.DataFrame(unseen_data).to_excel(writer, sheet_name='Unseen Patterns', index=False)
+                logger.info(f"  ✓ Unseen Patterns: {len(unseen_data)} unseen")
+            else:
+                # Empty sheet with headers
+                pd.DataFrame(columns=[
+                    'Entity', 'Unseen Line', 'Full Line', 'Timestamp'
+                ]).to_excel(writer, sheet_name='Unseen Patterns', index=False)
+                logger.info(f"  ✓ Unseen Patterns: 0 unseen (empty sheet)")
+            
+            # =====================================================
+            # SHEET 4: Pattern Suggestions (Always present, may be empty)
+            # =====================================================
+            suggestions_data = []
+            for entity, analyses in results.items():
+                for analysis in analyses:
+                    for closest in analysis['closest_patterns']:
+                        suggestions_data.append({
+                            'Unseen Line': analysis['line'][:60],
+                            'Suggested Pattern ID': closest['pattern_id'],
+                            'Suggested Entity': closest['entity_name'],
+                            'Confidence': f"{closest['confidence']:.1%}",
+                            'Extracted Values': str(closest['extracted'])[:100]
+                        })
+            
+            if suggestions_
+                pd.DataFrame(suggestions_data).to_excel(writer, sheet_name='Suggestions', index=False)
+                logger.info(f"  ✓ Suggestions: {len(suggestions_data)} suggestions")
+            else:
+                # Empty sheet with headers
+                pd.DataFrame(columns=[
+                    'Unseen Line', 'Suggested Pattern ID', 'Suggested Entity', 'Confidence', 'Extracted Values'
+                ]).to_excel(writer, sheet_name='Suggestions', index=False)
+                logger.info(f"  ✓ Suggestions: 0 suggestions (empty sheet)")
+            
+            # =====================================================
+            # SHEET 5: Summary (Always present)
+            # =====================================================
+            matched_count = len(matched_data) if matched_data else 0
+            unseen_count = sum(len(v) for v in results.values())
+            
+            summary_data = [
+                {'Metric': 'Total Config Patterns', 'Value': len(self.config_patterns)},
+                {'Metric': 'Matched Patterns', 'Value': matched_count},
+                {'Metric': 'Unseen Patterns', 'Value': unseen_count},
+                {'Metric': 'Total Lines Processed', 'Value': matched_count + unseen_count},
+                {'Metric': 'Match Rate', 'Value': f"{(matched_count/(matched_count+unseen_count)*100):.1f}%" if (matched_count + unseen_count) > 0 else '0%'},
+            ]
+            
+            pd.DataFrame(summary_data).to_excel(writer, sheet_name='Summary', index=False)
+            logger.info(f"  ✓ Summary: {len(summary_data)} metrics")
+        
+        logger.info(f"✓ Complete RAG report saved: {output_path}")
+    
+    except Exception as e:
+        logger.error(f"Report save error: {e}", exc_info=True)
+        raise
 
-# Identify files
-consolidated_file = None
-unseen_file = None
+def extract_entities(self):
+    """Extract entities - TRACK BOTH MATCHED AND UNSEEN"""
+    
+    if self.selected_email is None:
+        messagebox.showwarning("No Selection", "Please select an email")
+        return
+    
+    try:
+        entity_json = self.entity_text.get(1.0, tk.END).strip()
+        self.entity_definitions = json.loads(entity_json)
+    except json.JSONDecodeError as e:
+        messagebox.showerror("JSON Error", f"Invalid JSON: {str(e)}")
+        return
+    
+    try:
+        self.clear_results()
+        
+        # Stop previous RAG and create new one
+        if hasattr(self, 'rag_extractor') and self.rag_extractor:
+            logger.info("Stopping previous RAG processor...")
+            self.rag_extractor.rag_processor.stop_and_wait(timeout=1.0)
+            self.rag_extractor = None
+        
+        # Create fresh RAG processor
+        logger.info("Creating new RAG processor...")
+        self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
+        
+        # Get email data
+        email_data = self.selected_email
+        entity_names = self.pattern_manager.get_all_entity_names()
+        results = {}
+        entities = {}
+        
+        # ===== TRACK MATCHED PATTERNS =====
+        matched_patterns = []
+        
+        logger.info(f"Processing: {email_data['subject']}")
+        print(f"\n[1/2] Extracting entities...")
+        
+        # Process email body
+        email_lines = email_data['body'].splitlines()
+        email_lines = list(filter(None, email_lines))
+        
+        current_activity = None
+        matched_count = 0
+        unseen_count = 0
+        
+        for line in email_lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for activity keywords
+            line_upper = line.upper()
+            for keyword in self.activity_keywords:
+                if keyword in line_upper:
+                    current_activity = line_upper
+                    break
+            
+            # YOUR EXISTING EXTRACTION LOGIC
+            extracted_from_line = False
+            
+            for entity_name in entity_names:
+                patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+                
+                result = {
+                    'value': None,
+                    'pattern_id': None,
+                    'entity_name': entity_name
+                }
+                
+                for pattern_entry in patterns:
+                    entity_type = pattern_entry.get('entity_type', 'pattern')
+                    
+                    if entity_type == "pattern":
+                        pattern_id = pattern_entry['pattern_id']
+                        pattern_regex = pattern_entry['pattern']
+                        
+                        self.usage_tracker.record_attempt(pattern_id)
+                        
+                        try:
+                            if self.attribute_count_check(pattern_regex, line):
+                                regex = re.compile(pattern_regex, re.IGNORECASE)
+                                matches = regex.finditer(line)
+                                
+                                for match in matches:
+                                    groupdict = match.groupdict()
+                                    
+                                    if current_activity:
+                                        groupdict['ActivityType'] = current_activity
+                                    
+                                    extracted_labels = []
+                                    for k, v in groupdict.items():
+                                        if v:
+                                            entities.setdefault(k, []).append(f"{v}")
+                                            extracted_labels.append(k)
+                                    
+                                    self.usage_tracker.record_match(pattern_id, line)
+                                    result['value'] = line
+                                    result['pattern_id'] = pattern_id
+                                    extracted_from_line = True
+                                    matched_count += 1
+                                    
+                                    # ===== TRACK MATCHED PATTERN =====
+                                    matched_patterns.append({
+                                        'line': line,
+                                        'pattern_id': pattern_id,
+                                        'entity_name': entity_name,
+                                        'extracted_labels': extracted_labels,
+                                        'confidence': f"{len(extracted_labels)}/{len(groupdict)}"
+                                    })
+                                    
+                                    break
+                        
+                        except re.error as regex_error:
+                            logger.error(f"Regex error {pattern_id}: {regex_error}")
+                    
+                    elif entity_type == "gazetteer":
+                        entity_def = self.entity_definitions.get(entity_name, {})
+                        gazetteer_vals = entity_def.get("values", [])
+                        subject_vals = self.extract_with_gazetteer(email_data['subject'], gazetteer_vals)
+                        body_vals = self.extract_with_gazetteer(line, gazetteer_vals)
+                        
+                        all_vals = subject_vals + body_vals
+                        
+                        if all_vals:
+                            entities[entity_name] = all_vals
+                            extracted_from_line = True
+                            matched_count += 1
+                            
+                            # Track gazetteer match
+                            matched_patterns.append({
+                                'line': line,
+                                'pattern_id': 'GAZETTEER',
+                                'entity_name': entity_name,
+                                'extracted_labels': all_vals,
+                                'confidence': 'N/A'
+                            })
+                
+                results[entity_name] = result
+            
+            # If no pattern matched, queue for RAG
+            if not extracted_from_line:
+                unseen_count += 1
+                self.rag_extractor.queue_unseen(line, "Trade")
+        
+        logger.info(f"Extraction: {matched_count} matched, {unseen_count} unseen")
+        
+        # Display results
+        self.entity_result_text.delete(1.0, tk.END)
+        
+        if entities:
+            for entity_name, vals in entities.items():
+                self.entity_result_text.insert(tk.END, f"{entity_name}:\n")
+                for v in vals:
+                    self.entity_result_text.insert(tk.END, f"  - {v}\n")
+        else:
+            self.entity_result_text.insert(tk.END, "No entities found")
+        
+        self.finish_extraction_with_mi()
+        
+        # Generate RAG report WITH MATCHED DATA
+        print(f"\n[2/2] Generating complete RAG report...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
+        
+        try:
+            # ===== PASS MATCHED DATA TO RAG REPORT =====
+            rag_results = self.rag_extractor.finish_and_generate_report(
+                rag_report_path,
+                matched_data=matched_patterns
+            )
+            
+            print(f"✓ Complete!")
+            print(f"  Matched: {matched_count}")
+            print(f"  Unseen: {unseen_count}")
+            print(f"  Report: {rag_report_path}")
+            
+            messagebox.showinfo("Success", 
+                f"Extraction complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"Report: {rag_report_path}")
+        
+        except Exception as rag_error:
+            logger.error(f"RAG error: {rag_error}")
+            messagebox.showwarning("Warning",
+                f"Extraction complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"RAG report error: {str(rag_error)}")
+    
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed: {str(e)}")
 
-for file_name in os.listdir(folder_path):
-    if file_name.lower().startswith("consolidated") and file_name.lower().endswith(".xlsx"):
-        consolidated_file = os.path.join(folder_path, file_name)
-    elif "unseen_patterns_" in file_name.lower() and file_name.lower().endswith(".xlsx"):
-        unseen_file = os.path.join(folder_path, file_name)
 
-# Validate existence
-if not consolidated_file:
-    raise FileNotFoundError("No consolidated file found in the folder.")
-if not unseen_file:
-    raise FileNotFoundError("No unseen_patterns file found in the folder.")
+def finish_and_generate_report(self, report_path: str = None, matched_ List[Dict] = None):
+    """
+    Finish and generate report with matched data
+    
+    Args:
+        report_path: Output file path
+        matched_ List of matched patterns
+    """
+    logger.info("Finalizing RAG...")
+    
+    # Stop processor
+    self.rag_processor.stop_and_wait(timeout=1.5)
+    
+    # Generate report with matched data
+    if report_path:
+        self.rag_processor.save_rag_report(report_path, matched_data=matched_data)
+    
+    return self.rag_processor.get_results()
 
-print(f"Consolidated File: {consolidated_file}")
-print(f"Unseen File: {unseen_file}")
-
-# Load workbooks
-consolidated_wb = openpyxl.load_workbook(consolidated_file)
-unseen_wb = openpyxl.load_workbook(unseen_file)
-
-# Copy sheets from unseen to consolidated
-for sheet_name in unseen_wb.sheetnames:
-    unseen_sheet = unseen_wb[sheet_name]
-
-    # If the sheet already exists, delete it first
-    if sheet_name in consolidated_wb.sheetnames:
-        del consolidated_wb[sheet_name]
-
-    # Create new sheet
-    new_sheet = consolidated_wb.create_sheet(title=sheet_name)
-
-    # Copy cell values
-    for row in unseen_sheet.iter_rows():
-        for cell in row:
-            new_sheet[cell.coordinate].value = cell.value
-
-# Save and close
-consolidated_wb.save(consolidated_file)
-consolidated_wb.close()
-unseen_wb.close()
-
-# Delete unseen file
-os.remove(unseen_file)
-print(f"Deleted {unseen_file}")
-print("Sheets copied successfully to consolidated workbook.")

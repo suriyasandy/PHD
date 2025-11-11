@@ -1,3 +1,149 @@
+def export_consolidated_results(self):
+    """
+    Export consolidated results - FIXED to preserve RAG sheets
+    """
+    try:
+        temp_df = None
+        today = datetime.now()
+        today_str = today.strftime("%m_%d_%y")
+        csv_files = glob.glob(f"{self.temp_path}/*.csv")
+        sheet_name = "Consolidated_Report"
+        consolidated_file = f"{self.out_path}/{today_str}_{sheet_name}.xlsx"
+        lock_path = consolidated_file + '.lock'
+        ws_rows = []
+        
+        # Use a lock so only one process writes at a time
+        with FileLock(lock_path, timeout=60):
+            for file in csv_files:
+                base_name = os.path.basename(file)
+                trade_id = base_name.split("_")[0]
+                rows_found = False
+                
+                with open(file, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    csv_headers = list(reader.fieldnames) if reader.fieldnames else []
+                    expected_headers = self.static_headers[1:]
+                    required_sub_headers = self.static_headers[19:]
+                    
+                    if all(header in csv_headers for header in required_sub_headers):
+                        for row in reader:
+                            out_row = [trade_id]
+                            for header in expected_headers:
+                                out_row.append(row.get(header, ""))
+                            ws_rows.append(out_row)
+                            rows_found = True
+                    
+                    elif any(header in csv_headers for header in expected_headers[1:]):
+                        for row in reader:
+                            out_row = [trade_id]
+                            for header in expected_headers:
+                                out_row.append(row.get(header, ""))
+                            ws_rows.append(out_row)
+                            rows_found = True
+                    
+                    else:
+                        if len(csv_headers) == 0:
+                            out_row = [f"{trade_id} - Found in Mail - No Entity Found"] + [""] * (len(self.static_headers) - 1)
+                        else:
+                            out_row = [f"{trade_id} - Partial header mismatch - Check file: {base_name}"] + [""] * (len(self.static_headers) - 1)
+                        ws_rows.append(out_row)
+                        rows_found = True
+                    
+                    f.close()
+                
+                if not rows_found:
+                    out_row = [f"{trade_id} - Not Found in Mail"] + [""] * (len(self.static_headers) - 1)
+                    ws_rows.append(out_row)
+                    os.remove(file)
+            
+            # Build dataframe for new trade data
+            df_new = pd.DataFrame(ws_rows, columns=self.static_headers)
+            
+            # ===== FIX: PRESERVE EXISTING RAG SHEETS =====
+            if os.path.isfile(consolidated_file):
+                # File exists - need to preserve RAG sheets
+                logger.info(f"Consolidated file exists - preserving RAG sheets")
+                
+                # Read existing Sheet1 data
+                df_existing = pd.read_excel(consolidated_file, sheet_name=sheet_name)
+                df_combined = pd.concat([df_existing, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates()
+                
+                # Load workbook to preserve other sheets
+                wb = load_workbook(consolidated_file)
+                
+                # Save all sheet names EXCEPT Sheet1
+                other_sheets = {}
+                for ws_name in wb.sheetnames:
+                    if ws_name != sheet_name:
+                        # Read data from other sheets
+                        ws = wb[ws_name]
+                        sheet_data = []
+                        for row in ws.iter_rows(values_only=True):
+                            sheet_data.append(row)
+                        other_sheets[ws_name] = sheet_data
+                
+                wb.close()
+                
+                # Write Sheet1 with updated data
+                with pd.ExcelWriter(consolidated_file, engine='openpyxl', mode='w') as writer:
+                    df_combined.to_excel(writer, sheet_name=sheet_name, index=False)
+                
+                # Restore other sheets
+                if other_sheets:
+                    wb = load_workbook(consolidated_file)
+                    for ws_name, sheet_data in other_sheets.items():
+                        if ws_name not in wb.sheetnames:
+                            ws = wb.create_sheet(ws_name)
+                        else:
+                            ws = wb[ws_name]
+                        
+                        # Write data back
+                        for row_idx, row in enumerate(sheet_data, 1):
+                            for col_idx, value in enumerate(row, 1):
+                                ws.cell(row=row_idx, column=col_idx, value=value)
+                    
+                    wb.save(consolidated_file)
+                    wb.close()
+                    logger.info(f"✓ Preserved {len(other_sheets)} RAG sheets")
+            
+            else:
+                # New file - just write Sheet1
+                df_new.to_excel(consolidated_file, sheet_name=sheet_name, index=False)
+                logger.info("✓ Created new consolidated file")
+            
+            # Display summary
+            temp_df = pd.read_excel(consolidated_file, sheet_name=sheet_name)
+            if not temp_df.empty:
+                self.entity_result_text.delete(1.0, tk.END)
+                self.entity_result_text.insert(tk.END, f"{temp_df}\n")
+            else:
+                self.entity_result_text.insert(tk.END, "No Data found in this email")
+        
+        logger.info("Success - Consolidated Report File Generated")
+        
+        # ===== NOW APPEND RAG DATA (SHEETS ALREADY PRESERVED) =====
+        self._append_rag_to_consolidated(consolidated_file)
+        
+        # Copy files and cleanup
+        self.copy_files(self.temp_path, self.out_path)
+        
+        messagebox.showinfo("Success", f"Consolidated Report File Generated: {self.out_path}")
+    
+    except Exception as e:
+        logger.info(f"Export Error Failed to export : {e}")
+        messagebox.showerror("Export Error", f"Failed to export : {e}")
+
+
+
+
+
+
+
+
+
+
+
 def _append_rag_to_consolidated(self, consolidated_file: str):
     """
     Append RAG report data to consolidated file (Sheet2+)

@@ -1,0 +1,299 @@
+"""
+COMBINED EXTRACTION + UI REDESIGN
+- Single extraction function for both Extract and Export
+- Display results in email content area
+- Remove separate entity_result_text area
+"""
+
+# ============================================================================
+# CORE EXTRACTION FUNCTION (Private - Shared Logic)
+# ============================================================================
+
+def _perform_extraction_and_export(self, save_to_csv=False):
+    """
+    Core extraction that handles both UI display and CSV export
+    
+    Args:
+        save_to_csv: If True, saves to CSV. If False, just displays in UI
+    """
+    if self.selected_email is None:
+        messagebox.showwarning("No Selection", "Please select an email from the chain first")
+        return
+    
+    try:
+        # Get entity definitions
+        entity_json = self.entity_text.get(1.0, tk.END).strip()
+        self.entity_definitions = json.loads(entity_json)
+    except json.JSONDecodeError as e:
+        messagebox.showerror("JSON Error", f"Invalid JSON: {str(e)}")
+        return
+    
+    try:
+        # Stop previous RAG if exists
+        if hasattr(self, 'rag_extractor') and self.rag_extractor:
+            logger.info("Stopping previous RAG processor...")
+            self.rag_extractor.rag_processor.stop_and_wait(timeout=1.0)
+            self.rag_extractor = None
+        
+        # Create fresh RAG processor
+        logger.info("Creating new RAG processor...")
+        self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
+        
+        entity_names = self.pattern_manager.get_all_entity_names()
+        email_data = self.selected_email
+        entities = {}
+        matched_patterns = []
+        all_data = []
+        all_tables = []
+        
+        # Clean email body
+        email_lines = email_data['body'].splitlines()
+        clean_body = self.email_cleaner.clean_email_body(email_lines)
+        email_lines = list(filter(None, email_lines))
+        
+        current_activity = None
+        matched_count = 0
+        unseen_count = 0
+        
+        # ===== EXTRACTION LOOP =====
+        for line in email_lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for activity keywords
+            line_upper = line.upper()
+            for keyword in self.activity_keywords:
+                if keyword in line_upper:
+                    len_words = self.count_words(line_upper)
+                    if len_words < 5:
+                        current_activity = line_upper
+                        logger.info(f"Activity type changed to: {current_activity}")
+                        break
+            
+            extracted_from_line = False
+            
+            # Process each entity
+            for entity_name in entity_names:
+                patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+                
+                for pattern_entry in patterns:
+                    entity_type = pattern_entry.get('entity_type', 'pattern')
+                    
+                    if entity_type == "pattern":
+                        pattern_id = pattern_entry['pattern_id']
+                        pattern_regex = pattern_entry['pattern']
+                        
+                        self.usage_tracker.record_attempt(pattern_id)
+                        
+                        try:
+                            if self.attribute_count_check(pattern_regex, line):
+                                regex = re.compile(pattern_regex, re.IGNORECASE)
+                                matches = regex.finditer(line)
+                                
+                                for match in matches:
+                                    groupdict = match.groupdict()
+                                    
+                                    if current_activity:
+                                        groupdict['ActivityType'] = current_activity
+                                    
+                                    extracted_labels = []
+                                    for k, v in groupdict.items():
+                                        if v:
+                                            entities.setdefault(k, []).append(f"{v}")
+                                            extracted_labels.append(k)
+                                    
+                                    self.usage_tracker.record_match(pattern_id, line)
+                                    extracted_from_line = True
+                                    matched_count += 1
+                                    
+                                    matched_patterns.append({
+                                        'line': line,
+                                        'pattern_id': pattern_id,
+                                        'entity_name': entity_name,
+                                        'extracted_labels': extracted_labels,
+                                        'confidence': f"{len(extracted_labels)}/{len(groupdict)}"
+                                    })
+                                    break
+                        
+                        except re.error as regex_error:
+                            logger.error(f"Regex error {pattern_id}: {regex_error}")
+                    
+                    elif entity_type == "gazetteer":
+                        entity_def = self.entity_definitions.get(entity_name, {})
+                        gazetteer_vals = entity_def.get("values", [])
+                        subject_vals = self.extract_with_gazetteer(email_data['subject'], gazetteer_vals)
+                        body_vals = self.extract_with_gazetteer(line, gazetteer_vals)
+                        
+                        all_vals = subject_vals + body_vals
+                        
+                        if all_vals:
+                            entities[entity_name] = all_vals
+                            extracted_from_line = True
+                            matched_count += 1
+                            
+                            matched_patterns.append({
+                                'line': line,
+                                'pattern_id': 'GAZETTEER',
+                                'entity_name': entity_name,
+                                'extracted_labels': all_vals,
+                                'confidence': 'N/A'
+                            })
+            
+            # Queue unseen
+            if not extracted_from_line:
+                unseen_count += 1
+                self.rag_extractor.queue_unseen(line, "Trade")
+        
+        # ===== TABLE EXTRACTION =====
+        html_content = email_data.get('html_body', '')
+        if html_content:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            tables = soup.find_all('table')
+            
+            for table in tables:
+                headers = []
+                rows = []
+                
+                header_row = table.find('tr')
+                if header_row:
+                    headers = [th.get_text(strip=True) for th in header_row.find_all('th')]
+                
+                for tr in table.find_all('tr')[1:]:
+                    cols = tr.find_all(['td', 'th'])
+                    row_data = [col.get_text(strip=True) for col in cols]
+                    rows.append(row_data)
+                
+                all_tables.append({
+                    'Email_Index': 1,
+                    'Date': email_data.get('date'),
+                    'From': email_data.get('sender'),
+                    'To': email_data.get('recipient'),
+                    'Subject': email_data.get('subject', ''),
+                    'Headers': headers,
+                    'rows': rows
+                })
+        
+        # ===== DISPLAY IN EMAIL CONTENT AREA (Always) =====
+        self.content_text.delete(1.0, tk.END)
+        
+        # Show extracted entities
+        self.content_text.insert(tk.END, "=" * 60 + "\n")
+        self.content_text.insert(tk.END, "EXTRACTED ENTITIES\n")
+        self.content_text.insert(tk.END, "=" * 60 + "\n\n")
+        
+        if entities:
+            for entity_name, vals in entities.items():
+                self.content_text.insert(tk.END, f"📌 {entity_name}:\n")
+                for v in vals:
+                    self.content_text.insert(tk.END, f"   • {v}\n")
+                self.content_text.insert(tk.END, "\n")
+        else:
+            self.content_text.insert(tk.END, "⚠️  No entities found in this email\n\n")
+        
+        # Show extraction stats
+        self.content_text.insert(tk.END, "-" * 60 + "\n")
+        self.content_text.insert(tk.END, "EXTRACTION STATISTICS\n")
+        self.content_text.insert(tk.END, "-" * 60 + "\n")
+        self.content_text.insert(tk.END, f"✓ Matched patterns: {matched_count}\n")
+        self.content_text.insert(tk.END, f"⚠ Unseen patterns: {unseen_count}\n")
+        self.content_text.insert(tk.END, f"📊 Total lines processed: {matched_count + unseen_count}\n")
+        
+        if matched_count + unseen_count > 0:
+            match_rate = (matched_count / (matched_count + unseen_count)) * 100
+            self.content_text.insert(tk.END, f"📈 Match rate: {match_rate:.1f}%\n")
+        
+        # ===== IF SAVING TO CSV =====
+        if save_to_csv:
+            today = datetime.now()
+            today_str = today.strftime("%m_%d_%y")
+            filename = f"{email_data['trade_id']}_email_entities_export_{today_str}.csv"
+            out_file = os.path.join(self.temp_path, filename)
+            
+            # Your existing CSV export logic
+            # ... [table processing, dataframe creation, etc.]
+            
+            # Create DataFrame and save
+            # ... [existing export code]
+            
+            self.content_text.insert(tk.END, f"\n✅ Exported to: {filename}\n")
+            logger.info(f"Success - Data exported to {filename}")
+        
+        # ===== GENERATE RAG REPORT (Always) =====
+        print(f"\nGenerating RAG report...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rag_report_path = f"{self.temp_path}/RAG_Pattern_Analysis_{timestamp}.xlsx"
+        
+        rag_results = self.rag_extractor.finish_and_generate_report(
+            rag_report_path,
+            matched_data=matched_patterns
+        )
+        
+        self.content_text.insert(tk.END, f"\n📄 RAG report: {os.path.basename(rag_report_path)}\n")
+        
+        # Show message based on action
+        if save_to_csv:
+            messagebox.showinfo("Success", 
+                f"Extraction and Export Complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"CSV: {filename}\n"
+                f"RAG Report: {os.path.basename(rag_report_path)}")
+        else:
+            messagebox.showinfo("Success", 
+                f"Extraction Complete!\n\n"
+                f"Matched: {matched_count}\n"
+                f"Unseen: {unseen_count}\n\n"
+                f"Results displayed in Email Content area")
+    
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed: {str(e)}")
+
+
+# ============================================================================
+# BUTTON HANDLERS (Simplified)
+# ============================================================================
+
+def extract_entities(self):
+    """Extract entities and display in email content area"""
+    self._perform_extraction_and_export(save_to_csv=False)
+
+
+def export_to_csv(self):
+    """Extract entities and export to CSV"""
+    if not self.emails:
+        messagebox.showwarning("No Data", "No emails to export")
+        return
+    
+    self._perform_extraction_and_export(save_to_csv=True)
+
+
+# ============================================================================
+# UI SETUP (Modified)
+# ============================================================================
+
+def setup_ui(self):
+    """Setup UI - MODIFIED to remove entity_result_text area"""
+    
+    # ... [Your existing UI code] ...
+    
+    # Email Content Area (Row 7 - EXPANDED)
+    ttk.Label(main_frame, text="Email Content:").grid(row=7, column=0, sticky=tk.W, pady=5)
+    
+    # Make this area LARGER since we're displaying extraction results here
+    self.content_text = scrolledtext.ScrolledText(main_frame, width=80, height=30)  # Increased height
+    self.content_text.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+    
+    # REMOVE THIS - No longer needed
+    # ttk.Label(main_frame, text="Extracted Entities:").grid(row=7, column=5, sticky=tk.W, pady=5)
+    # self.entity_result_text = scrolledtext.ScrolledText(main_frame, width=40, height=20)
+    # self.entity_result_text.grid(row=8, column=5, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+    
+    # Buttons
+    button_frame = ttk.Frame(main_frame)
+    button_frame.grid(row=9, column=0, columnspan=8, pady=10)
+    
+    ttk.Button(button_frame, text="Extract Entities", command=self.extract_entities).pack(side=tk.LEFT, padx=5)
+    ttk.Button(button_frame, text="Export to CSV", command=self.export_to_csv).pack(side=tk.LEFT, padx=5)
+    ttk.Button(button_frame, text="Export Consolidated", command=self.export_consolidated_results).pack(side=tk.LEFT, padx=5)

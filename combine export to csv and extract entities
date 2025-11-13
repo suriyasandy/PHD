@@ -1,21 +1,26 @@
 """
-COMBINED EXTRACTION + UI REDESIGN
-- Single extraction function for both Extract and Export
-- Display results in email content area
-- Remove separate entity_result_text area
+OPTIMIZED: Single extraction flow
+- One button click does: Extract + Export CSV + Display + RAG
+- No duplicate processing
+- Maximum performance
 """
 
 # ============================================================================
-# CORE EXTRACTION FUNCTION (Private - Shared Logic)
+# SINGLE UNIFIED EXTRACTION (Extract + Export in one pass)
 # ============================================================================
 
-def _perform_extraction_and_export(self, save_to_csv=False):
+def extract_and_export(self):
     """
-    Core extraction that handles both UI display and CSV export
+    OPTIMIZED: Single pass extraction that:
+    1. Extracts entities from email body
+    2. Extracts tables from HTML
+    3. Saves to CSV
+    4. Displays results in UI
+    5. Generates RAG report
     
-    Args:
-        save_to_csv: If True, saves to CSV. If False, just displays in UI
+    All in ONE iteration!
     """
+    
     if self.selected_email is None:
         messagebox.showwarning("No Selection", "Please select an email from the chain first")
         return
@@ -29,7 +34,7 @@ def _perform_extraction_and_export(self, save_to_csv=False):
         return
     
     try:
-        # Stop previous RAG if exists
+        # Stop previous RAG
         if hasattr(self, 'rag_extractor') and self.rag_extractor:
             logger.info("Stopping previous RAG processor...")
             self.rag_extractor.rag_processor.stop_and_wait(timeout=1.0)
@@ -41,12 +46,14 @@ def _perform_extraction_and_export(self, save_to_csv=False):
         
         entity_names = self.pattern_manager.get_all_entity_names()
         email_data = self.selected_email
+        
+        # Initialize collections
         entities = {}
         matched_patterns = []
         all_data = []
         all_tables = []
         
-        # Clean email body
+        # Prepare email lines
         email_lines = email_data['body'].splitlines()
         clean_body = self.email_cleaner.clean_email_body(email_lines)
         email_lines = list(filter(None, email_lines))
@@ -55,7 +62,7 @@ def _perform_extraction_and_export(self, save_to_csv=False):
         matched_count = 0
         unseen_count = 0
         
-        # ===== EXTRACTION LOOP =====
+        # ===== SINGLE PASS: Pattern Extraction =====
         for line in email_lines:
             line = line.strip()
             if not line:
@@ -145,7 +152,7 @@ def _perform_extraction_and_export(self, save_to_csv=False):
                 unseen_count += 1
                 self.rag_extractor.queue_unseen(line, "Trade")
         
-        # ===== TABLE EXTRACTION =====
+        # ===== SINGLE PASS: Table Extraction =====
         html_content = email_data.get('html_body', '')
         if html_content:
             soup = BeautifulSoup(html_content, 'html.parser')
@@ -155,15 +162,18 @@ def _perform_extraction_and_export(self, save_to_csv=False):
                 headers = []
                 rows = []
                 
+                # Extract headers
                 header_row = table.find('tr')
                 if header_row:
                     headers = [th.get_text(strip=True) for th in header_row.find_all('th')]
                 
+                # Extract rows
                 for tr in table.find_all('tr')[1:]:
                     cols = tr.find_all(['td', 'th'])
                     row_data = [col.get_text(strip=True) for col in cols]
                     rows.append(row_data)
                 
+                # Store table data
                 all_tables.append({
                     'Email_Index': 1,
                     'Date': email_data.get('date'),
@@ -174,13 +184,12 @@ def _perform_extraction_and_export(self, save_to_csv=False):
                     'rows': rows
                 })
         
-        # ===== DISPLAY IN EMAIL CONTENT AREA (Always) =====
+        # ===== STEP 1: DISPLAY IN UI =====
         self.content_text.delete(1.0, tk.END)
         
-        # Show extracted entities
-        self.content_text.insert(tk.END, "=" * 60 + "\n")
+        self.content_text.insert(tk.END, "=" * 70 + "\n")
         self.content_text.insert(tk.END, "EXTRACTED ENTITIES\n")
-        self.content_text.insert(tk.END, "=" * 60 + "\n\n")
+        self.content_text.insert(tk.END, "=" * 70 + "\n\n")
         
         if entities:
             for entity_name, vals in entities.items():
@@ -191,35 +200,87 @@ def _perform_extraction_and_export(self, save_to_csv=False):
         else:
             self.content_text.insert(tk.END, "⚠️  No entities found in this email\n\n")
         
-        # Show extraction stats
-        self.content_text.insert(tk.END, "-" * 60 + "\n")
+        # Show tables if any
+        if all_tables:
+            self.content_text.insert(tk.END, "-" * 70 + "\n")
+            self.content_text.insert(tk.END, f"EXTRACTED TABLES ({len(all_tables)} found)\n")
+            self.content_text.insert(tk.END, "-" * 70 + "\n\n")
+            
+            for idx, table in enumerate(all_tables, 1):
+                self.content_text.insert(tk.END, f"Table {idx}:\n")
+                self.content_text.insert(tk.END, f"  Headers: {', '.join(table['Headers'])}\n")
+                self.content_text.insert(tk.END, f"  Rows: {len(table['rows'])}\n\n")
+        
+        # Show stats
+        self.content_text.insert(tk.END, "-" * 70 + "\n")
         self.content_text.insert(tk.END, "EXTRACTION STATISTICS\n")
-        self.content_text.insert(tk.END, "-" * 60 + "\n")
+        self.content_text.insert(tk.END, "-" * 70 + "\n")
         self.content_text.insert(tk.END, f"✓ Matched patterns: {matched_count}\n")
         self.content_text.insert(tk.END, f"⚠ Unseen patterns: {unseen_count}\n")
         self.content_text.insert(tk.END, f"📊 Total lines processed: {matched_count + unseen_count}\n")
+        self.content_text.insert(tk.END, f"📋 Tables extracted: {len(all_tables)}\n")
         
         if matched_count + unseen_count > 0:
             match_rate = (matched_count / (matched_count + unseen_count)) * 100
             self.content_text.insert(tk.END, f"📈 Match rate: {match_rate:.1f}%\n")
         
-        # ===== IF SAVING TO CSV =====
-        if save_to_csv:
-            today = datetime.now()
-            today_str = today.strftime("%m_%d_%y")
-            filename = f"{email_data['trade_id']}_email_entities_export_{today_str}.csv"
-            out_file = os.path.join(self.temp_path, filename)
-            
-            # Your existing CSV export logic
-            # ... [table processing, dataframe creation, etc.]
-            
-            # Create DataFrame and save
-            # ... [existing export code]
-            
-            self.content_text.insert(tk.END, f"\n✅ Exported to: {filename}\n")
-            logger.info(f"Success - Data exported to {filename}")
+        # ===== STEP 2: EXPORT TO CSV =====
+        today = datetime.now()
+        today_str = today.strftime("%m_%d_%y")
+        filename = f"{email_data['trade_id']}_email_entities_export_{today_str}.csv"
+        out_file = os.path.join(self.temp_path, filename)
         
-        # ===== GENERATE RAG REPORT (Always) =====
+        # Build records for CSV
+        records = []
+        
+        # Add entity data
+        if entities:
+            for entity_name, vals in entities.items():
+                for val in vals:
+                    records.append({
+                        'Trade_ID': email_data['trade_id'],
+                        'Entity': entity_name,
+                        'Value': val,
+                        'Type': 'Entity'
+                    })
+        
+        # Add table data
+        if all_tables:
+            for table in all_tables:
+                for row in table['rows']:
+                    row_dict = {
+                        'Trade_ID': email_data['trade_id'],
+                        'Type': 'Table',
+                        'Headers': ', '.join(table['Headers'])
+                    }
+                    # Add table cells
+                    for i, cell in enumerate(row):
+                        row_dict[f'Col_{i+1}'] = cell
+                    records.append(row_dict)
+        
+        # Create DataFrame
+        if records:
+            table_df = pd.DataFrame(records)
+        else:
+            # Empty DataFrame with headers
+            table_df = pd.DataFrame(columns=self.selected_columns)
+        
+        # Save to CSV (append if exists)
+        if os.path.exists(out_file):
+            existing = pd.read_csv(out_file)
+            all_cols = list(set(existing.columns).union(set(table_df.columns)))
+            existing = existing.reindex(columns=all_cols)
+            table_df = table_df.reindex(columns=all_cols)
+            combined = pd.concat([existing, table_df], ignore_index=True)
+            combined = combined.drop_duplicates().reset_index(drop=True)
+            combined.to_csv(out_file, index=False)
+        else:
+            table_df.to_csv(out_file, index=False)
+        
+        self.content_text.insert(tk.END, f"\n✅ Exported to CSV: {filename}\n")
+        logger.info(f"Success - Data exported to {filename}")
+        
+        # ===== STEP 3: GENERATE RAG REPORT =====
         print(f"\nGenerating RAG report...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         rag_report_path = f"{self.temp_path}/RAG_Pattern_Analysis_{timestamp}.xlsx"
@@ -229,22 +290,17 @@ def _perform_extraction_and_export(self, save_to_csv=False):
             matched_data=matched_patterns
         )
         
-        self.content_text.insert(tk.END, f"\n📄 RAG report: {os.path.basename(rag_report_path)}\n")
+        self.content_text.insert(tk.END, f"📄 RAG report: {os.path.basename(rag_report_path)}\n")
         
-        # Show message based on action
-        if save_to_csv:
-            messagebox.showinfo("Success", 
-                f"Extraction and Export Complete!\n\n"
-                f"Matched: {matched_count}\n"
-                f"Unseen: {unseen_count}\n\n"
-                f"CSV: {filename}\n"
-                f"RAG Report: {os.path.basename(rag_report_path)}")
-        else:
-            messagebox.showinfo("Success", 
-                f"Extraction Complete!\n\n"
-                f"Matched: {matched_count}\n"
-                f"Unseen: {unseen_count}\n\n"
-                f"Results displayed in Email Content area")
+        # ===== FINAL MESSAGE =====
+        messagebox.showinfo("Success", 
+            f"Extraction Complete!\n\n"
+            f"✓ Matched: {matched_count}\n"
+            f"⚠ Unseen: {unseen_count}\n"
+            f"📋 Tables: {len(all_tables)}\n\n"
+            f"CSV: {filename}\n"
+            f"RAG: {os.path.basename(rag_report_path)}\n\n"
+            f"Results displayed in Email Content area")
     
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)
@@ -252,48 +308,29 @@ def _perform_extraction_and_export(self, save_to_csv=False):
 
 
 # ============================================================================
-# BUTTON HANDLERS (Simplified)
+# BUTTON SETUP (Simplified)
 # ============================================================================
 
-def extract_entities(self):
-    """Extract entities and display in email content area"""
-    self._perform_extraction_and_export(save_to_csv=False)
-
-
-def export_to_csv(self):
-    """Extract entities and export to CSV"""
-    if not self.emails:
-        messagebox.showwarning("No Data", "No emails to export")
-        return
+def setup_buttons(self):
+    """Setup buttons - SIMPLIFIED"""
     
-    self._perform_extraction_and_export(save_to_csv=True)
-
-
-# ============================================================================
-# UI SETUP (Modified)
-# ============================================================================
-
-def setup_ui(self):
-    """Setup UI - MODIFIED to remove entity_result_text area"""
-    
-    # ... [Your existing UI code] ...
-    
-    # Email Content Area (Row 7 - EXPANDED)
-    ttk.Label(main_frame, text="Email Content:").grid(row=7, column=0, sticky=tk.W, pady=5)
-    
-    # Make this area LARGER since we're displaying extraction results here
-    self.content_text = scrolledtext.ScrolledText(main_frame, width=80, height=30)  # Increased height
-    self.content_text.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-    
-    # REMOVE THIS - No longer needed
-    # ttk.Label(main_frame, text="Extracted Entities:").grid(row=7, column=5, sticky=tk.W, pady=5)
-    # self.entity_result_text = scrolledtext.ScrolledText(main_frame, width=40, height=20)
-    # self.entity_result_text.grid(row=8, column=5, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-    
-    # Buttons
-    button_frame = ttk.Frame(main_frame)
+    button_frame = ttk.Frame(self.main_frame)
     button_frame.grid(row=9, column=0, columnspan=8, pady=10)
     
-    ttk.Button(button_frame, text="Extract Entities", command=self.extract_entities).pack(side=tk.LEFT, padx=5)
-    ttk.Button(button_frame, text="Export to CSV", command=self.export_to_csv).pack(side=tk.LEFT, padx=5)
-    ttk.Button(button_frame, text="Export Consolidated", command=self.export_consolidated_results).pack(side=tk.LEFT, padx=5)
+    # Single button does everything
+    ttk.Button(
+        button_frame, 
+        text="🔍 Extract & Export", 
+        command=self.extract_and_export,
+        width=20
+    ).pack(side=tk.LEFT, padx=5)
+    
+    ttk.Button(
+        button_frame, 
+        text="📊 Export Consolidated", 
+        command=self.export_consolidated_results,
+        width=20
+    ).pack(side=tk.LEFT, padx=5)
+    
+    # Optional: Keep separate buttons if you want
+    # ttk.Button(button_frame, text="Extract Only", command=lambda: self.extract_and_export()).pack(side=tk.LEFT, padx=5)

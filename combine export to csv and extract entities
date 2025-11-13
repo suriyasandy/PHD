@@ -1,25 +1,18 @@
 """
-OPTIMIZED: Single extraction flow
-- One button click does: Extract + Export CSV + Display + RAG
-- No duplicate processing
-- Maximum performance
+CORRECTED CSV EXPORT
+- Entity names become column headers
+- Each row represents a single extraction with all entities filled
+- Example:
+  | Trade_ID | Customer | Amount | Currency | Date | ... |
+  | 12345    | John Doe | 1000   | USD      | ...  | ... |
 """
 
 # ============================================================================
-# SINGLE UNIFIED EXTRACTION (Extract + Export in one pass)
+# OPTIMIZED CSV EXPORT (Record-by-Record with Entity Headers)
 # ============================================================================
 
 def extract_and_export(self):
-    """
-    OPTIMIZED: Single pass extraction that:
-    1. Extracts entities from email body
-    2. Extracts tables from HTML
-    3. Saves to CSV
-    4. Displays results in UI
-    5. Generates RAG report
-    
-    All in ONE iteration!
-    """
+    """Extract entities and export with proper column structure"""
     
     if self.selected_email is None:
         messagebox.showwarning("No Selection", "Please select an email from the chain first")
@@ -47,10 +40,11 @@ def extract_and_export(self):
         entity_names = self.pattern_manager.get_all_entity_names()
         email_data = self.selected_email
         
-        # Initialize collections
-        entities = {}
+        # ===== COLLECT ALL EXTRACTED DATA BY MATCH =====
+        # Each match will be a separate row with all its entities
+        extraction_records = []  # List of dicts, each dict is one row
+        
         matched_patterns = []
-        all_data = []
         all_tables = []
         
         # Prepare email lines
@@ -62,7 +56,7 @@ def extract_and_export(self):
         matched_count = 0
         unseen_count = 0
         
-        # ===== SINGLE PASS: Pattern Extraction =====
+        # ===== EXTRACTION WITH RECORD COLLECTION =====
         for line in email_lines:
             line = line.strip()
             if not line:
@@ -101,14 +95,32 @@ def extract_and_export(self):
                                 for match in matches:
                                     groupdict = match.groupdict()
                                     
+                                    # ===== CREATE ONE RECORD PER MATCH =====
+                                    record = {
+                                        'Trade_ID': email_data['trade_id'],
+                                        'Email_Date': email_data.get('date', ''),
+                                        'Email_From': email_data.get('sender', ''),
+                                        'Email_Subject': email_data.get('subject', '')
+                                    }
+                                    
+                                    # Add activity if available
                                     if current_activity:
+                                        record['ActivityType'] = current_activity
                                         groupdict['ActivityType'] = current_activity
                                     
+                                    # Add all extracted entities from this match
                                     extracted_labels = []
                                     for k, v in groupdict.items():
                                         if v:
-                                            entities.setdefault(k, []).append(f"{v}")
+                                            record[k] = v  # Entity name is column, value is cell value
                                             extracted_labels.append(k)
+                                    
+                                    # Add source line for reference
+                                    record['Source_Line'] = line
+                                    record['Pattern_ID'] = pattern_id
+                                    
+                                    # Add to records
+                                    extraction_records.append(record)
                                     
                                     self.usage_tracker.record_match(pattern_id, line)
                                     extracted_from_line = True
@@ -135,7 +147,18 @@ def extract_and_export(self):
                         all_vals = subject_vals + body_vals
                         
                         if all_vals:
-                            entities[entity_name] = all_vals
+                            # Create record for gazetteer match
+                            record = {
+                                'Trade_ID': email_data['trade_id'],
+                                'Email_Date': email_data.get('date', ''),
+                                'Email_From': email_data.get('sender', ''),
+                                'Email_Subject': email_data.get('subject', ''),
+                                entity_name: ', '.join(all_vals),  # Entity name as column
+                                'Source_Line': line,
+                                'Pattern_ID': 'GAZETTEER'
+                            }
+                            extraction_records.append(record)
+                            
                             extracted_from_line = True
                             matched_count += 1
                             
@@ -152,13 +175,13 @@ def extract_and_export(self):
                 unseen_count += 1
                 self.rag_extractor.queue_unseen(line, "Trade")
         
-        # ===== SINGLE PASS: Table Extraction =====
+        # ===== TABLE EXTRACTION =====
         html_content = email_data.get('html_body', '')
         if html_content:
             soup = BeautifulSoup(html_content, 'html.parser')
             tables = soup.find_all('table')
             
-            for table in tables:
+            for table_idx, table in enumerate(tables, 1):
                 headers = []
                 rows = []
                 
@@ -183,38 +206,66 @@ def extract_and_export(self):
                     'Headers': headers,
                     'rows': rows
                 })
+                
+                # ===== ADD TABLE ROWS TO EXTRACTION RECORDS =====
+                for row in rows:
+                    table_record = {
+                        'Trade_ID': email_data['trade_id'],
+                        'Email_Date': email_data.get('date', ''),
+                        'Email_From': email_data.get('sender', ''),
+                        'Email_Subject': email_data.get('subject', ''),
+                        'Source': f'Table_{table_idx}',
+                        'Pattern_ID': 'TABLE'
+                    }
+                    
+                    # Add table columns as entity columns
+                    for i, (header, value) in enumerate(zip(headers, row)):
+                        if header:
+                            table_record[header] = value
+                        else:
+                            table_record[f'Column_{i+1}'] = value
+                    
+                    extraction_records.append(table_record)
         
-        # ===== STEP 1: DISPLAY IN UI =====
+        # ===== DISPLAY IN UI =====
         self.content_text.delete(1.0, tk.END)
         
         self.content_text.insert(tk.END, "=" * 70 + "\n")
-        self.content_text.insert(tk.END, "EXTRACTED ENTITIES\n")
+        self.content_text.insert(tk.END, "EXTRACTED ENTITIES (Record View)\n")
         self.content_text.insert(tk.END, "=" * 70 + "\n\n")
         
-        if entities:
-            for entity_name, vals in entities.items():
-                self.content_text.insert(tk.END, f"📌 {entity_name}:\n")
-                for v in vals:
-                    self.content_text.insert(tk.END, f"   • {v}\n")
+        # Show extraction records summary
+        if extraction_records:
+            # Get all unique entity columns
+            all_entities = set()
+            for record in extraction_records:
+                all_entities.update(record.keys())
+            
+            # Remove metadata columns for display
+            entity_columns = sorted([e for e in all_entities if e not in 
+                                   ['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject', 
+                                    'Source_Line', 'Pattern_ID', 'Source', 'ActivityType']])
+            
+            self.content_text.insert(tk.END, f"Extracted Entities: {', '.join(entity_columns)}\n\n")
+            
+            # Show first few records
+            for i, record in enumerate(extraction_records[:5], 1):
+                self.content_text.insert(tk.END, f"Record {i}:\n")
+                for entity in entity_columns:
+                    if entity in record and record[entity]:
+                        self.content_text.insert(tk.END, f"  {entity}: {record[entity]}\n")
                 self.content_text.insert(tk.END, "\n")
+            
+            if len(extraction_records) > 5:
+                self.content_text.insert(tk.END, f"... and {len(extraction_records) - 5} more records\n\n")
         else:
             self.content_text.insert(tk.END, "⚠️  No entities found in this email\n\n")
-        
-        # Show tables if any
-        if all_tables:
-            self.content_text.insert(tk.END, "-" * 70 + "\n")
-            self.content_text.insert(tk.END, f"EXTRACTED TABLES ({len(all_tables)} found)\n")
-            self.content_text.insert(tk.END, "-" * 70 + "\n\n")
-            
-            for idx, table in enumerate(all_tables, 1):
-                self.content_text.insert(tk.END, f"Table {idx}:\n")
-                self.content_text.insert(tk.END, f"  Headers: {', '.join(table['Headers'])}\n")
-                self.content_text.insert(tk.END, f"  Rows: {len(table['rows'])}\n\n")
         
         # Show stats
         self.content_text.insert(tk.END, "-" * 70 + "\n")
         self.content_text.insert(tk.END, "EXTRACTION STATISTICS\n")
         self.content_text.insert(tk.END, "-" * 70 + "\n")
+        self.content_text.insert(tk.END, f"✓ Total records extracted: {len(extraction_records)}\n")
         self.content_text.insert(tk.END, f"✓ Matched patterns: {matched_count}\n")
         self.content_text.insert(tk.END, f"⚠ Unseen patterns: {unseen_count}\n")
         self.content_text.insert(tk.END, f"📊 Total lines processed: {matched_count + unseen_count}\n")
@@ -224,63 +275,55 @@ def extract_and_export(self):
             match_rate = (matched_count / (matched_count + unseen_count)) * 100
             self.content_text.insert(tk.END, f"📈 Match rate: {match_rate:.1f}%\n")
         
-        # ===== STEP 2: EXPORT TO CSV =====
+        # ===== EXPORT TO CSV WITH PROPER STRUCTURE =====
         today = datetime.now()
         today_str = today.strftime("%m_%d_%y")
         filename = f"{email_data['trade_id']}_email_entities_export_{today_str}.csv"
         out_file = os.path.join(self.temp_path, filename)
         
-        # Build records for CSV
-        records = []
-        
-        # Add entity data
-        if entities:
-            for entity_name, vals in entities.items():
-                for val in vals:
-                    records.append({
-                        'Trade_ID': email_data['trade_id'],
-                        'Entity': entity_name,
-                        'Value': val,
-                        'Type': 'Entity'
-                    })
-        
-        # Add table data
-        if all_tables:
-            for table in all_tables:
-                for row in table['rows']:
-                    row_dict = {
-                        'Trade_ID': email_data['trade_id'],
-                        'Type': 'Table',
-                        'Headers': ', '.join(table['Headers'])
-                    }
-                    # Add table cells
-                    for i, cell in enumerate(row):
-                        row_dict[f'Col_{i+1}'] = cell
-                    records.append(row_dict)
-        
-        # Create DataFrame
-        if records:
-            table_df = pd.DataFrame(records)
+        # Create DataFrame from extraction records
+        if extraction_records:
+            final_df = pd.DataFrame(extraction_records)
+            
+            # Reorder columns: metadata first, then entities
+            metadata_cols = ['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject', 
+                           'ActivityType', 'Pattern_ID', 'Source', 'Source_Line']
+            
+            # Get entity columns (all columns except metadata)
+            entity_cols = [col for col in final_df.columns if col not in metadata_cols]
+            
+            # Reorder: metadata + entities
+            existing_metadata = [col for col in metadata_cols if col in final_df.columns]
+            column_order = existing_metadata + sorted(entity_cols)
+            
+            final_df = final_df[column_order]
         else:
-            # Empty DataFrame with headers
-            table_df = pd.DataFrame(columns=self.selected_columns)
+            # Empty DataFrame with expected structure
+            final_df = pd.DataFrame(columns=self.static_headers if hasattr(self, 'static_headers') 
+                                  else ['Trade_ID', 'Email_Date', 'Email_From'])
         
         # Save to CSV (append if exists)
         if os.path.exists(out_file):
             existing = pd.read_csv(out_file)
-            all_cols = list(set(existing.columns).union(set(table_df.columns)))
+            
+            # Merge columns from both dataframes
+            all_cols = list(set(existing.columns).union(set(final_df.columns)))
             existing = existing.reindex(columns=all_cols)
-            table_df = table_df.reindex(columns=all_cols)
-            combined = pd.concat([existing, table_df], ignore_index=True)
+            final_df = final_df.reindex(columns=all_cols)
+            
+            combined = pd.concat([existing, final_df], ignore_index=True)
             combined = combined.drop_duplicates().reset_index(drop=True)
             combined.to_csv(out_file, index=False)
         else:
-            table_df.to_csv(out_file, index=False)
+            final_df.to_csv(out_file, index=False)
         
         self.content_text.insert(tk.END, f"\n✅ Exported to CSV: {filename}\n")
+        self.content_text.insert(tk.END, f"   Columns: {len(final_df.columns)}\n")
+        self.content_text.insert(tk.END, f"   Rows: {len(final_df)}\n")
+        
         logger.info(f"Success - Data exported to {filename}")
         
-        # ===== STEP 3: GENERATE RAG REPORT =====
+        # ===== GENERATE RAG REPORT =====
         print(f"\nGenerating RAG report...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         rag_report_path = f"{self.temp_path}/RAG_Pattern_Analysis_{timestamp}.xlsx"
@@ -292,45 +335,16 @@ def extract_and_export(self):
         
         self.content_text.insert(tk.END, f"📄 RAG report: {os.path.basename(rag_report_path)}\n")
         
-        # ===== FINAL MESSAGE =====
+        # Final message
         messagebox.showinfo("Success", 
             f"Extraction Complete!\n\n"
+            f"✓ Records: {len(extraction_records)}\n"
             f"✓ Matched: {matched_count}\n"
             f"⚠ Unseen: {unseen_count}\n"
             f"📋 Tables: {len(all_tables)}\n\n"
             f"CSV: {filename}\n"
-            f"RAG: {os.path.basename(rag_report_path)}\n\n"
-            f"Results displayed in Email Content area")
+            f"RAG: {os.path.basename(rag_report_path)}")
     
     except Exception as e:
         logger.error(f"Error: {str(e)}", exc_info=True)
         messagebox.showerror("Error", f"Failed: {str(e)}")
-
-
-# ============================================================================
-# BUTTON SETUP (Simplified)
-# ============================================================================
-
-def setup_buttons(self):
-    """Setup buttons - SIMPLIFIED"""
-    
-    button_frame = ttk.Frame(self.main_frame)
-    button_frame.grid(row=9, column=0, columnspan=8, pady=10)
-    
-    # Single button does everything
-    ttk.Button(
-        button_frame, 
-        text="🔍 Extract & Export", 
-        command=self.extract_and_export,
-        width=20
-    ).pack(side=tk.LEFT, padx=5)
-    
-    ttk.Button(
-        button_frame, 
-        text="📊 Export Consolidated", 
-        command=self.export_consolidated_results,
-        width=20
-    ).pack(side=tk.LEFT, padx=5)
-    
-    # Optional: Keep separate buttons if you want
-    # ttk.Button(button_frame, text="Extract Only", command=lambda: self.extract_and_export()).pack(side=tk.LEFT, padx=5)

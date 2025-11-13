@@ -1,276 +1,454 @@
-"""
-OPTIMIZED attribute_count_check
-Integrates with your existing Status validation logic
-"""
-
-def attribute_count_check(self, pattern, line):
+def attribute_count_check_strict(self, pattern, line):
     """
-    OPTIMIZED: Validate that pattern's group count matches the line's token count
-    Handles special case for Status patterns
+    STRICTEST: Only accept matches where ALL groups are captured with valid values
     """
     try:
-        # Compile regex ONCE (cache if possible)
-        if not hasattr(self, '_pattern_cache'):
-            self._pattern_cache = {}
-        
+        # Use cached compiled pattern
         if pattern not in self._pattern_cache:
             self._pattern_cache[pattern] = re.compile(pattern)
         
         compiled_pattern = self._pattern_cache[pattern]
         
-        # Fast checks first
+        # Get counts
         group_count = len(compiled_pattern.groupindex)
         text_count = len(line.split())
         
-        # Special handling for Status patterns
+        # Try to match
+        match = compiled_pattern.search(line)
+        if not match:
+            return 0  # No match at all
+        
+        groupdict = match.groupdict()
+        
+        # ===== STRICT: Check ALL groups have non-empty values =====
+        non_empty_captures = sum(1 for v in groupdict.values() if v and v.strip())
+        
+        # Reject if any group is None or empty
+        if non_empty_captures < group_count:
+            logger.debug(f"Partial match rejected: {non_empty_captures}/{group_count} groups captured")
+            return 0
+        
+        # ===== Status pattern handling =====
         if "Status" in pattern:
             line_upper = line.upper()
+            has_status = any(kw in line_upper for kw in self.trade_status)
             
-            # Check if any trade status keyword is in line
-            for keyword in self.trade_status:
-                if keyword in line_upper and "Status" in pattern:
-                    if text_count == group_count:
-                        return True
-                    else:
-                        return False
+            if has_status and text_count == group_count:
+                return 1
+            return 0
         
-        # Standard check: if Status not in pattern, validate counts
+        # ===== Standard check =====
         elif "Status" not in pattern and text_count == group_count:
-            return True
+            return 1
         
-        return False
+        return 0
     
     except Exception as e:
         logger.error(f"Attribute count check error: {e}")
-        return False
+        return 0
 
 
-# ============================================================================
-# EVEN FASTER VERSION: Pre-compiled patterns
-# ============================================================================
-
-def attribute_count_check_fast(self, compiled_regex, line):
+def extract_and_export(self):
     """
-    FASTEST: Use pre-compiled regex (no compilation overhead)
+    OPTIMIZED: Extract entities and export to CSV
+    - Pre-compiles patterns (no repeated compilation)
+    - Uses cached attribute checking
+    - Record-by-record CSV structure
+    - Single pass through email lines
+    - Fast table extraction
+    """
     
-    Usage:
-        # Compile once outside loop
-        compiled_regex = re.compile(pattern, re.IGNORECASE)
-        
-        # Use in loop
-        for line in lines:
-            if self.attribute_count_check_fast(compiled_regex, line):
-                # Process
-    """
+    if self.selected_email is None:
+        messagebox.showwarning("No Selection", "Please select an email from the chain first")
+        return
+    
     try:
-        # Quick check - just see if it matches at all
-        match = compiled_regex.search(line)
-        if not match:
-            return False
-        
-        # Get matched groups
-        groupdict = match.groupdict()
-        
-        # Check if we have valid captures
-        valid_groups = sum(1 for v in groupdict.values() if v is not None)
-        
-        # For Status patterns
-        if 'Status' in groupdict:
-            line_upper = line.upper()
-            # Check trade status keywords
-            for keyword in self.trade_status:
-                if keyword in line_upper:
-                    return valid_groups > 0
-            return False
-        
-        # Standard check
-        return valid_groups > 0
+        # Get entity definitions
+        entity_json = self.entity_text.get(1.0, tk.END).strip()
+        self.entity_definitions = json.loads(entity_json)
+    except json.JSONDecodeError as e:
+        messagebox.showerror("JSON Error", f"Invalid JSON: {str(e)}")
+        return
     
-    except Exception:
-        return False
-
-
-# ============================================================================
-# INTEGRATION: How to use in your extraction loop
-# ============================================================================
-
-def extract_and_export_optimized(self):
-    """Optimized extraction using fast attribute check"""
-    
-    # ... [Your existing setup code] ...
-    
-    # ===== PRE-COMPILE ALL PATTERNS (Once!) =====
-    compiled_patterns_map = {}
-    
-    for entity_name in entity_names:
-        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
-        compiled_list = []
+    try:
+        start_time = time.time()
         
-        for pattern_entry in patterns:
-            if pattern_entry.get('entity_type') == 'pattern':
-                pattern_str = pattern_entry['pattern']
-                pattern_id = pattern_entry['pattern_id']
-                
-                try:
-                    # Compile ONCE
-                    compiled_regex = re.compile(pattern_str, re.IGNORECASE)
-                    compiled_list.append({
-                        'pattern_id': pattern_id,
-                        'compiled_regex': compiled_regex,
-                        'entity_name': entity_name,
-                        'has_status': 'Status' in pattern_str
-                    })
-                except re.error as e:
-                    logger.error(f"Regex compilation error for {pattern_id}: {e}")
+        # Stop previous RAG
+        if hasattr(self, 'rag_extractor') and self.rag_extractor:
+            logger.info("Stopping previous RAG processor...")
+            self.rag_extractor.rag_processor.stop_and_wait(timeout=1.0)
+            self.rag_extractor = None
         
-        compiled_patterns_map[entity_name] = compiled_list
-    
-    # ===== FAST EXTRACTION LOOP =====
-    for line in email_lines:
-        line = line.strip()
-        if not line:
-            continue
+        # Create fresh RAG processor
+        logger.info("Creating new RAG processor...")
+        self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
         
-        extracted_from_line = False
+        entity_names = self.pattern_manager.get_all_entity_names()
+        email_data = self.selected_email
         
-        # Try all pre-compiled patterns
-        for entity_name, compiled_patterns in compiled_patterns_map.items():
-            if extracted_from_line:
-                break
+        # ===== OPTIMIZATION: Pre-compile all patterns ONCE =====
+        compiled_patterns_map = {}
+        
+        for entity_name in entity_names:
+            patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+            compiled_list = []
             
-            for pattern_info in compiled_patterns:
-                compiled_regex = pattern_info['compiled_regex']
-                pattern_id = pattern_info['pattern_id']
-                has_status = pattern_info['has_status']
-                
-                # FAST attribute check (no recompilation!)
-                if not self.attribute_count_check_fast(compiled_regex, line):
-                    continue
-                
-                # Try to match
-                matches = compiled_regex.finditer(line)
-                
-                for match in matches:
-                    groupdict = match.groupdict()
+            for pattern_entry in patterns:
+                if pattern_entry.get('entity_type') == 'pattern':
+                    pattern_str = pattern_entry['pattern']
+                    pattern_id = pattern_entry['pattern_id']
                     
-                    if not groupdict:
-                        continue
-                    
-                    # Create record
-                    record = {
-                        'Trade_ID': email_data['trade_id'],
-                        'Email_Date': email_data.get('date', ''),
-                        'Email_From': email_data.get('sender', ''),
-                        'Email_Subject': email_data.get('subject', '')
-                    }
-                    
-                    # Add activity if available
-                    if current_activity:
-                        record['ActivityType'] = current_activity
-                    
-                    # Extract entities
-                    extracted_labels = []
-                    for k, v in groupdict.items():
-                        if v:
-                            record[k] = v
-                            extracted_labels.append(k)
-                    
-                    if extracted_labels:
-                        record['Source_Line'] = line
-                        record['Pattern_ID'] = pattern_id
-                        extraction_records.append(record)
-                        
-                        self.usage_tracker.record_match(pattern_id, line)
-                        extracted_from_line = True
-                        matched_count += 1
-                        break
-                
+                    try:
+                        # Compile pattern ONCE
+                        compiled_regex = re.compile(pattern_str, re.IGNORECASE)
+                        compiled_list.append({
+                            'pattern_id': pattern_id,
+                            'pattern_str': pattern_str,
+                            'compiled_regex': compiled_regex,
+                            'entity_name': entity_name
+                        })
+                    except re.error as e:
+                        logger.error(f"Regex compilation error for {pattern_id}: {e}")
+            
+            compiled_patterns_map[entity_name] = compiled_list
+        
+        logger.info(f"⏱ Pattern compilation: {time.time() - start_time:.2f}s")
+        
+        # ===== Initialize data structures =====
+        extraction_records = []  # List of dicts, each dict is one row
+        matched_patterns = []
+        all_tables = []
+        
+        # ===== Prepare email lines =====
+        email_lines = email_data['body'].splitlines()
+        email_lines = self.email_cleaner.clean_email_body(email_lines)
+        email_lines = [line.strip() for line in email_lines if line.strip()]  # Fast list comprehension
+        
+        current_activity = None
+        matched_count = 0
+        unseen_count = 0
+        
+        extraction_start = time.time()
+        
+        # ===== OPTIMIZED EXTRACTION LOOP =====
+        for line in email_lines:
+            # Check for activity keywords
+            line_upper = line.upper()
+            for keyword in self.activity_keywords:
+                if keyword in line_upper and len(line_upper.split()) < 5:
+                    current_activity = line_upper
+                    logger.info(f"Activity type changed to: {current_activity}")
+                    break
+            
+            extracted_from_line = False
+            
+            # Use pre-compiled patterns
+            for entity_name, compiled_patterns in compiled_patterns_map.items():
                 if extracted_from_line:
                     break
-        
-        # Queue unseen
-        if not extracted_from_line:
-            unseen_count += 1
-            self.rag_extractor.queue_unseen(line, "Trade")
-    
-    # ... [Rest of your code] ...
-
-
-# ============================================================================
-# ADDITIONAL OPTIMIZATION: Pattern Cache Manager
-# ============================================================================
-
-class PatternCacheManager:
-    """Manages compiled regex patterns with caching"""
-    
-    def __init__(self):
-        self._cache = {}
-        self._hit_count = 0
-        self._miss_count = 0
-    
-    def get_compiled(self, pattern_str):
-        """Get or compile pattern with caching"""
-        if pattern_str in self._cache:
-            self._hit_count += 1
-            return self._cache[pattern_str]
-        
-        # Cache miss - compile and store
-        try:
-            compiled = re.compile(pattern_str, re.IGNORECASE)
-            self._cache[pattern_str] = compiled
-            self._miss_count += 1
-            return compiled
-        except re.error as e:
-            logger.error(f"Regex compilation error: {e}")
-            return None
-    
-    def get_stats(self):
-        """Get cache performance stats"""
-        total = self._hit_count + self._miss_count
-        hit_rate = (self._hit_count / total * 100) if total > 0 else 0
-        return {
-            'hits': self._hit_count,
-            'misses': self._miss_count,
-            'hit_rate': f"{hit_rate:.1f}%",
-            'cached_patterns': len(self._cache)
-        }
-
-
-# ============================================================================
-# USAGE IN YOUR __init__
-# ============================================================================
-
-def __init__(self):
-    # ... [Your existing init code] ...
-    
-    # Add pattern cache
-    self.pattern_cache_manager = PatternCacheManager()
-
-
-# ============================================================================
-# UPDATED EXTRACTION WITH CACHE MANAGER
-# ============================================================================
-
-def extract_with_cache_manager(self):
-    """Extraction using pattern cache manager"""
-    
-    # Pre-compile patterns with cache
-    for entity_name in entity_names:
-        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
-        
-        for pattern_entry in patterns:
-            if pattern_entry.get('entity_type') == 'pattern':
-                pattern_str = pattern_entry['pattern']
                 
-                # Get compiled pattern (cached if already compiled)
-                compiled_regex = self.pattern_cache_manager.get_compiled(pattern_str)
+                for pattern_info in compiled_patterns:
+                    compiled_regex = pattern_info['compiled_regex']
+                    pattern_str = pattern_info['pattern_str']
+                    pattern_id = pattern_info['pattern_id']
+                    
+                    # Use optimized attribute check (with caching)
+                    if not self.attribute_count_check(pattern_str, line):
+                        continue
+                    
+                    # Try to match with pre-compiled regex
+                    matches = compiled_regex.finditer(line)
+                    
+                    for match in matches:
+                        groupdict = match.groupdict()
+                        
+                        if not groupdict:
+                            continue
+                        
+                        # ===== CREATE ONE RECORD PER MATCH =====
+                        record = {
+                            'Trade_ID': email_data['trade_id'],
+                            'Email_Date': email_data.get('date', ''),
+                            'Email_From': email_data.get('sender', ''),
+                            'Email_Subject': email_data.get('subject', '')
+                        }
+                        
+                        # Add activity if available
+                        if current_activity:
+                            record['ActivityType'] = current_activity
+                        
+                        # Add all extracted entities from this match
+                        extracted_labels = []
+                        for k, v in groupdict.items():
+                            if v:
+                                record[k] = v  # Entity name is column, value is cell value
+                                extracted_labels.append(k)
+                        
+                        if extracted_labels:
+                            # Add metadata
+                            record['Source_Line'] = line
+                            record['Pattern_ID'] = pattern_id
+                            
+                            # Add to records
+                            extraction_records.append(record)
+                            
+                            # Track for RAG
+                            matched_patterns.append({
+                                'line': line,
+                                'pattern_id': pattern_id,
+                                'entity_name': entity_name,
+                                'extracted_labels': extracted_labels,
+                                'confidence': f"{len(extracted_labels)}/{len(groupdict)}"
+                            })
+                            
+                            self.usage_tracker.record_match(pattern_id, line)
+                            extracted_from_line = True
+                            matched_count += 1
+                            break
+                    
+                    if extracted_from_line:
+                        break
+            
+            # ===== GAZETTEER EXTRACTION =====
+            if not extracted_from_line:
+                for entity_name in entity_names:
+                    entity_def = self.entity_definitions.get(entity_name, {})
+                    if entity_def.get('entity_type') == 'gazetteer':
+                        gazetteer_vals = entity_def.get("values", [])
+                        subject_vals = self.extract_with_gazetteer(email_data['subject'], gazetteer_vals)
+                        body_vals = self.extract_with_gazetteer(line, gazetteer_vals)
+                        
+                        all_vals = subject_vals + body_vals
+                        
+                        if all_vals:
+                            # Create record for gazetteer match
+                            record = {
+                                'Trade_ID': email_data['trade_id'],
+                                'Email_Date': email_data.get('date', ''),
+                                'Email_From': email_data.get('sender', ''),
+                                'Email_Subject': email_data.get('subject', ''),
+                                entity_name: ', '.join(all_vals),
+                                'Source_Line': line,
+                                'Pattern_ID': 'GAZETTEER'
+                            }
+                            extraction_records.append(record)
+                            
+                            matched_patterns.append({
+                                'line': line,
+                                'pattern_id': 'GAZETTEER',
+                                'entity_name': entity_name,
+                                'extracted_labels': all_vals,
+                                'confidence': 'N/A'
+                            })
+                            
+                            extracted_from_line = True
+                            matched_count += 1
+                            break
+            
+            # Queue unseen
+            if not extracted_from_line:
+                unseen_count += 1
+                self.rag_extractor.queue_unseen(line, "Trade")
+        
+        logger.info(f"⏱ Pattern extraction: {time.time() - extraction_start:.2f}s")
+        
+        # ===== FAST TABLE EXTRACTION =====
+        table_start = time.time()
+        html_content = email_data.get('html_body', '')
+        
+        if html_content:
+            try:
+                soup = BeautifulSoup(html_content, 'html.parser')
+                tables = soup.find_all('table')
                 
-                if compiled_regex:
-                    # Use fast attribute check
-                    if self.attribute_count_check_fast(compiled_regex, line):
-                        # Process match
-                        pass
+                for table_idx, table in enumerate(tables, 1):
+                    # Fast header extraction
+                    headers = []
+                    header_row = table.find('tr')
+                    if header_row:
+                        headers = [th.get_text(strip=True) for th in header_row.find_all('th')]
+                    
+                    # Fast row extraction using list comprehension
+                    rows = [[col.get_text(strip=True) for col in tr.find_all(['td', 'th'])] 
+                            for tr in table.find_all('tr')[1:]]
+                    
+                    all_tables.append({
+                        'Email_Index': 1,
+                        'Headers': headers,
+                        'rows': rows
+                    })
+                    
+                    # ===== ADD TABLE ROWS TO EXTRACTION RECORDS =====
+                    for row in rows:
+                        table_record = {
+                            'Trade_ID': email_data['trade_id'],
+                            'Email_Date': email_data.get('date', ''),
+                            'Email_From': email_data.get('sender', ''),
+                            'Email_Subject': email_data.get('subject', ''),
+                            'Source': f'Table_{table_idx}',
+                            'Pattern_ID': 'TABLE'
+                        }
+                        
+                        # Add table columns as entity columns (fast dict update)
+                        table_record.update({
+                            (header if header else f'Column_{i+1}'): value 
+                            for i, (header, value) in enumerate(zip(headers, row))
+                        })
+                        
+                        extraction_records.append(table_record)
+            
+            except Exception as e:
+                logger.error(f"Table extraction error: {e}")
+        
+        logger.info(f"⏱ Table extraction: {time.time() - table_start:.2f}s")
+        
+        # ===== DISPLAY IN UI (Batched update) =====
+        ui_start = time.time()
+        self._update_ui_display(extraction_records, matched_count, unseen_count, len(all_tables))
+        logger.info(f"⏱ UI update: {time.time() - ui_start:.2f}s")
+        
+        # ===== EXPORT TO CSV =====
+        csv_start = time.time()
+        today_str = datetime.now().strftime("%m_%d_%y")
+        filename = f"{email_data['trade_id']}_email_entities_export_{today_str}.csv"
+        out_file = os.path.join(self.temp_path, filename)
+        
+        # Create DataFrame from extraction records
+        if extraction_records:
+            final_df = pd.DataFrame(extraction_records)
+            
+            # Reorder columns: metadata first, then entities
+            metadata_cols = ['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject', 
+                           'ActivityType', 'Pattern_ID', 'Source', 'Source_Line']
+            
+            # Get entity columns (all columns except metadata)
+            entity_cols = [col for col in final_df.columns if col not in metadata_cols]
+            
+            # Reorder: metadata + entities
+            existing_metadata = [col for col in metadata_cols if col in final_df.columns]
+            column_order = existing_metadata + sorted(entity_cols)
+            
+            final_df = final_df[column_order]
+        else:
+            # Empty DataFrame with expected structure
+            final_df = pd.DataFrame(columns=['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject'])
+        
+        # Save to CSV (append if exists)
+        if os.path.exists(out_file):
+            existing = pd.read_csv(out_file)
+            
+            # Merge columns from both dataframes
+            all_cols = list(set(existing.columns).union(set(final_df.columns)))
+            existing = existing.reindex(columns=all_cols)
+            final_df = final_df.reindex(columns=all_cols)
+            
+            combined = pd.concat([existing, final_df], ignore_index=True)
+            combined = combined.drop_duplicates().reset_index(drop=True)
+            combined.to_csv(out_file, index=False)
+        else:
+            final_df.to_csv(out_file, index=False)
+        
+        logger.info(f"⏱ CSV export: {time.time() - csv_start:.2f}s")
+        
+        self.content_text.insert(tk.END, f"\n✅ Exported to CSV: {filename}\n")
+        self.content_text.insert(tk.END, f"   Columns: {len(final_df.columns)}\n")
+        self.content_text.insert(tk.END, f"   Rows: {len(final_df)}\n")
+        
+        # ===== GENERATE RAG REPORT =====
+        rag_start = time.time()
+        print(f"\nGenerating RAG report...")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rag_report_path = f"{self.temp_path}/RAG_Pattern_Analysis_{timestamp}.xlsx"
+        
+        rag_results = self.rag_extractor.finish_and_generate_report(
+            rag_report_path,
+            matched_data=matched_patterns
+        )
+        logger.info(f"⏱ RAG generation: {time.time() - rag_start:.2f}s")
+        
+        self.content_text.insert(tk.END, f"📄 RAG report: {os.path.basename(rag_report_path)}\n")
+        
+        # ===== PERFORMANCE SUMMARY =====
+        total_time = time.time() - start_time
+        logger.info(f"⏱ TOTAL TIME: {total_time:.2f}s")
+        logger.info(f"📊 Pattern cache size: {len(self._pattern_cache)} patterns")
+        
+        self.content_text.insert(tk.END, f"\n⏱ Processing time: {total_time:.2f}s\n")
+        
+        # Final message
+        messagebox.showinfo("Success", 
+            f"Extraction Complete!\n\n"
+            f"✓ Records: {len(extraction_records)}\n"
+            f"✓ Matched: {matched_count}\n"
+            f"⚠ Unseen: {unseen_count}\n"
+            f"📋 Tables: {len(all_tables)}\n"
+            f"⏱ Time: {total_time:.2f}s\n\n"
+            f"CSV: {filename}\n"
+            f"RAG: {os.path.basename(rag_report_path)}")
     
-    # Log cache stats
-    stats = self.pattern_cache_manager.get_stats()
-    logger.info(f"Pattern cache stats: {stats}")
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed: {str(e)}")
+
+
+# ============================================================================
+# HELPER: Batched UI Update (for performance)
+# ============================================================================
+
+def _update_ui_display(self, extraction_records, matched_count, unseen_count, table_count):
+    """
+    Update UI in one batch to avoid multiple redraws
+    """
+    # Build entire text first, then insert once
+    output_lines = []
+    
+    output_lines.append("=" * 70)
+    output_lines.append("EXTRACTED ENTITIES (Record View)")
+    output_lines.append("=" * 70)
+    output_lines.append("")
+    
+    if extraction_records:
+        # Get unique entity columns (fast set operation)
+        all_entities = set()
+        for record in extraction_records:
+            all_entities.update(record.keys())
+        
+        metadata_cols = {'Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject', 
+                        'Source_Line', 'Pattern_ID', 'Source', 'ActivityType'}
+        entity_columns = sorted(all_entities - metadata_cols)
+        
+        output_lines.append(f"Extracted Entities: {', '.join(entity_columns)}")
+        output_lines.append("")
+        
+        # Show first 5 records
+        for i, record in enumerate(extraction_records[:5], 1):
+            output_lines.append(f"Record {i}:")
+            for entity in entity_columns:
+                if entity in record and record[entity]:
+                    output_lines.append(f"  {entity}: {record[entity]}")
+            output_lines.append("")
+        
+        if len(extraction_records) > 5:
+            output_lines.append(f"... and {len(extraction_records) - 5} more records")
+            output_lines.append("")
+    else:
+        output_lines.append("⚠️  No entities found in this email")
+        output_lines.append("")
+    
+    output_lines.append("-" * 70)
+    output_lines.append("EXTRACTION STATISTICS")
+    output_lines.append("-" * 70)
+    output_lines.append(f"✓ Total records extracted: {len(extraction_records)}")
+    output_lines.append(f"✓ Matched patterns: {matched_count}")
+    output_lines.append(f"⚠ Unseen patterns: {unseen_count}")
+    output_lines.append(f"📊 Total lines processed: {matched_count + unseen_count}")
+    output_lines.append(f"📋 Tables extracted: {table_count}")
+    
+    if matched_count + unseen_count > 0:
+        match_rate = (matched_count / (matched_count + unseen_count)) * 100
+        output_lines.append(f"📈 Match rate: {match_rate:.1f}%")
+    
+    # Single UI update (fast!)
+    self.content_text.delete(1.0, tk.END)
+    self.content_text.insert(tk.END, "\n".join(output_lines))
+

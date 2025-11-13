@@ -1,0 +1,276 @@
+"""
+OPTIMIZED attribute_count_check
+Integrates with your existing Status validation logic
+"""
+
+def attribute_count_check(self, pattern, line):
+    """
+    OPTIMIZED: Validate that pattern's group count matches the line's token count
+    Handles special case for Status patterns
+    """
+    try:
+        # Compile regex ONCE (cache if possible)
+        if not hasattr(self, '_pattern_cache'):
+            self._pattern_cache = {}
+        
+        if pattern not in self._pattern_cache:
+            self._pattern_cache[pattern] = re.compile(pattern)
+        
+        compiled_pattern = self._pattern_cache[pattern]
+        
+        # Fast checks first
+        group_count = len(compiled_pattern.groupindex)
+        text_count = len(line.split())
+        
+        # Special handling for Status patterns
+        if "Status" in pattern:
+            line_upper = line.upper()
+            
+            # Check if any trade status keyword is in line
+            for keyword in self.trade_status:
+                if keyword in line_upper and "Status" in pattern:
+                    if text_count == group_count:
+                        return True
+                    else:
+                        return False
+        
+        # Standard check: if Status not in pattern, validate counts
+        elif "Status" not in pattern and text_count == group_count:
+            return True
+        
+        return False
+    
+    except Exception as e:
+        logger.error(f"Attribute count check error: {e}")
+        return False
+
+
+# ============================================================================
+# EVEN FASTER VERSION: Pre-compiled patterns
+# ============================================================================
+
+def attribute_count_check_fast(self, compiled_regex, line):
+    """
+    FASTEST: Use pre-compiled regex (no compilation overhead)
+    
+    Usage:
+        # Compile once outside loop
+        compiled_regex = re.compile(pattern, re.IGNORECASE)
+        
+        # Use in loop
+        for line in lines:
+            if self.attribute_count_check_fast(compiled_regex, line):
+                # Process
+    """
+    try:
+        # Quick check - just see if it matches at all
+        match = compiled_regex.search(line)
+        if not match:
+            return False
+        
+        # Get matched groups
+        groupdict = match.groupdict()
+        
+        # Check if we have valid captures
+        valid_groups = sum(1 for v in groupdict.values() if v is not None)
+        
+        # For Status patterns
+        if 'Status' in groupdict:
+            line_upper = line.upper()
+            # Check trade status keywords
+            for keyword in self.trade_status:
+                if keyword in line_upper:
+                    return valid_groups > 0
+            return False
+        
+        # Standard check
+        return valid_groups > 0
+    
+    except Exception:
+        return False
+
+
+# ============================================================================
+# INTEGRATION: How to use in your extraction loop
+# ============================================================================
+
+def extract_and_export_optimized(self):
+    """Optimized extraction using fast attribute check"""
+    
+    # ... [Your existing setup code] ...
+    
+    # ===== PRE-COMPILE ALL PATTERNS (Once!) =====
+    compiled_patterns_map = {}
+    
+    for entity_name in entity_names:
+        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        compiled_list = []
+        
+        for pattern_entry in patterns:
+            if pattern_entry.get('entity_type') == 'pattern':
+                pattern_str = pattern_entry['pattern']
+                pattern_id = pattern_entry['pattern_id']
+                
+                try:
+                    # Compile ONCE
+                    compiled_regex = re.compile(pattern_str, re.IGNORECASE)
+                    compiled_list.append({
+                        'pattern_id': pattern_id,
+                        'compiled_regex': compiled_regex,
+                        'entity_name': entity_name,
+                        'has_status': 'Status' in pattern_str
+                    })
+                except re.error as e:
+                    logger.error(f"Regex compilation error for {pattern_id}: {e}")
+        
+        compiled_patterns_map[entity_name] = compiled_list
+    
+    # ===== FAST EXTRACTION LOOP =====
+    for line in email_lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        extracted_from_line = False
+        
+        # Try all pre-compiled patterns
+        for entity_name, compiled_patterns in compiled_patterns_map.items():
+            if extracted_from_line:
+                break
+            
+            for pattern_info in compiled_patterns:
+                compiled_regex = pattern_info['compiled_regex']
+                pattern_id = pattern_info['pattern_id']
+                has_status = pattern_info['has_status']
+                
+                # FAST attribute check (no recompilation!)
+                if not self.attribute_count_check_fast(compiled_regex, line):
+                    continue
+                
+                # Try to match
+                matches = compiled_regex.finditer(line)
+                
+                for match in matches:
+                    groupdict = match.groupdict()
+                    
+                    if not groupdict:
+                        continue
+                    
+                    # Create record
+                    record = {
+                        'Trade_ID': email_data['trade_id'],
+                        'Email_Date': email_data.get('date', ''),
+                        'Email_From': email_data.get('sender', ''),
+                        'Email_Subject': email_data.get('subject', '')
+                    }
+                    
+                    # Add activity if available
+                    if current_activity:
+                        record['ActivityType'] = current_activity
+                    
+                    # Extract entities
+                    extracted_labels = []
+                    for k, v in groupdict.items():
+                        if v:
+                            record[k] = v
+                            extracted_labels.append(k)
+                    
+                    if extracted_labels:
+                        record['Source_Line'] = line
+                        record['Pattern_ID'] = pattern_id
+                        extraction_records.append(record)
+                        
+                        self.usage_tracker.record_match(pattern_id, line)
+                        extracted_from_line = True
+                        matched_count += 1
+                        break
+                
+                if extracted_from_line:
+                    break
+        
+        # Queue unseen
+        if not extracted_from_line:
+            unseen_count += 1
+            self.rag_extractor.queue_unseen(line, "Trade")
+    
+    # ... [Rest of your code] ...
+
+
+# ============================================================================
+# ADDITIONAL OPTIMIZATION: Pattern Cache Manager
+# ============================================================================
+
+class PatternCacheManager:
+    """Manages compiled regex patterns with caching"""
+    
+    def __init__(self):
+        self._cache = {}
+        self._hit_count = 0
+        self._miss_count = 0
+    
+    def get_compiled(self, pattern_str):
+        """Get or compile pattern with caching"""
+        if pattern_str in self._cache:
+            self._hit_count += 1
+            return self._cache[pattern_str]
+        
+        # Cache miss - compile and store
+        try:
+            compiled = re.compile(pattern_str, re.IGNORECASE)
+            self._cache[pattern_str] = compiled
+            self._miss_count += 1
+            return compiled
+        except re.error as e:
+            logger.error(f"Regex compilation error: {e}")
+            return None
+    
+    def get_stats(self):
+        """Get cache performance stats"""
+        total = self._hit_count + self._miss_count
+        hit_rate = (self._hit_count / total * 100) if total > 0 else 0
+        return {
+            'hits': self._hit_count,
+            'misses': self._miss_count,
+            'hit_rate': f"{hit_rate:.1f}%",
+            'cached_patterns': len(self._cache)
+        }
+
+
+# ============================================================================
+# USAGE IN YOUR __init__
+# ============================================================================
+
+def __init__(self):
+    # ... [Your existing init code] ...
+    
+    # Add pattern cache
+    self.pattern_cache_manager = PatternCacheManager()
+
+
+# ============================================================================
+# UPDATED EXTRACTION WITH CACHE MANAGER
+# ============================================================================
+
+def extract_with_cache_manager(self):
+    """Extraction using pattern cache manager"""
+    
+    # Pre-compile patterns with cache
+    for entity_name in entity_names:
+        patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+        
+        for pattern_entry in patterns:
+            if pattern_entry.get('entity_type') == 'pattern':
+                pattern_str = pattern_entry['pattern']
+                
+                # Get compiled pattern (cached if already compiled)
+                compiled_regex = self.pattern_cache_manager.get_compiled(pattern_str)
+                
+                if compiled_regex:
+                    # Use fast attribute check
+                    if self.attribute_count_check_fast(compiled_regex, line):
+                        # Process match
+                        pass
+    
+    # Log cache stats
+    stats = self.pattern_cache_manager.get_stats()
+    logger.info(f"Pattern cache stats: {stats}")

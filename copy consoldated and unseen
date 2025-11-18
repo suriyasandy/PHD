@@ -1,324 +1,174 @@
-import openpyxl
-import os
-
-# Directory where the files are located
-folder_path = "."
-
-# Identify files
-consolidated_file = None
-unseen_file = None
-
-for file_name in os.listdir(folder_path):
-    if file_name.lower().startswith("consolidated") and file_name.lower().endswith(".xlsx"):
-        consolidated_file = os.path.join(folder_path, file_name)
-    elif "unseen_patterns_" in file_name.lower() and file_name.lower().endswith(".xlsx"):
-        unseen_file = os.path.join(folder_path, file_name)
-
-# Validate existence
-if not consolidated_file:
-    raise FileNotFoundError("No consolidated file found in the folder.")
-if not unseen_file:
-    raise FileNotFoundError("No unseen_patterns file found in the folder.")
-
-print(f"Consolidated File: {consolidated_file}")
-print(f"Unseen File: {unseen_file}")
-
-# Load workbooks
-consolidated_wb = openpyxl.load_workbook(consolidated_file)
-unseen_wb = openpyxl.load_workbook(unseen_file)
-
-# Copy sheets from unseen to consolidated
-for sheet_name in unseen_wb.sheetnames:
-    unseen_sheet = unseen_wb[sheet_name]
-
-    # If the sheet already exists, delete it first
-    if sheet_name in consolidated_wb.sheetnames:
-        del consolidated_wb[sheet_name]
-
-    # Create new sheet
-    new_sheet = consolidated_wb.create_sheet(title=sheet_name)
-
-    # Copy cell values
-    for row in unseen_sheet.iter_rows():
-        for cell in row:
-            new_sheet[cell.coordinate].value = cell.value
-
-# Save and close
-consolidated_wb.save(consolidated_file)
-consolidated_wb.close()
-unseen_wb.close()
-
-# Delete unseen file
-os.remove(unseen_file)
-print(f"Deleted {unseen_file}")
-print("Sheets copied successfully to consolidated workbook.")
-
-
-
-
-
-
-"""
-RAG Report Consolidator - UPDATED
-- Starts from Sheet2 (Sheet1 left untouched)
-- Appends RAG data from Sheet2-5
-- Preserves existing Sheet1 data
-"""
-
-import os
-import shutil
-import logging
-from datetime import datetime
-import pandas as pd
-from pathlib import Path
-from openpyxl import load_workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
-
-logger = logging.getLogger(__name__)
-
-
-class RAGReportConsolidator:
-    """Consolidate RAG reports into master file (starting from Sheet2)"""
-    
-    def __init__(self, shared_path: str, consolidated_filename: str = "RAG_Consolidated_Master.xlsx"):
-        """
-        Initialize consolidator
-        
-        Args:
-            shared_path: Path to shared folder (e.g., r"\\server\share\RAG_Reports")
-            consolidated_filename: Name of consolidated master file
-        """
-        self.shared_path = Path(shared_path)
-        self.consolidated_file = self.shared_path / consolidated_filename
-        
-        # Sheet names - RAG will write to these sheets
-        # Sheet 1 is reserved for other data (not touched)
-        self.rag_sheets = [
-            'Config Patterns',      # Sheet2
-            'Matched Patterns',     # Sheet3
-            'Unseen Patterns',      # Sheet4
-            'Suggestions',          # Sheet5
-            'Summary'               # Sheet6
-        ]
-        
-        # Create shared path if doesn't exist
-        self.shared_path.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize consolidated file if doesn't exist
-        if not self.consolidated_file.exists():
-            self._initialize_consolidated_file()
-            logger.info(f"Created new consolidated file: {self.consolidated_file}")
-    
-    def _initialize_consolidated_file(self):
-        """Create new consolidated file with empty sheets (starting from Sheet2)"""
-        logger.info("Initializing consolidated master file...")
-        
-        with pd.ExcelWriter(self.consolidated_file, engine='openpyxl') as writer:
-            
-            # ===== SHEET 1: RESERVED (Leave for other data) =====
-            pd.DataFrame({
-                'Notes': ['Sheet1 reserved for other data'],
-                'Description': ['RAG reports will append to Sheet2 onwards']
-            }).to_excel(writer, sheet_name='Sheet1', index=False)
-            logger.info("  ✓ Sheet1: Reserved")
-            
-            # ===== SHEETS 2-6: RAG DATA =====
-            
-            # Sheet 2: Config Patterns
-            pd.DataFrame(columns=[
-                'Pattern ID', 'Entity', 'Pattern', 'Full Pattern', 'Source File', 'Timestamp'
-            ]).to_excel(writer, sheet_name='Config Patterns', index=False)
-            logger.info("  ✓ Sheet2 (Config Patterns): Created")
-            
-            # Sheet 3: Matched Patterns
-            pd.DataFrame(columns=[
-                'Line', 'Full Line', 'Pattern ID', 'Entity', 'Extracted Labels', 
-                'Confidence', 'Source File', 'Timestamp'
-            ]).to_excel(writer, sheet_name='Matched Patterns', index=False)
-            logger.info("  ✓ Sheet3 (Matched Patterns): Created")
-            
-            # Sheet 4: Unseen Patterns
-            pd.DataFrame(columns=[
-                'Entity', 'Unseen Line', 'Full Line', 'Timestamp', 'Source File'
-            ]).to_excel(writer, sheet_name='Unseen Patterns', index=False)
-            logger.info("  ✓ Sheet4 (Unseen Patterns): Created")
-            
-            # Sheet 5: Suggestions
-            pd.DataFrame(columns=[
-                'Unseen Line', 'Suggested Pattern ID', 'Suggested Entity', 
-                'Confidence', 'Extracted Values', 'Source File', 'Timestamp'
-            ]).to_excel(writer, sheet_name='Suggestions', index=False)
-            logger.info("  ✓ Sheet5 (Suggestions): Created")
-            
-            # Sheet 6: Summary
-            pd.DataFrame(columns=[
-                'Source File', 'Timestamp', 'Total Config Patterns', 'Matched Patterns',
-                'Unseen Patterns', 'Total Lines', 'Match Rate'
-            ]).to_excel(writer, sheet_name='Summary', index=False)
-            logger.info("  ✓ Sheet6 (Summary): Created")
-        
-        logger.info("✓ Consolidated file initialized (Sheet1 reserved, RAG data in Sheet2+)")
-    
-    def copy_and_consolidate(self, local_rag_report: str, run_timestamp: str = None):
-        """
-        Copy RAG report to shared path and append to consolidated file (Sheet2+)
-        
-        Args:
-            local_rag_report: Path to local RAG report
-            run_timestamp: Timestamp of the run (default: current time)
-        
-        Returns:
-            str: Path to copied report in shared location
-        """
-        if run_timestamp is None:
-            run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        try:
-            # Step 1: Copy to shared path
-            local_file = Path(local_rag_report)
-            if not local_file.exists():
-                logger.error(f"Local report not found: {local_rag_report}")
-                return None
-            
-            # Create unique filename in shared path
-            shared_file = self.shared_path / f"RAG_Report_{run_timestamp}.xlsx"
-            shutil.copy2(local_file, shared_file)
-            logger.info(f"✓ Copied to shared: {shared_file}")
-            
-            # Step 2: Append to consolidated file (starting from Sheet2)
-            self._append_to_consolidated(shared_file, run_timestamp)
-            
-            logger.info(f"✓ Consolidated successfully (sheets 2-6)")
-            return str(shared_file)
-        
-        except Exception as e:
-            logger.error(f"Consolidation error: {e}", exc_info=True)
-            return None
-    
-    def _append_to_consolidated(self, source_file: Path, run_timestamp: str):
-        """Append data from source file to consolidated file (Sheet2+)"""
-        logger.info(f"Appending to consolidated: {source_file.name}")
-        
-        source_filename = source_file.name
-        
-        # Load consolidated file
-        consolidated_wb = load_workbook(self.consolidated_file)
-        
-        # Load source file
-        source_wb = load_workbook(source_file, read_only=True)
-        
-        try:
-            # Process each RAG sheet (Sheet2-6)
-            for sheet_name in self.rag_sheets:
-                if sheet_name not in source_wb.sheetnames:
-                    logger.warning(f"Sheet '{sheet_name}' not found in source")
-                    continue
-                
-                if sheet_name not in consolidated_wb.sheetnames:
-                    logger.warning(f"Sheet '{sheet_name}' not found in consolidated")
-                    continue
-                
-                logger.info(f"  Processing: {sheet_name}")
-                
-                # Read source sheet
-                source_sheet = source_wb[sheet_name]
-                consolidated_sheet = consolidated_wb[sheet_name]
-                
-                # Convert source sheet to dataframe
-                data = []
-                headers = []
-                
-                for idx, row in enumerate(source_sheet.iter_rows(values_only=True)):
-                    if idx == 0:
-                        headers = list(row)
-                    else:
-                        if any(cell is not None for cell in row):
-                            data.append(list(row))
-                
-                if not 
-                    logger.info(f"    → No data to append")
-                    continue
-                
-                # Create dataframe
-                df = pd.DataFrame(data, columns=headers)
-                
-                # Add metadata columns if not already present
-                if 'Source File' not in df.columns:
-                    df['Source File'] = source_filename
-                if 'Timestamp' not in df.columns:
-                    df['Timestamp'] = run_timestamp
-                
-                # Get current max row (skip header row 1)
-                start_row = consolidated_sheet.max_row + 1
-                
-                # Append data to consolidated sheet
-                for row_idx, row_data in enumerate(dataframe_to_rows(df, index=False, header=False)):
-                    for col_idx, value in enumerate(row_data, 1):
-                        consolidated_sheet.cell(row=start_row + row_idx, column=col_idx, value=value)
-                
-                logger.info(f"    ✓ Appended {len(data)} rows")
-            
-            # Save consolidated file
-            consolidated_wb.save(self.consolidated_file)
-            logger.info(f"✓ Consolidated file saved: {self.consolidated_file}")
-        
-        finally:
-            consolidated_wb.close()
-            source_wb.close()
-
-
-# ============================================================================
-# INTEGRATION WITH EXTRACTION
-# ============================================================================
-
-def extract_entities(self):
-    """Extract entities with auto-consolidation to Sheet2+"""
-    
-    # ... [Your existing extraction code] ...
-    
+def export_consolidated_results(self):
+    """
+    Export consolidated results by appending all unique temp trade CSVs
+    to a single Excel file, with PROPER duplicate handling
+    """
     try:
-        # ... [extraction logic] ...
+        temp_df = None
+        today = datetime.now()
+        today_str = today.strftime("%m_%d_%y")
         
-        # Generate RAG report
-        print(f"\n[2/3] Generating RAG report...")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rag_report_path = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
+        # Find all CSV files
+        csv_files = glob.glob(f"{self.temp_path}/*.csv")
+        sheet_name = "Consolidated_Report"
+        consolidated_file = f"{self.out_path}/{today_str}_{sheet_name}.xlsx"
+        lock_path = consolidated_file + '.lock'
+        ws_rows = []
         
-        rag_results = self.rag_extractor.finish_and_generate_report(
-            rag_report_path,
-            matched_data=matched_patterns
-        )
+        # Use file lock
+        with FileLock(lock_path, timeout=60):
+            for file in csv_files:
+                base_name = os.path.basename(file)
+                trade_id = base_name.split("_")[0]
+                rows_found = False
+                
+                with open(file, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    csv_headers = list(reader.fieldnames) if reader.fieldnames else []
+                    expected_headers = self.static_headers[1:]
+                    required_sub_headers = self.static_headers[20:]
+                    
+                    # Check if required headers exist
+                    if all(header in csv_headers for header in required_sub_headers):
+                        # Append data rows if all required headers exist
+                        for row in reader:
+                            out_row = [trade_id]
+                            for header in expected_headers:
+                                out_row.append(row.get(header, ""))
+                            ws_rows.append(out_row)
+                        rows_found = True
+                    
+                    elif any(header in csv_headers for header in expected_headers[1:]):
+                        # Partial header mismatch
+                        for row in reader:
+                            out_row = [trade_id]
+                            for header in expected_headers:
+                                out_row.append(row.get(header, ""))
+                            ws_rows.append(out_row)
+                        rows_found = True
+                    
+                    else:
+                        # No match
+                        if len(csv_headers) == 0:
+                            out_row = [f"{trade_id} - Found In Mail - No Entity Found"] + [""] * (len(self.static_headers) - 1)
+                        else:
+                            out_row = [f"{trade_id} - Partial header mismatch - Check file: {base_name}"] + [""] * (len(self.static_headers) - 1)
+                        ws_rows.append(out_row)
+                        rows_found = True
+                
+                f.close()
+                
+                if not rows_found:
+                    out_row = [f"{trade_id} - Not Found In Mail"] + [""] * (len(self.static_headers) - 1)
+                    ws_rows.append(out_row)
+                    os.remove(file)
+            
+            # Build new dataframe
+            df_new = pd.DataFrame(ws_rows, columns=self.static_headers)
+            
+            # ===== FIX: PROPER DUPLICATE HANDLING =====
+            if os.path.isfile(consolidated_file):
+                # File exists - need to preserve RAG sheets and avoid duplicates
+                logger.info(f"Consolidated file exists - preserving RAG sheets")
+                
+                # Read existing Sheet1 data
+                df_existing = pd.read_excel(consolidated_file, sheet_name=sheet_name)
+                
+                # ===== CREATE COMPOSITE KEY FOR DEDUPLICATION =====
+                # Define columns that make a record unique
+                key_columns = ['Trade_ID']  # Add more if needed
+                
+                # Add composite key to both dataframes
+                if not df_existing.empty:
+                    # Create a hash of key columns for existing data
+                    df_existing['_dedup_key'] = df_existing[key_columns].apply(
+                        lambda row: '_'.join(row.values.astype(str)), axis=1
+                    )
+                
+                if not df_new.empty:
+                    # Create same hash for new data
+                    df_new['_dedup_key'] = df_new[key_columns].apply(
+                        lambda row: '_'.join(row.values.astype(str)), axis=1
+                    )
+                    
+                    # ===== FILTER OUT DUPLICATES =====
+                    # Only keep new records that don't exist in existing data
+                    existing_keys = set(df_existing['_dedup_key'].values) if not df_existing.empty else set()
+                    df_new_filtered = df_new[~df_new['_dedup_key'].isin(existing_keys)]
+                    
+                    logger.info(f"📊 Existing records: {len(df_existing)}")
+                    logger.info(f"📊 New records (before dedup): {len(df_new)}")
+                    logger.info(f"📊 New records (after dedup): {len(df_new_filtered)}")
+                    logger.info(f"🗑️ Duplicates removed: {len(df_new) - len(df_new_filtered)}")
+                    
+                    # Drop the temporary key column
+                    df_existing = df_existing.drop('_dedup_key', axis=1)
+                    df_new_filtered = df_new_filtered.drop('_dedup_key', axis=1)
+                    
+                    # Combine existing + new (deduplicated)
+                    df_combined = pd.concat([df_existing, df_new_filtered], ignore_index=True)
+                else:
+                    df_combined = df_existing
+                
+                # Load workbook to preserve other sheets
+                wb = load_workbook(consolidated_file)
+                
+                # Save all sheet names EXCEPT Sheet1
+                other_sheets = {}
+                for ws_name in wb.sheetnames:
+                    if ws_name != sheet_name:
+                        # Read data from other sheets
+                        ws = wb[ws_name]
+                        sheet_data = []
+                        for row in ws.iter_rows(values_only=True):
+                            sheet_data.append(row)
+                        other_sheets[ws_name] = sheet_data
+                
+                wb.close()
+                
+                # Write combined data to Sheet1
+                df_combined.to_excel(consolidated_file, sheet_name=sheet_name, index=False)
+                
+                # Restore other sheets
+                if other_sheets:
+                    wb = load_workbook(consolidated_file)
+                    for ws_name, sheet_data in other_sheets.items():
+                        if ws_name not in wb.sheetnames:
+                            ws = wb.create_sheet(ws_name)
+                        else:
+                            ws = wb[ws_name]
+                        
+                        # Write data back
+                        for row_idx, row in enumerate(sheet_data, 1):
+                            for col_idx, value in enumerate(row, 1):
+                                ws.cell(row=row_idx, column=col_idx, value=value)
+                    
+                    wb.save(consolidated_file)
+                    wb.close()
+                    logger.info(f"✅ Preserved {len(other_sheets)} RAG sheets")
+            
+            else:
+                # New file - just write Sheet1
+                df_new.to_excel(consolidated_file, sheet_name=sheet_name, index=False)
+                logger.info("✅ Created new consolidated file")
+            
+            # Display summary
+            if not df_new.empty:
+                self.content_text.delete(1.0, tk.END)
+                self.content_text.insert(tk.END, f"{df_new}\n")
+            else:
+                self.content_text.insert(tk.END, "No Data found in this email")
         
-        print(f"✓ RAG report: {rag_report_path}")
+        logger.info(f"Success - Consolidated Report File Generated")
         
-        # ===== STEP 3: AUTO-CONSOLIDATE (Sheet2+) =====
-        print(f"\n[3/3] Consolidating to shared location (Sheet2+)...")
+        # ===== NOW APPEND RAG DATA (SHEETS ALREADY PRESERVED) =====
+        self._append_rag_to_consolidated(consolidated_file)
         
-        # Get shared path from config
-        shared_path = r"\\shared\path\to\RAG_Reports"  # UPDATE THIS PATH
+        # Copy files and cleanup
+        self.copy_files(self.temp_path, self.out_path)
         
-        # Initialize consolidator
-        consolidator = RAGReportConsolidator(shared_path)
-        
-        # Copy and consolidate
-        shared_file = consolidator.copy_and_consolidate(rag_report_path, timestamp)
-        
-        if shared_file:
-            print(f"✓ Consolidated to: {shared_file}")
-            messagebox.showinfo("Success", 
-                f"Extraction complete!\n\n"
-                f"Matched: {matched_count}\n"
-                f"Unseen: {unseen_count}\n\n"
-                f"Local Report: {rag_report_path}\n"
-                f"Shared Report: {shared_file}\n"
-                f"Consolidated: RAG_Consolidated_Master.xlsx\n"
-                f"(Sheet1: Other data | Sheet2+: RAG data)")
-        else:
-            messagebox.showwarning("Warning",
-                f"Extraction complete!\n\n"
-                f"Report: {rag_report_path}\n"
-                f"(Consolidation failed - check logs)")
+        messagebox.showinfo("Success", f"Consolidated Report File Generated: {self.out_path}")
     
     except Exception as e:
-        logger.error(f"Error: {str(e)}", exc_info=True)
-        messagebox.showerror("Error", f"Failed: {str(e)}")
+        logger.error(f"Consolidation error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed to consolidate: {str(e)}")

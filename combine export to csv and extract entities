@@ -1,12 +1,12 @@
 def extract_and_export(self):
     """
-    OPTIMIZED & COMPLETE: Extract entities and export to CSV
-    - Pre-compiles patterns (no repeated compilation)
-    - Uses cached attribute checking
-    - Record-by-record CSV structure
+    COMPLETE & OPTIMIZED: Extract entities with package-aware activity tracking
+    - Automatic trade package boundary detection
+    - Package-scoped activity tracking
+    - Pre-compiled patterns (no repeated compilation)
+    - Cached attribute checking
     - Table enrichment with Cust_ID matching
-    - Single pass through email lines
-    - Fast table extraction
+    - Record-by-record CSV structure
     """
     
     if self.selected_email is None:
@@ -66,7 +66,7 @@ def extract_and_export(self):
         logger.info(f"⏱ Pattern compilation: {time.time() - start_time:.2f}s")
         
         # ===== Initialize data structures =====
-        extraction_records = []  # For pattern extractions
+        extraction_records = []
         matched_patterns = []
         all_tables = []
         
@@ -75,25 +75,62 @@ def extract_and_export(self):
         email_lines = self.email_cleaner.clean_email_body(email_lines)
         email_lines = [line.strip() for line in email_lines if line.strip()]
         
-        current_activity = None
         matched_count = 0
         unseen_count = 0
         
         extraction_start = time.time()
         
-        # ===== OPTIMIZED EXTRACTION LOOP =====
-        for line in email_lines:
-            # Check for activity keywords
+        # ===== TRADE PACKAGE BOUNDARY DETECTION =====
+        def is_package_boundary(line, prev_line):
+            """
+            Detect if this line starts a new trade package
+            Returns True if this is likely a new package
+            """
+            line_upper = line.upper()
+            
+            # Indicators of new package:
+            # 1. Empty line or separator
+            if not line.strip() or line.strip() in ['---', '===', '***', '___']:
+                return True
+            
+            # 2. New activity keyword on standalone line
+            for keyword in self.activity_keywords:
+                if keyword in line_upper and len(line_upper.split()) < 5:
+                    return True
+            
+            # 3. Repeating header patterns
+            package_headers = ['TRADE DETAILS', 'PACKAGE', 'DEAL #', 'TRADE #', 
+                             'TRANSACTION', 'BOOKING', 'CONFIRMATION']
+            for header in package_headers:
+                if header in line_upper and len(line_upper) < 30:
+                    return True
+            
+            return False
+        
+        # ===== PACKAGE-AWARE EXTRACTION =====
+        current_activity = None
+        current_package_id = 0
+        
+        for line_idx, line in enumerate(email_lines):
+            prev_line = email_lines[line_idx - 1] if line_idx > 0 else ""
+            
+            # ===== CHECK FOR PACKAGE BOUNDARY =====
+            if is_package_boundary(line, prev_line):
+                current_package_id += 1
+                current_activity = None  # Reset activity for new package
+                logger.info(f"📦 New trade package #{current_package_id} detected at line {line_idx}")
+            
+            # ===== CHECK FOR ACTIVITY KEYWORD =====
             line_upper = line.upper()
             for keyword in self.activity_keywords:
                 if keyword in line_upper and len(line_upper.split()) < 5:
                     current_activity = line_upper
-                    logger.info(f"Activity type changed to: {current_activity}")
+                    logger.info(f"🏷️ Activity '{current_activity}' set for package #{current_package_id}")
                     break
             
             extracted_from_line = False
             
-            # Use pre-compiled patterns
+            # ===== PATTERN EXTRACTION =====
             for entity_name, compiled_patterns in compiled_patterns_map.items():
                 if extracted_from_line:
                     break
@@ -116,15 +153,16 @@ def extract_and_export(self):
                         if not groupdict:
                             continue
                         
-                        # ===== CREATE ONE RECORD PER MATCH =====
+                        # ===== CREATE RECORD WITH PACKAGE-SCOPED ACTIVITY =====
                         record = {
                             'Trade_ID': email_data['trade_id'],
                             'Email_Date': email_data.get('date', ''),
                             'Email_From': email_data.get('sender', ''),
-                            'Email_Subject': email_data.get('subject', '')
+                            'Email_Subject': email_data.get('subject', ''),
+                            'Package_ID': current_package_id  # Track package
                         }
                         
-                        # Add activity if available
+                        # Add activity (package-scoped)
                         if current_activity:
                             record['ActivityType'] = current_activity
                         
@@ -139,6 +177,7 @@ def extract_and_export(self):
                             # Add metadata
                             record['Source_Line'] = line
                             record['Pattern_ID'] = pattern_id
+                            record['Line_Index'] = line_idx
                             
                             # Add to records
                             extraction_records.append(record)
@@ -149,7 +188,9 @@ def extract_and_export(self):
                                 'pattern_id': pattern_id,
                                 'entity_name': entity_name,
                                 'extracted_labels': extracted_labels,
-                                'confidence': f"{len(extracted_labels)}/{len(groupdict)}"
+                                'confidence': f"{len(extracted_labels)}/{len(groupdict)}",
+                                'activity': current_activity,
+                                'package_id': current_package_id
                             })
                             
                             self.usage_tracker.record_match(pattern_id, line)
@@ -177,10 +218,17 @@ def extract_and_export(self):
                                 'Email_Date': email_data.get('date', ''),
                                 'Email_From': email_data.get('sender', ''),
                                 'Email_Subject': email_data.get('subject', ''),
+                                'Package_ID': current_package_id,
                                 entity_name: ', '.join(all_vals),
                                 'Source_Line': line,
-                                'Pattern_ID': 'GAZETTEER'
+                                'Pattern_ID': 'GAZETTEER',
+                                'Line_Index': line_idx
                             }
+                            
+                            # Add activity (package-scoped)
+                            if current_activity:
+                                record['ActivityType'] = current_activity
+                            
                             extraction_records.append(record)
                             
                             matched_patterns.append({
@@ -188,7 +236,9 @@ def extract_and_export(self):
                                 'pattern_id': 'GAZETTEER',
                                 'entity_name': entity_name,
                                 'extracted_labels': all_vals,
-                                'confidence': 'N/A'
+                                'confidence': 'N/A',
+                                'activity': current_activity,
+                                'package_id': current_package_id
                             })
                             
                             extracted_from_line = True
@@ -201,6 +251,7 @@ def extract_and_export(self):
                 self.rag_extractor.queue_unseen(line, "Trade")
         
         logger.info(f"⏱ Pattern extraction: {time.time() - extraction_start:.2f}s")
+        logger.info(f"📦 Total packages detected: {current_package_id}")
         
         # ===== CREATE entity_df FROM EXTRACTION RECORDS =====
         if extraction_records:
@@ -218,7 +269,7 @@ def extract_and_export(self):
                 soup = BeautifulSoup(html_content, 'html.parser')
                 tables = soup.find_all('table')
                 
-                table_records = []  # Records from tables
+                table_records = []
                 
                 for table_idx, table in enumerate(tables, 1):
                     # Fast header extraction
@@ -243,7 +294,7 @@ def extract_and_export(self):
                         row_filtered = list(filter(None, row))
                         cleaned = [item for item in row_filtered if item not in [':', '-', '']]
                         
-                        if len(cleaned) >= 2:  # At least key-value pair
+                        if len(cleaned) >= 2:
                             key = cleaned[0]
                             value = " ".join(cleaned[1:])
                             
@@ -261,13 +312,9 @@ def extract_and_export(self):
                 # Create table_df
                 if table_records:
                     table_df = pd.DataFrame(table_records)
-                    # Drop rows with all NaN
                     table_df = table_df.dropna(how='all')
                     table_df = table_df.dropna(how='all', axis=1)
-                    
-                    # Aggregate to remove duplicate column names
                     table_df = table_df.agg(lambda x: x.dropna().iloc[0] if x.notna().any() else np.nan).to_frame().T
-                    
                     logger.info(f"table_df: {table_df}")
             
             except Exception as e:
@@ -275,7 +322,7 @@ def extract_and_export(self):
         
         logger.info(f"⏱ Table extraction: {time.time() - table_start:.2f}s")
         
-        # ===== TABLE ENRICHMENT LOGIC (From your existing code) =====
+        # ===== TABLE ENRICHMENT LOGIC =====
         enrichment_start = time.time()
         enriched_records = []
         
@@ -299,22 +346,19 @@ def extract_and_export(self):
                     
                     enriched_records.append(row_dict)
                 
-                # Build final dataframe from enriched records
+                # Build final dataframe
                 final_df = pd.DataFrame(enriched_records)
             else:
-                # No Cust_ID match - combine entity_df and table_df
+                # No Cust_ID match - combine
                 final_df = pd.concat([entity_df, table_df], ignore_index=True)
         
         elif not entity_df.empty:
-            # Only entity_df has data
             final_df = entity_df.copy()
         
         elif table_df is not None and not table_df.empty:
-            # Only table_df has data
             final_df = table_df.copy()
         
         else:
-            # No data at all
             final_df = pd.DataFrame(columns=['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject'])
         
         logger.info(f"⏱ Table enrichment: {time.time() - enrichment_start:.2f}s")
@@ -322,9 +366,10 @@ def extract_and_export(self):
         # ===== REORDER COLUMNS =====
         if not final_df.empty:
             metadata_cols = ['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject', 
-                           'ActivityType', 'Pattern_ID', 'Source', 'Source_Line']
+                           'Package_ID', 'ActivityType', 'Pattern_ID', 'Source', 
+                           'Source_Line', 'Line_Index']
             
-            # Get entity columns (all columns except metadata)
+            # Get entity columns
             entity_cols = [col for col in final_df.columns if col not in metadata_cols]
             
             # Reorder: metadata + entities
@@ -333,9 +378,10 @@ def extract_and_export(self):
             
             final_df = final_df[column_order]
         
-        # ===== DISPLAY IN UI (Batched update) =====
+        # ===== DISPLAY IN UI =====
         ui_start = time.time()
-        self._update_ui_display(extraction_records, matched_count, unseen_count, len(all_tables))
+        self._update_ui_display(extraction_records, matched_count, unseen_count, 
+                               len(all_tables), current_package_id)
         logger.info(f"⏱ UI update: {time.time() - ui_start:.2f}s")
         
         # ===== EXPORT TO CSV =====
@@ -348,7 +394,7 @@ def extract_and_export(self):
         if os.path.exists(out_file):
             existing = pd.read_csv(out_file)
             
-            # Merge columns from both dataframes
+            # Merge columns
             all_cols = list(set(existing.columns).union(set(final_df.columns)))
             existing = existing.reindex(columns=all_cols)
             final_df = final_df.reindex(columns=all_cols)
@@ -364,6 +410,7 @@ def extract_and_export(self):
         self.content_text.insert(tk.END, f"\n✅ Exported to CSV: {filename}\n")
         self.content_text.insert(tk.END, f"   Columns: {len(final_df.columns)}\n")
         self.content_text.insert(tk.END, f"   Rows: {len(final_df)}\n")
+        self.content_text.insert(tk.END, f"   Packages: {current_package_id}\n")
         
         # ===== GENERATE RAG REPORT =====
         rag_start = time.time()
@@ -393,6 +440,7 @@ def extract_and_export(self):
             f"✓ Pattern Matches: {matched_count}\n"
             f"⚠ Unseen: {unseen_count}\n"
             f"📋 Tables: {len(all_tables)}\n"
+            f"📦 Packages: {current_package_id}\n"
             f"⏱ Time: {total_time:.2f}s\n\n"
             f"CSV: {filename}\n"
             f"RAG: {os.path.basename(rag_report_path)}")
@@ -403,15 +451,16 @@ def extract_and_export(self):
 
 
 # ============================================================================
-# HELPER: Batched UI Update (for performance)
+# UPDATED HELPER: UI Display with Package Info
 # ============================================================================
 
-def _update_ui_display(self, extraction_records, matched_count, unseen_count, table_count):
-    """Update UI in one batch to avoid multiple redraws"""
+def _update_ui_display(self, extraction_records, matched_count, unseen_count, 
+                      table_count, package_count):
+    """Update UI in one batch with package information"""
     output_lines = []
     
     output_lines.append("=" * 70)
-    output_lines.append("EXTRACTED ENTITIES (Record View)")
+    output_lines.append("EXTRACTED ENTITIES (Package-Aware View)")
     output_lines.append("=" * 70)
     output_lines.append("")
     
@@ -422,22 +471,46 @@ def _update_ui_display(self, extraction_records, matched_count, unseen_count, ta
             all_entities.update(record.keys())
         
         metadata_cols = {'Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject', 
-                        'Source_Line', 'Pattern_ID', 'Source', 'ActivityType'}
+                        'Source_Line', 'Pattern_ID', 'Source', 'ActivityType',
+                        'Package_ID', 'Line_Index'}
         entity_columns = sorted(all_entities - metadata_cols)
         
         output_lines.append(f"Extracted Entities: {', '.join(entity_columns)}")
+        output_lines.append(f"📦 Total Packages Detected: {package_count}")
         output_lines.append("")
         
-        # Show first 5 records
-        for i, record in enumerate(extraction_records[:5], 1):
-            output_lines.append(f"Record {i}:")
-            for entity in entity_columns:
-                if entity in record and record[entity]:
-                    output_lines.append(f"  {entity}: {record[entity]}")
+        # Group records by package
+        from collections import defaultdict
+        packages = defaultdict(list)
+        for record in extraction_records:
+            pkg_id = record.get('Package_ID', 0)
+            packages[pkg_id].append(record)
+        
+        # Show first 3 packages
+        for pkg_id in sorted(packages.keys())[:3]:
+            pkg_records = packages[pkg_id]
+            output_lines.append(f"📦 Package #{pkg_id} ({len(pkg_records)} records):")
+            
+            # Show activity if available
+            activity = pkg_records[0].get('ActivityType') if pkg_records else None
+            if activity:
+                output_lines.append(f"   🏷️ Activity: {activity}")
+            
+            # Show first 2 records in package
+            for i, record in enumerate(pkg_records[:2], 1):
+                output_lines.append(f"   Record {i}:")
+                for entity in entity_columns:
+                    if entity in record and record[entity]:
+                        output_lines.append(f"     {entity}: {record[entity]}")
+            
+            if len(pkg_records) > 2:
+                output_lines.append(f"   ... and {len(pkg_records) - 2} more records")
             output_lines.append("")
         
-        if len(extraction_records) > 5:
-            output_lines.append(f"... and {len(extraction_records) - 5} more records")
+        if len(packages) > 3:
+            remaining = len(packages) - 3
+            remaining_records = sum(len(packages[pid]) for pid in sorted(packages.keys())[3:])
+            output_lines.append(f"... and {remaining} more packages ({remaining_records} records)")
             output_lines.append("")
     else:
         output_lines.append("⚠️  No entities found in this email")
@@ -451,11 +524,12 @@ def _update_ui_display(self, extraction_records, matched_count, unseen_count, ta
     output_lines.append(f"⚠ Unseen patterns: {unseen_count}")
     output_lines.append(f"📊 Total lines processed: {matched_count + unseen_count}")
     output_lines.append(f"📋 Tables extracted: {table_count}")
+    output_lines.append(f"📦 Trade packages detected: {package_count}")
     
     if matched_count + unseen_count > 0:
         match_rate = (matched_count / (matched_count + unseen_count)) * 100
         output_lines.append(f"📈 Match rate: {match_rate:.1f}%")
     
-    # Single UI update (fast!)
+    # Single UI update
     self.content_text.delete(1.0, tk.END)
     self.content_text.insert(tk.END, "\n".join(output_lines))

@@ -1,0 +1,55 @@
+# ===== FIX 5: Remove duplicates for Unseen Patterns & Matched Patterns =====
+
+import pandas as pd
+
+duplicate_rules = {
+    "Unseen Patterns": ["Query_Trade_ID", "Full Line"],
+    "Matched Patterns": ["Query_Trade_ID", "Full Line", "Pattern_ID"]
+}
+
+for sheet_name, dedup_cols in duplicate_rules.items():
+
+    if sheet_name not in consolidated_wb.sheetnames:
+        logger.info(f"[Dedup] Sheet '{sheet_name}' not found – skipping")
+        continue
+
+    sheet = consolidated_wb[sheet_name]
+
+    # Read full sheet content
+    rows = list(sheet.iter_rows(values_only=True))
+    if not rows or len(rows) <= 1:
+        logger.info(f"[Dedup] Sheet '{sheet_name}' empty – skipping")
+        continue
+
+    # Convert to DataFrame
+    df = pd.DataFrame(rows)
+    df.columns = df.iloc[0]          # Set first row as header
+    df = df[1:]                      # Remove header row
+
+    # Keep only columns that exist in the sheet
+    dedup_cols = [c for c in dedup_cols if c in df.columns]
+    if not dedup_cols:
+        logger.warning(f"[Dedup] None of the dedup columns exist in sheet '{sheet_name}'")
+        continue
+
+    before = len(df)
+    df = df.drop_duplicates(subset=dedup_cols)
+    after = len(df)
+
+    logger.info(f"[Dedup] Sheet '{sheet_name}': Removed {before - after} duplicates")
+
+    # Clear existing sheet
+    for row in sheet["A1":f"{sheet.max_column}{sheet.max_row}"]:
+        for cell in row:
+            cell.value = None
+
+    # Write header back
+    for col_idx, col_name in enumerate(df.columns, 1):
+        sheet.cell(row=1, column=col_idx).value = col_name
+
+    # Write cleaned data back
+    for row_idx, row in enumerate(df.itertuples(index=False), 2):
+        for col_idx, value in enumerate(row, 1):
+            sheet.cell(row=row_idx, column=col_idx).value = value
+
+logger.info("[Dedup] Completed cleanup for Unseen Patterns & Matched Patterns")

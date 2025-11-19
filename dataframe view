@@ -1,3 +1,97 @@
+def display_dataframe_in_text_widget(self, df, title="DataFrame"):
+    """
+    Display DataFrame with all columns visible in text widget
+    """
+    if df.empty:
+        self.content_text.insert(tk.END, f"\n{title}: No data to display\n")
+        return
+    
+    # ===== METHOD 1: Set pandas display options =====
+    with pd.option_context('display.max_columns', None,  # Show all columns
+                          'display.max_rows', None,      # Show all rows
+                          'display.width', None,         # No width restriction
+                          'display.max_colwidth', 50):   # Max 50 chars per column
+        
+        df_string = df.to_string()
+        
+        # Clear and display
+        self.content_text.delete(1.0, tk.END)
+        self.content_text.insert(tk.END, f"\n{'='*80}\n")
+        self.content_text.insert(tk.END, f"{title}\n")
+        self.content_text.insert(tk.END, f"{'='*80}\n\n")
+        self.content_text.insert(tk.END, df_string)
+        self.content_text.insert(tk.END, f"\n\n{'='*80}\n")
+        self.content_text.insert(tk.END, f"Total Rows: {len(df)}, Total Columns: {len(df.columns)}\n")
+        self.content_text.insert(tk.END, f"{'='*80}\n")
+
+
+# Usage in your code:
+# Instead of:
+self.content_text.insert(tk.END, f"{df_new}\n")
+
+# Use:
+self.display_dataframe_in_text_widget(df_new, "Consolidated Report Data")
+
+
+
+
+
+
+
+
+def display_dataframe_formatted(self, df, title="DataFrame"):
+    """
+    Display DataFrame with formatted output showing all columns
+    """
+    if df.empty:
+        self.content_text.insert(tk.END, f"\n{title}: No data to display\n")
+        return
+    
+    # Clear content
+    self.content_text.delete(1.0, tk.END)
+    
+    # Title
+    self.content_text.insert(tk.END, f"\n{'='*80}\n")
+    self.content_text.insert(tk.END, f"{title.upper()}\n")
+    self.content_text.insert(tk.END, f"{'='*80}\n\n")
+    
+    # Summary
+    self.content_text.insert(tk.END, f"📊 Total Records: {len(df)}\n")
+    self.content_text.insert(tk.END, f"📋 Columns ({len(df.columns)}): {', '.join(df.columns.tolist())}\n\n")
+    
+    # Display first N rows in detail
+    max_display_rows = 10
+    self.content_text.insert(tk.END, f"{'─'*80}\n")
+    self.content_text.insert(tk.END, f"SHOWING FIRST {min(max_display_rows, len(df))} RECORDS\n")
+    self.content_text.insert(tk.END, f"{'─'*80}\n\n")
+    
+    for idx, row in df.head(max_display_rows).iterrows():
+        self.content_text.insert(tk.END, f"Record #{idx + 1}:\n")
+        
+        for col in df.columns:
+            value = row[col]
+            if pd.notna(value):
+                value_str = str(value)
+                # Truncate long values
+                if len(value_str) > 100:
+                    value_str = value_str[:97] + "..."
+                self.content_text.insert(tk.END, f"  • {col}: {value_str}\n")
+        
+        self.content_text.insert(tk.END, "\n")
+    
+    if len(df) > max_display_rows:
+        self.content_text.insert(tk.END, f"... and {len(df) - max_display_rows} more records\n\n")
+    
+    self.content_text.insert(tk.END, f"{'='*80}\n")
+
+
+
+
+
+
+
+
+
 def display_dataframe_as_table(self, df, title="DataFrame"):
     """
     Display DataFrame in a scrollable table format with all columns

@@ -27,7 +27,7 @@ for sheet_name, dedup_cols in duplicate_rules.items():
     df = df[1:]                      # Remove header row
 
     # Keep only columns that exist in the sheet
-    dedup_cols = [c for c in dedup_cols if c in df.columns]
+    dedup_cols = [c for c in dedup_cols if c in dedup_cols]
     if not dedup_cols:
         logger.warning(f"[Dedup] None of the dedup columns exist in sheet '{sheet_name}'")
         continue
@@ -38,16 +38,10 @@ for sheet_name, dedup_cols in duplicate_rules.items():
 
     logger.info(f"[Dedup] Sheet '{sheet_name}': Removed {before - after} duplicates")
 
-    # Clear existing sheet
-    for row in sheet["A1":f"{sheet.max_column}{sheet.max_row}"]:
-        for cell in row:
-            cell.value = None
+    # Delete all rows except header (more efficient than clearing cells)
+    sheet.delete_rows(2, sheet.max_row)
 
-    # Write header back
-    for col_idx, col_name in enumerate(df.columns, 1):
-        sheet.cell(row=1, column=col_idx).value = col_name
-
-    # Write cleaned data back
+    # Write cleaned data back (header already exists at row 1)
     for row_idx, row in enumerate(df.itertuples(index=False), 2):
         for col_idx, value in enumerate(row, 1):
             sheet.cell(row=row_idx, column=col_idx).value = value

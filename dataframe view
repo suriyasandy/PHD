@@ -1,0 +1,41 @@
+def display_dataframe_as_table(self, df, title="DataFrame"):
+    """
+    Display DataFrame in a scrollable table format with all columns
+    """
+    if df.empty:
+        self.content_text.insert(tk.END, f"\n{title}: No data to display\n")
+        return
+    
+    # Clear existing content
+    self.content_text.delete(1.0, tk.END)
+    
+    # Add title
+    self.content_text.insert(tk.END, f"\n{'='*100}\n")
+    self.content_text.insert(tk.END, f"{title}\n")
+    self.content_text.insert(tk.END, f"Rows: {len(df)} | Columns: {len(df.columns)}\n")
+    self.content_text.insert(tk.END, f"{'='*100}\n\n")
+    
+    # ===== COLUMN HEADERS =====
+    col_width = 20  # Fixed width per column
+    header_line = ""
+    separator_line = ""
+    
+    for col in df.columns:
+        col_str = str(col)[:col_width].ljust(col_width)
+        header_line += f"{col_str} | "
+        separator_line += "-" * col_width + "-+-"
+    
+    self.content_text.insert(tk.END, header_line + "\n")
+    self.content_text.insert(tk.END, separator_line + "\n")
+    
+    # ===== DATA ROWS =====
+    for idx, row in df.iterrows():
+        row_line = ""
+        for col in df.columns:
+            value = str(row[col]) if pd.notna(row[col]) else ""
+            value_str = value[:col_width].ljust(col_width)
+            row_line += f"{value_str} | "
+        
+        self.content_text.insert(tk.END, row_line + "\n")
+    
+    self.content_text.insert(tk.END, f"\n{'='*100}\n")

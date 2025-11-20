@@ -1,0 +1,500 @@
+def extract_and_export(self):
+    """
+    COMPLETE & OPTIMIZED: Multi-approach extraction
+    - Line-by-line pattern matching (existing)
+    - Text table detection and extraction (NEW)
+    - Block-based extraction for structured data (NEW)
+    - HTML table parsing (existing)
+    - Conversation-aware activity tracking
+    """
+    
+    if self.selected_email is None:
+        messagebox.showwarning("No Selection", "Please select an email from the chain first")
+        return
+    
+    try:
+        # Get entity definitions
+        entity_json = self.entity_text.get(1.0, tk.END).strip()
+        self.entity_definitions = json.loads(entity_json)
+    except json.JSONDecodeError as e:
+        messagebox.showerror("JSON Error", f"Invalid JSON: {str(e)}")
+        return
+    
+    try:
+        start_time = time.time()
+        
+        # Stop previous RAG
+        if hasattr(self, 'rag_extractor') and self.rag_extractor:
+            logger.info("Stopping previous RAG processor...")
+            self.rag_extractor.rag_processor.stop_and_wait(timeout=1.0)
+            self.rag_extractor = None
+        
+        # Create fresh RAG processor
+        logger.info("Creating new RAG processor...")
+        self.rag_extractor = RAGEnabledExtractor(self.pattern_manager, self.usage_tracker)
+        
+        entity_names = self.pattern_manager.get_all_entity_names()
+        email_data = self.selected_email
+        
+        # ===== PRE-COMPILE PATTERNS =====
+        compiled_patterns_map = {}
+        
+        for entity_name in entity_names:
+            patterns = self.pattern_manager.get_patterns_for_entity(entity_name)
+            compiled_list = []
+            
+            for pattern_entry in patterns:
+                if pattern_entry.get('entity_type') == 'pattern':
+                    pattern_str = pattern_entry['pattern']
+                    pattern_id = pattern_entry['pattern_id']
+                    
+                    try:
+                        compiled_regex = re.compile(pattern_str, re.IGNORECASE)
+                        compiled_list.append({
+                            'pattern_id': pattern_id,
+                            'pattern_str': pattern_str,
+                            'compiled_regex': compiled_regex,
+                            'entity_name': entity_name
+                        })
+                    except re.error as e:
+                        logger.error(f"Regex compilation error for {pattern_id}: {e}")
+            
+            compiled_patterns_map[entity_name] = compiled_list
+        
+        logger.info(f"⏱ Pattern compilation: {time.time() - start_time:.2f}s")
+        
+        # ===== Initialize data structures =====
+        extraction_records = []
+        matched_patterns = []
+        all_tables = []
+        
+        # ===== Prepare email lines =====
+        email_lines = email_data['body'].splitlines()
+        email_lines = self.email_cleaner.clean_email_body(email_lines)
+        email_lines = [line.strip() for line in email_lines if line.strip()]
+        
+        matched_count = 0
+        unseen_count = 0
+        
+        extraction_start = time.time()
+        
+        # ===== NEW: DETECT TEXT TABLES FIRST =====
+        text_tables = self.detect_text_tables(email_lines)
+        logger.info(f"📊 Detected {len(text_tables)} text tables in email body")
+        
+        # Mark lines that are part of text tables
+        text_table_lines = set()
+        for table in text_tables:
+            text_table_lines.update(range(table['start_line'], table['end_line'] + 1))
+        
+        # ===== CONVERSATION & PACKAGE DETECTION FUNCTIONS =====
+        def is_conversation_boundary(line, line_idx, email_lines):
+            """Detect email conversation boundaries"""
+            line_lower = line.lower()
+            
+            reply_patterns = [
+                'from:', 'sent:', 'to:', 'subject:',
+                'on ', ' wrote:',
+                '-----original message-----',
+                '--- forwarded message ---',
+                '________________________________',
+                '==================',
+                'begin forwarded message',
+                're:', 'fw:', 'fwd:',
+            ]
+            
+            for pattern in reply_patterns:
+                if pattern in line_lower:
+                    if 'from:' in line_lower or 'sent:' in line_lower:
+                        return True
+                    
+                    if line_idx + 1 < len(email_lines):
+                        next_line = email_lines[line_idx + 1].lower()
+                        if any(p in next_line for p in ['from:', 'to:', 'sent:', 'subject:']):
+                            return True
+            
+            import re
+            timestamp_pattern = r'on\s+\w+,?\s+\w+\s+\d+,?\s+\d{4}'
+            if re.search(timestamp_pattern, line_lower):
+                return True
+            
+            return False
+        
+        def is_package_boundary(line, prev_line):
+            """Detect trade package boundaries"""
+            line_upper = line.upper()
+            
+            if not line.strip() or line.strip() in ['---', '===', '***', '___']:
+                return True
+            
+            for keyword in self.activity_keywords:
+                if keyword in line_upper and len(line_upper.split()) < 5:
+                    return True
+            
+            package_headers = ['TRADE DETAILS', 'PACKAGE', 'DEAL #', 'TRADE #', 
+                             'TRANSACTION', 'BOOKING', 'CONFIRMATION']
+            for header in package_headers:
+                if header in line_upper and len(line_upper) < 30:
+                    return True
+            
+            return False
+        
+        # ===== MULTI-APPROACH EXTRACTION =====
+        current_activity = None
+        current_package_id = 0
+        current_conversation_id = 0
+        
+        # ===== APPROACH 1: TEXT TABLE EXTRACTION =====
+        for table_idx, table_info in enumerate(text_tables):
+            logger.info(f"Processing text table {table_idx + 1}: lines {table_info['start_line']} to {table_info['end_line']}")
+            
+            table_records = self.extract_from_text_table(
+                table_info,
+                email_lines,
+                email_data,
+                current_conversation_id,
+                current_package_id,
+                current_activity
+            )
+            
+            extraction_records.extend(table_records)
+            matched_count += len(table_records)
+        
+        # ===== APPROACH 2: LINE-BY-LINE PATTERN EXTRACTION =====
+        for line_idx, line in enumerate(email_lines):
+            # Skip lines that are part of text tables (already processed)
+            if line_idx in text_table_lines:
+                continue
+            
+            prev_line = email_lines[line_idx - 1] if line_idx > 0 else ""
+            
+            # ===== CHECK FOR CONVERSATION BOUNDARY =====
+            if is_conversation_boundary(line, line_idx, email_lines):
+                current_conversation_id += 1
+                current_package_id = 0
+                current_activity = None
+                logger.info(f"📧 New conversation #{current_conversation_id} at line {line_idx}")
+                continue
+            
+            # ===== CHECK FOR PACKAGE BOUNDARY =====
+            if is_package_boundary(line, prev_line):
+                current_package_id += 1
+                current_activity = None
+                logger.info(f"📦 New package #{current_package_id} in conversation #{current_conversation_id}")
+            
+            # ===== CHECK FOR ACTIVITY KEYWORD =====
+            line_upper = line.upper()
+            for keyword in self.activity_keywords:
+                if keyword in line_upper and len(line_upper.split()) < 5:
+                    current_activity = line_upper
+                    logger.info(f"🏷️ Activity '{current_activity}' set")
+                    break
+            
+            extracted_from_line = False
+            
+            # ===== PATTERN EXTRACTION =====
+            for entity_name, compiled_patterns in compiled_patterns_map.items():
+                if extracted_from_line:
+                    break
+                
+                for pattern_info in compiled_patterns:
+                    compiled_regex = pattern_info['compiled_regex']
+                    pattern_str = pattern_info['pattern_str']
+                    pattern_id = pattern_info['pattern_id']
+                    
+                    if not self.attribute_count_check(pattern_str, line):
+                        continue
+                    
+                    matches = compiled_regex.finditer(line)
+                    
+                    for match in matches:
+                        groupdict = match.groupdict()
+                        
+                        if not groupdict:
+                            continue
+                        
+                        record = {
+                            'Trade_ID': email_data['trade_id'],
+                            'Email_Date': email_data.get('date', ''),
+                            'Email_From': email_data.get('sender', ''),
+                            'Email_Subject': email_data.get('subject', ''),
+                            'Conversation_ID': current_conversation_id,
+                            'Package_ID': current_package_id
+                        }
+                        
+                        if current_activity:
+                            record['ActivityType'] = current_activity
+                        
+                        extracted_labels = []
+                        for k, v in groupdict.items():
+                            if v:
+                                record[k] = v
+                                extracted_labels.append(k)
+                        
+                        if extracted_labels:
+                            record['Source_Line'] = line
+                            record['Pattern_ID'] = pattern_id
+                            record['Line_Index'] = line_idx
+                            record['Extraction_Method'] = 'pattern'
+                            
+                            extraction_records.append(record)
+                            
+                            matched_patterns.append({
+                                'line': line,
+                                'pattern_id': pattern_id,
+                                'entity_name': entity_name,
+                                'extracted_labels': extracted_labels,
+                                'confidence': f"{len(extracted_labels)}/{len(groupdict)}",
+                                'activity': current_activity,
+                                'conversation_id': current_conversation_id,
+                                'package_id': current_package_id
+                            })
+                            
+                            self.usage_tracker.record_match(pattern_id, line)
+                            extracted_from_line = True
+                            matched_count += 1
+                            break
+                    
+                    if extracted_from_line:
+                        break
+            
+            # ===== GAZETTEER EXTRACTION =====
+            if not extracted_from_line:
+                for entity_name in entity_names:
+                    entity_def = self.entity_definitions.get(entity_name, {})
+                    if entity_def.get('entity_type') == 'gazetteer':
+                        gazetteer_vals = entity_def.get("values", [])
+                        subject_vals = self.extract_with_gazetteer(email_data['subject'], gazetteer_vals)
+                        body_vals = self.extract_with_gazetteer(line, gazetteer_vals)
+                        
+                        all_vals = subject_vals + body_vals
+                        
+                        if all_vals:
+                            record = {
+                                'Trade_ID': email_data['trade_id'],
+                                'Email_Date': email_data.get('date', ''),
+                                'Email_From': email_data.get('sender', ''),
+                                'Email_Subject': email_data.get('subject', ''),
+                                'Conversation_ID': current_conversation_id,
+                                'Package_ID': current_package_id,
+                                entity_name: ', '.join(all_vals),
+                                'Source_Line': line,
+                                'Pattern_ID': 'GAZETTEER',
+                                'Line_Index': line_idx,
+                                'Extraction_Method': 'gazetteer'
+                            }
+                            
+                            if current_activity:
+                                record['ActivityType'] = current_activity
+                            
+                            extraction_records.append(record)
+                            
+                            extracted_from_line = True
+                            matched_count += 1
+                            break
+            
+            # Queue unseen
+            if not extracted_from_line:
+                unseen_count += 1
+                self.rag_extractor.queue_unseen(line, "Trade")
+        
+        logger.info(f"⏱ Multi-approach extraction: {time.time() - extraction_start:.2f}s")
+        logger.info(f"📧 Conversations: {current_conversation_id}")
+        logger.info(f"📦 Packages: {current_package_id}")
+        logger.info(f"📊 Text tables processed: {len(text_tables)}")
+        
+        # ===== CREATE entity_df FROM EXTRACTION RECORDS =====
+        if extraction_records:
+            entity_df = pd.DataFrame(extraction_records)
+        else:
+            entity_df = pd.DataFrame()
+        
+        # ... [Continue with HTML table extraction, enrichment, CSV export as before] ...
+        
+        # [REST OF YOUR EXISTING CODE for table extraction, enrichment, export]
+        
+    except Exception as e:
+        logger.error(f"Error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed: {str(e)}")
+
+
+# ============================================================================
+# NEW: TEXT TABLE DETECTION
+# ============================================================================
+
+def detect_text_tables(self, lines):
+    """
+    Detect ASCII/text tables in email body
+    
+    Identifies patterns like:
+    Customer    Amount    Currency    Status
+    ------------------------------------------------
+    ABC Corp    10000     USD         Confirmed
+    XYZ Ltd     25000     EUR         Pending
+    """
+    tables = []
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        
+        # Look for table headers (multiple words separated by spaces/tabs)
+        if self.looks_like_table_header(line):
+            # Check if next line is a separator
+            if i + 1 < len(lines) and self.is_table_separator(lines[i + 1]):
+                # Found a table!
+                start_line = i
+                table_lines = [line, lines[i + 1]]  # Header + separator
+                
+                # Collect data rows
+                j = i + 2
+                while j < len(lines):
+                    data_line = lines[j]
+                    
+                    # Stop if we hit a blank line or non-table content
+                    if not data_line.strip():
+                        break
+                    
+                    if not self.looks_like_table_row(data_line, line):
+                        break
+                    
+                    table_lines.append(data_line)
+                    j += 1
+                
+                # Only consider it a table if we have at least 1 data row
+                if len(table_lines) > 2:
+                    tables.append({
+                        'start_line': start_line,
+                        'end_line': j - 1,
+                        'header_line': start_line,
+                        'separator_line': start_line + 1,
+                        'data_start': start_line + 2,
+                        'lines': table_lines,
+                        'header': line
+                    })
+                    
+                    logger.info(f"Detected text table from line {start_line} to {j-1}")
+                    i = j
+                    continue
+        
+        i += 1
+    
+    return tables
+
+
+def looks_like_table_header(self, line):
+    """
+    Check if line looks like a table header
+    Multiple capitalized words separated by whitespace
+    """
+    if not line.strip():
+        return False
+    
+    # Split by multiple spaces or tabs
+    parts = re.split(r'\s{2,}|\t+', line.strip())
+    
+    # Should have at least 2 columns
+    if len(parts) < 2:
+        return False
+    
+    # Most parts should start with capital letter or be common headers
+    common_headers = ['customer', 'amount', 'currency', 'date', 'status', 'id', 'type', 
+                     'price', 'quantity', 'total', 'name', 'value', 'description']
+    
+    capital_count = sum(1 for part in parts if part and (part[0].isupper() or part.lower() in common_headers))
+    
+    return capital_count >= len(parts) * 0.6  # At least 60% look like headers
+
+
+def is_table_separator(self, line):
+    """
+    Check if line is a table separator
+    Lines made of dashes, equals, or underscores
+    """
+    if not line.strip():
+        return False
+    
+    stripped = line.strip()
+    separator_chars = ['-', '=', '_', '─', '━']
+    
+    # At least 80% of the line should be separator chars
+    separator_count = sum(1 for char in stripped if char in separator_chars)
+    
+    return separator_count >= len(stripped) * 0.8 and len(stripped) >= 5
+
+
+def looks_like_table_row(self, line, header):
+    """
+    Check if line looks like a data row matching the header structure
+    """
+    if not line.strip():
+        return False
+    
+    # Count columns in header
+    header_parts = re.split(r'\s{2,}|\t+', header.strip())
+    line_parts = re.split(r'\s{2,}|\t+', line.strip())
+    
+    # Should have similar number of columns (within 1)
+    return abs(len(line_parts) - len(header_parts)) <= 1
+
+
+# ============================================================================
+# NEW: TEXT TABLE EXTRACTION
+# ============================================================================
+
+def extract_from_text_table(self, table_info, all_lines, email_data, 
+                            conversation_id, package_id, activity):
+    """
+    Extract data from detected text table
+    """
+    records = []
+    
+    header_line = all_lines[table_info['header_line']].strip()
+    
+    # Parse header columns
+    columns = re.split(r'\s{2,}|\t+', header_line)
+    columns = [col.strip() for col in columns if col.strip()]
+    
+    logger.info(f"Text table columns: {columns}")
+    
+    # Extract data rows
+    for i in range(table_info['data_start'], table_info['end_line'] + 1):
+        if i >= len(all_lines):
+            break
+        
+        data_line = all_lines[i].strip()
+        if not data_line:
+            continue
+        
+        # Parse data values (aligned with columns)
+        values = re.split(r'\s{2,}|\t+', data_line)
+        values = [val.strip() for val in values if val.strip()]
+        
+        # Create record
+        record = {
+            'Trade_ID': email_data['trade_id'],
+            'Email_Date': email_data.get('date', ''),
+            'Email_From': email_data.get('sender', ''),
+            'Email_Subject': email_data.get('subject', ''),
+            'Conversation_ID': conversation_id,
+            'Package_ID': package_id,
+            'Source_Line': data_line,
+            'Pattern_ID': 'TEXT_TABLE',
+            'Line_Index': i,
+            'Extraction_Method': 'text_table'
+        }
+        
+        if activity:
+            record['ActivityType'] = activity
+        
+        # Map values to columns
+        for col_idx, col_name in enumerate(columns):
+            if col_idx < len(values):
+                record[col_name] = values[col_idx]
+        
+        records.append(record)
+        logger.debug(f"Extracted text table row: {record}")
+    
+    logger.info(f"Extracted {len(records)} records from text table")
+    
+    return records

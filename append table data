@@ -1,0 +1,342 @@
+def export_consolidated_results(self):
+    """
+    Export consolidated results by appending all unique temp trade CSVs
+    to a single Excel file, with PROPER duplicate handling
+    + NEW: Separate sheet for HTML table extractions
+    """
+    
+    try:
+        temp_df = None
+        today = datetime.now()
+        today_str = today.strftime("%m_%d_%y")
+        
+        # Find all CSV files
+        csv_files = glob.glob(f"{self.temp_path}/*.csv")
+        sheet_name = "Consolidated_Report"
+        table_sheet_name = "Table_Data"  # NEW: Sheet for table extractions
+        consolidated_file = f"{self.out_path}/{today_str}_{sheet_name}.xlsx"
+        lock_path = consolidated_file + '.lock'
+        ws_rows = []
+        
+        # Use file lock
+        with FileLock(lock_path, timeout=60):
+            for file in csv_files:
+                base_name = os.path.basename(file)
+                trade_id = base_name.split("_")[0]
+                rows_found = False
+                
+                with open(file, newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    csv_headers = list(reader.fieldnames) if reader.fieldnames else []
+                    expected_headers = self.static_headers[1:]
+                    required_sub_headers = self.static_headers[20:]
+                    
+                    # Check if required headers exist
+                    if all(header in csv_headers for header in required_sub_headers):
+                        # Append data rows if all required headers exist
+                        for row in reader:
+                            out_row = [trade_id]
+                            for header in expected_headers:
+                                out_row.append(row.get(header, ""))
+                            ws_rows.append(out_row)
+                        rows_found = True
+                    
+                    elif any(header in csv_headers for header in expected_headers[1:]):
+                        # Partial header mismatch
+                        for row in reader:
+                            out_row = [trade_id]
+                            for header in expected_headers:
+                                out_row.append(row.get(header, ""))
+                            ws_rows.append(out_row)
+                        rows_found = True
+                    
+                    else:
+                        # No match
+                        if len(csv_headers) == 0:
+                            out_row = [f"{trade_id} - Found In Mail - No Entity Found"] + [""] * (len(self.static_headers) - 1)
+                        else:
+                            out_row = [f"{trade_id} - Partial header mismatch - Check file: {base_name}"] + [""] * (len(self.static_headers) - 1)
+                        ws_rows.append(out_row)
+                        rows_found = True
+                
+                f.close()
+                
+                if not rows_found:
+                    out_row = [f"{trade_id} - Not Found In Mail"] + [""] * (len(self.static_headers) - 1)
+                    ws_rows.append(out_row)
+                    os.remove(file)
+            
+            # Build new dataframe
+            df_new = pd.DataFrame(ws_rows, columns=self.static_headers)
+            
+            # ===== FIX: PROPER DUPLICATE HANDLING =====
+            if os.path.isfile(consolidated_file):
+                # File exists - need to preserve RAG sheets and avoid duplicates
+                logger.info(f"Consolidated file exists - preserving RAG sheets")
+                
+                # Read existing Sheet1 data
+                df_existing = pd.read_excel(consolidated_file, sheet_name=sheet_name)
+                
+                # ===== CREATE COMPOSITE KEY FOR DEDUPLICATION =====
+                key_columns = ['Trade_ID']
+                
+                # Add composite key to both dataframes
+                if not df_existing.empty:
+                    df_existing['_dedup_key'] = df_existing[key_columns].apply(
+                        lambda row: '_'.join(row.values.astype(str)), axis=1
+                    )
+                
+                if not df_new.empty:
+                    df_new['_dedup_key'] = df_new[key_columns].apply(
+                        lambda row: '_'.join(row.values.astype(str)), axis=1
+                    )
+                    
+                    # Filter out duplicates
+                    existing_keys = set(df_existing['_dedup_key'].values) if not df_existing.empty else set()
+                    df_new_filtered = df_new[~df_new['_dedup_key'].isin(existing_keys)]
+                    
+                    logger.info(f"📊 Existing records: {len(df_existing)}")
+                    logger.info(f"📊 New records (before dedup): {len(df_new)}")
+                    logger.info(f"📊 New records (after dedup): {len(df_new_filtered)}")
+                    logger.info(f"🗑️ Duplicates removed: {len(df_new) - len(df_new_filtered)}")
+                    
+                    # Drop the temporary key column
+                    df_existing = df_existing.drop('_dedup_key', axis=1)
+                    df_new_filtered = df_new_filtered.drop('_dedup_key', axis=1)
+                    
+                    # Combine existing + new (deduplicated)
+                    df_combined = pd.concat([df_existing, df_new_filtered], ignore_index=True)
+                else:
+                    df_combined = df_existing
+                
+                # Load workbook to preserve other sheets
+                wb = load_workbook(consolidated_file)
+                
+                # Save all sheet names EXCEPT Consolidated_Report
+                other_sheets = {}
+                for ws_name in wb.sheetnames:
+                    if ws_name != sheet_name:
+                        # Read data from other sheets
+                        ws = wb[ws_name]
+                        sheet_data = []
+                        for row in ws.iter_rows(values_only=True):
+                            sheet_data.append(row)
+                        other_sheets[ws_name] = sheet_data
+                
+                wb.close()
+                
+                # Write combined data to Consolidated_Report
+                df_combined.to_excel(consolidated_file, sheet_name=sheet_name, index=False)
+                
+                # Restore other sheets
+                if other_sheets:
+                    wb = load_workbook(consolidated_file)
+                    for ws_name, sheet_data in other_sheets.items():
+                        if ws_name not in wb.sheetnames:
+                            ws = wb.create_sheet(ws_name)
+                        else:
+                            ws = wb[ws_name]
+                        
+                        # Write data back
+                        for row_idx, row in enumerate(sheet_data, 1):
+                            for col_idx, value in enumerate(row, 1):
+                                ws.cell(row=row_idx, column=col_idx, value=value)
+                    
+                    wb.save(consolidated_file)
+                    wb.close()
+                    logger.info(f"✅ Preserved {len(other_sheets)} RAG sheets")
+            
+            else:
+                # New file - just write Consolidated_Report
+                df_combined = df_new
+                df_combined.to_excel(consolidated_file, sheet_name=sheet_name, index=False)
+                logger.info("✅ Created new consolidated file")
+            
+            # ===== NEW: CREATE TABLE_DATA SHEET =====
+            self._append_table_data_to_consolidated(consolidated_file, df_combined, table_sheet_name)
+            
+            # Display summary
+            if not df_new.empty:
+                self.display_dataframe_smart(df_new, "Consolidated Report Data", export_excel=False)
+            else:
+                self.content_text.insert(tk.END, "No Data found in this email")
+        
+        logger.info(f"Success - Consolidated Report File Generated")
+        
+        # ===== APPEND RAG DATA =====
+        self._append_rag_to_consolidated(consolidated_file)
+        
+        # Copy files and cleanup
+        self.copy_files(self.temp_path, self.out_path)
+        
+        messagebox.showinfo("Success", f"Consolidated Report File Generated: {self.out_path}")
+    
+    except Exception as e:
+        logger.error(f"Consolidation error: {str(e)}", exc_info=True)
+        messagebox.showerror("Error", f"Failed to consolidate: {str(e)}")
+
+
+# ============================================================================
+# NEW: APPEND TABLE_DATA SHEET
+# ============================================================================
+
+def _append_table_data_to_consolidated(self, consolidated_file, df_all_data, table_sheet_name):
+    """
+    Create/append Table_Data sheet with records where Extraction_Method == 'html_table'
+    
+    Args:
+        consolidated_file: Path to consolidated Excel file
+        df_all_ DataFrame with all consolidated data
+        table_sheet_name: Name of the sheet for table data (e.g., "Table_Data")
+    """
+    
+    try:
+        # ===== FILTER FOR HTML TABLE RECORDS =====
+        # Check if Extraction_Method column exists
+        if 'Extraction_Method' not in df_all_data.columns:
+            logger.warning("⚠️ 'Extraction_Method' column not found in data")
+            return
+        
+        # Filter for html_table records
+        df_table_data = df_all_data[df_all_data['Extraction_Method'] == 'html_table'].copy()
+        
+        if df_table_data.empty:
+            logger.info("ℹ️ No HTML table records found to add to Table_Data sheet")
+            return
+        
+        logger.info(f"📊 Found {len(df_table_data)} HTML table records")
+        
+        # ===== READ EXISTING FILE =====
+        wb = load_workbook(consolidated_file)
+        
+        # Check if Table_Data sheet exists
+        if table_sheet_name in wb.sheetnames:
+            logger.info(f"📋 Table_Data sheet exists - appending new data")
+            
+            # Read existing table data
+            df_existing_table = pd.read_excel(consolidated_file, sheet_name=table_sheet_name)
+            
+            # ===== DEDUPLICATE TABLE DATA =====
+            # Create composite key for table data
+            table_key_columns = ['Trade_ID', 'Table_Index', 'Row_Index']
+            available_table_keys = [col for col in table_key_columns if col in df_table_data.columns]
+            
+            if available_table_keys and not df_existing_table.empty:
+                # Create dedup keys
+                df_existing_table['_table_dedup_key'] = df_existing_table[available_table_keys].apply(
+                    lambda row: '_'.join(row.values.astype(str)), axis=1
+                )
+                
+                df_table_data['_table_dedup_key'] = df_table_data[available_table_keys].apply(
+                    lambda row: '_'.join(row.values.astype(str)), axis=1
+                )
+                
+                # Filter out duplicates
+                existing_table_keys = set(df_existing_table['_table_dedup_key'].values)
+                df_table_data_filtered = df_table_data[~df_table_data['_table_dedup_key'].isin(existing_table_keys)]
+                
+                logger.info(f"📊 Table data - Existing: {len(df_existing_table)}, "
+                          f"New: {len(df_table_data)}, "
+                          f"After dedup: {len(df_table_data_filtered)}")
+                
+                # Drop dedup keys
+                df_existing_table = df_existing_table.drop('_table_dedup_key', axis=1)
+                df_table_data_filtered = df_table_data_filtered.drop('_table_dedup_key', axis=1)
+                
+                # Combine
+                df_table_combined = pd.concat([df_existing_table, df_table_data_filtered], ignore_index=True)
+            else:
+                # No dedup needed
+                df_table_combined = pd.concat([df_existing_table, df_table_data], ignore_index=True)
+        else:
+            logger.info(f"📋 Creating new Table_Data sheet")
+            df_table_combined = df_table_data
+        
+        # ===== WRITE TABLE_DATA SHEET =====
+        # Remove old sheet if exists
+        if table_sheet_name in wb.sheetnames:
+            del wb[table_sheet_name]
+        
+        wb.close()
+        
+        # Write using pandas (easier)
+        with pd.ExcelWriter(consolidated_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            df_table_combined.to_excel(writer, sheet_name=table_sheet_name, index=False)
+        
+        logger.info(f"✅ Table_Data sheet created/updated with {len(df_table_combined)} records")
+        
+        # ===== OPTIONAL: FORMAT TABLE_DATA SHEET =====
+        wb = load_workbook(consolidated_file)
+        
+        if table_sheet_name in wb.sheetnames:
+            ws_table = wb[table_sheet_name]
+            
+            # Auto-adjust column widths
+            for column in ws_table.columns:
+                max_length = 0
+                column_letter = column[0].column_letter
+                
+                for cell in column:
+                    try:
+                        if cell.value:
+                            max_length = max(max_length, len(str(cell.value)))
+                    except:
+                        pass
+                
+                adjusted_width = min(max_length + 2, 50)
+                ws_table.column_dimensions[column_letter].width = adjusted_width
+            
+            # Format header row
+            from openpyxl.styles import Font, PatternFill, Alignment
+            
+            header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            header_font = Font(bold=True, color="FFFFFF")
+            
+            for cell in ws_table[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            
+            # Freeze header row
+            ws_table.freeze_panes = "A2"
+            
+            logger.info("✅ Table_Data sheet formatted")
+        
+        wb.save(consolidated_file)
+        wb.close()
+    
+    except Exception as e:
+        logger.error(f"Error creating Table_Data sheet: {str(e)}", exc_info=True)
+
+
+# ============================================================================
+# ALTERNATIVE: SIMPLER VERSION (if you don't need deduplication)
+# ============================================================================
+
+def _append_table_data_to_consolidated_simple(self, consolidated_file, df_all_data, table_sheet_name):
+    """
+    Simpler version: Just filter and write table data (no deduplication)
+    """
+    
+    try:
+        # Filter for html_table records
+        if 'Extraction_Method' not in df_all_data.columns:
+            logger.warning("⚠️ 'Extraction_Method' column not found")
+            return
+        
+        df_table_data = df_all_data[df_all_data['Extraction_Method'] == 'html_table'].copy()
+        
+        if df_table_data.empty:
+            logger.info("ℹ️ No HTML table records found")
+            return
+        
+        logger.info(f"📊 Writing {len(df_table_data)} HTML table records to Table_Data sheet")
+        
+        # Write to Excel
+        with pd.ExcelWriter(consolidated_file, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            df_table_data.to_excel(writer, sheet_name=table_sheet_name, index=False)
+        
+        logger.info(f"✅ Table_Data sheet created with {len(df_table_data)} records")
+    
+    except Exception as e:
+        logger.error(f"Error creating Table_Data sheet: {str(e)}", exc_info=True)

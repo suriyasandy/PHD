@@ -1,34 +1,48 @@
-# streamlit_email_app.py
+# streamlit_outlook_harvester.py
 """
-Streamlit UI wrapper for existing Email Extraction functionality
-Keeps all your existing backend code - just replaces Tkinter UI
+Streamlit version of Outlook Email Harvester
+Migrated from Tkinter - keeps all existing business logic
 """
 
 import streamlit as st
 import pandas as pd
-import json
 import os
-import glob
-from datetime import datetime
-from pathlib import Path
-import sys
+import re
+import gc
+import logging
+from datetime import datetime, timedelta
+import win32com.client
+import pythoncom
+import locale
+from io import BytesIO
 
-# Import your existing classes (adjust paths as needed)
-from your_existing_code import (
-    EmailExtractorApp,  # Your main Tkinter app class
-    PatternManager,
-    UsageTracker,
-    EmailCleaner,
-    RAGEnabledExtractor
-    # ... import other classes you need
-)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Page config
 st.set_page_config(
-    page_title="Email Entity Extractor",
+    page_title="Outlook Email Harvester",
     page_icon="📧",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        padding: 1rem 0;
+    }
+    .stButton>button {
+        width: 100%;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -36,114 +50,199 @@ st.set_page_config(
 # ============================================================================
 
 def init_session_state():
-    """Initialize session state to store app instance and data"""
-    if 'app' not in st.session_state:
-        # Create instance of your existing app class (without Tkinter UI)
-        st.session_state.app = create_app_instance()
-    
-    if 'selected_email' not in st.session_state:
-        st.session_state.selected_email = None
-    
-    if 'email_chain' not in st.session_state:
-        st.session_state.email_chain = []
-    
-    if 'extraction_results' not in st.session_state:
-        st.session_state.extraction_results = None
-
-
-def create_app_instance():
-    """
-    Create your existing app instance without Tkinter
-    Modify your class to work without tk.Tk()
-    """
-    # Your existing initialization logic
-    app = EmailExtractorBackend()  # Backend-only version
-    return app
+    """Initialize session state variables"""
+    if 'emails' not in st.session_state:
+        st.session_state.emails = []
+    if 'selected_email_idx' not in st.session_state:
+        st.session_state.selected_email_idx = None
+    if 'extraction_running' not in st.session_state:
+        st.session_state.extraction_running = False
 
 
 # ============================================================================
-# BACKEND CLASS (Modified from your Tkinter app)
+# BACKEND FUNCTIONS (Your existing logic)
 # ============================================================================
 
-class EmailExtractorBackend:
-    """
-    Your existing EmailExtractorApp class modified to work without Tkinter
-    Remove all tk.* references, keep all business logic
-    """
+class OutlookEmailHarvesterBackend:
+    """Backend class with all your existing functions"""
     
     def __init__(self):
-        """Initialize without Tkinter components"""
-        # Your existing initialization
-        self.temp_path = "./temp"
-        self.out_path = "./output"
-        self.email_username = ""
-        
-        # Create directories
-        Path(self.temp_path).mkdir(exist_ok=True)
-        Path(self.out_path).mkdir(exist_ok=True)
-        
-        # Initialize your managers
-        self.pattern_manager = PatternManager()
-        self.usage_tracker = UsageTracker()
-        self.email_cleaner = EmailCleaner()
-        self.rag_extractor = None
-        
-        # Activity keywords
-        self.activity_keywords = ["BOOKED", "CANCELLED", "AMENDED", "CONFIRMED"]
-        
-        # Static headers for export
-        self.static_headers = [
-            'Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject',
-            # ... rest of your headers
-        ]
-        
-        self.selected_email = None
-        self.entity_definitions = {}
+        # Fixed mailbox and folder mapping (your existing config)
+        self.mailbox_folders = {
+            "HBEU-Rates-TA": ["Sent Items", "QTrack History 2025Q4"],
+            "EXOTICSTAG HBFR-DMTC": ["Sent Items", "QTrack History 2025Q4"],
+            "FO-EURO-RATES HBFR-DMTC": ["Sent Items", "QTrack History 2025Q4"],
+            "MODERIV-HSBCF HBFR-DMTC": ["Sent Items", "QTrack History 2025Q4"],
+            "GMO_DARR": ["Sent Items", "QTrack History 2025Q4"],
+            "HKFI Derv Flow": ["Sent Items", "QTrack History 2025Q4"]
+        }
     
-    # ===== KEEP ALL YOUR EXISTING METHODS =====
-    # Just remove tk.messagebox and replace with return values/exceptions
+    # ===== YOUR EXISTING FUNCTIONS (copied exactly) =====
     
-    def fetch_emails_from_outlook(self, days_back=7):
-        """Your existing email fetch logic"""
-        # Return emails instead of updating treeview
+    def connect_to_outlook(self, mailbox_name, folder_name):
+        """Your existing connect_to_outlook function"""
         try:
-            # Your existing Outlook logic
-            emails = []  # populated by your code
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            mapi = outlook.GetNamespace("MAPI")
+            
+            mailbox = None
+            for i in range(1, mapi.Folders.Count + 1):
+                m = mapi.Folders.Item(i)
+                if m.Name == mailbox_name:
+                    mailbox = m
+                    break
+            
+            if mailbox is None:
+                logger.info(f"Mailbox '{mailbox_name}' not found!")
+                return None
+            
+            folder = None
+            for j in range(1, mailbox.Folders.Count + 1):
+                f = mailbox.Folders.Item(j)
+                if f.Name == folder_name:
+                    folder = f
+                    break
+            
+            if folder is None:
+                logger.info(f"Folder '{folder_name}' not found in '{mailbox_name}'!")
+                return None
+            
+            return folder
+        except Exception as e:
+            logger.error(f"Failed to connect to Outlook: {e}")
+            return None
+    
+    def get_region_datefmt_ampm(self):
+        """Your existing get_region_datefmt_ampm function"""
+        region = locale.getdefaultlocale()[0] if locale.getdefaultlocale() else ''
+        region_datefmt = {
+            'en_US': ('%m/%d/%Y', True),
+            'en_GB': ('%d/%m/%Y', False),
+            'en_IN': ('%d-%m-%Y', False),
+            'fr_FR': ('%d/%m/%Y', False),
+            'de_DE': ('%d.%m.%Y', False),
+            'es_ES': ('%d/%m/%Y', False),
+            'en_UK': ('%d/%m/%Y', False),
+            'en_HK': ('%d/%m/%Y', True)
+        }
+        date_fmt, use_ampm = region_datefmt.get(region, ('%m/%d/%Y', True))
+        return date_fmt, use_ampm
+    
+    def restrict_datetime_strings(self, date_dt, date_fmt, use_ampm):
+        """Your existing restrict_datetime_strings function"""
+        if use_ampm:
+            am_marker = date_dt.replace(hour=1).strftime('%p')
+            pm_marker = date_dt.replace(hour=13).strftime('%p')
+            start_time = f"{date_dt.strftime(date_fmt)} 12:00:00 {am_marker}"
+            end_time = f"{date_dt.strftime(date_fmt)} 11:59:59 {pm_marker}"
+        else:
+            start_time = f"{date_dt.strftime(date_fmt)} 00:00:00"
+            end_time = f"{date_dt.strftime(date_fmt)} 23:59:59"
+        return start_time, end_time
+    
+    def safe_items_to_list(self, items):
+        """Your existing safe_items_to_list function"""
+        try:
+            return list(items)
+        except Exception:
+            if items is None:
+                return []
+            try:
+                if getattr(items, "Subject", None) is not None:
+                    return [items]
+            except Exception:
+                pass
+            return []
+    
+    def process_items_in_batches(self, items, batch_size=150):
+        """Your existing process_items_in_batches function"""
+        items_list = self.safe_items_to_list(items)
+        if not items_list:
+            return []
+        all_data = []
+        for i in range(0, len(items_list), batch_size):
+            batch = items_list[i:i + batch_size]
+            for item in batch:
+                try:
+                    if getattr(item, "Class", None) == 43:
+                        all_data.append({"item": item})
+                except Exception as e:
+                    logger.warning(f"Error reading batch mail: {e}")
+                finally:
+                    del item
+            gc.collect()
+        return all_data
+    
+    def extract_emails(self, mailbox_name, folder_name, trade_ids, days_back=3):
+        """
+        Your existing extraction logic
+        Modified to return results instead of using threading
+        """
+        pythoncom.CoInitialize()
+        try:
+            folder = self.connect_to_outlook(mailbox_name, folder_name)
+            if not folder:
+                return {'success': False, 'error': 'Could not connect to folder'}
+            
+            trade_ids_list = [tid.strip() for tid in re.split(",|\\s", trade_ids) if tid.strip()]
+            today = datetime.now()
+            date_fmt, use_ampm = self.get_region_datefmt_ampm()
+            all_items = []
+
+            # Date range search
+            for days_ago in range(1, days_back + 1):
+                d = today - timedelta(days=days_ago)
+                start_time, end_time = self.restrict_datetime_strings(d, date_fmt, use_ampm)
+                filter_str = f"[ReceivedTime] >= '{start_time}' AND [ReceivedTime] <= '{end_time}'"
+                logger.info(f"Trying filter: {filter_str}")
+                items = folder.Items.Restrict(filter_str)
+                items_list = self.process_items_in_batches(items, batch_size=150)
+                
+                if not items_list and use_ampm:
+                    am_l = d.replace(hour=1).strftime('%p').lower()
+                    pm_l = d.replace(hour=13).strftime('%p').lower()
+                    start_time_l = f"{d.strftime(date_fmt)} 12:00:00 {am_l}"
+                    end_time_l = f"{d.strftime(date_fmt)} 11:59:59 {pm_l}"
+                    filter_str_l = f"[ReceivedTime] >= '{start_time_l}' AND [ReceivedTime] <= '{end_time_l}'"
+                    items = folder.Items.Restrict(filter_str_l)
+                    items_list = self.process_items_in_batches(items, batch_size=150)
+                
+                if items_list:
+                    all_items.extend([entry["item"] for entry in items_list])
+
+            # Extract emails matching trade IDs
+            emails = []
+            for trade_id in trade_ids_list:
+                for item in all_items:
+                    try:
+                        if getattr(item, "Class", None) == 43:
+                            subject = item.Subject or ""
+                            body = item.Body or ""
+                            html_body = ""
+                            try:
+                                html_body = item.HTMLBody
+                            except Exception:
+                                pass
+                            if (trade_id in subject or trade_id in body or (html_body and trade_id in html_body)):
+                                emails.append({
+                                    'trade_id': trade_id,
+                                    'subject': subject,
+                                    'sender': getattr(item, "SenderName", ""),
+                                    'recipient': getattr(item, "To", ""),
+                                    'date': item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S") if item.ReceivedTime else "",
+                                    'body': body,
+                                    'html_body': html_body,
+                                })
+                    except Exception:
+                        pass
+
+            gc.collect()
             return {'success': True, 'emails': emails}
         except Exception as e:
+            gc.collect()
             return {'success': False, 'error': str(e)}
-    
-    def extract_and_export(self):
-        """Your existing extraction logic - returns results instead of showing messagebox"""
-        try:
-            # ALL YOUR EXISTING EXTRACTION CODE
-            # ... (keep everything the same)
-            
-            # Instead of messagebox.showinfo, return results
-            return {
-                'success': True,
-                'records': len(entity_df),
-                'dataframe': entity_df,
-                'stats': {
-                    'matched': matched_count,
-                    'unseen': unseen_count,
-                    'tables': len(all_tables)
-                }
-            }
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-    
-    def export_consolidated_results(self):
-        """Your existing consolidation logic"""
-        try:
-            # ALL YOUR EXISTING CONSOLIDATION CODE
-            return {
-                'success': True,
-                'file': consolidated_file,
-                'records': len(df_combined)
-            }
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
+        finally:
+            pythoncom.CoUninitialize()
 
 
 # ============================================================================
@@ -154,303 +253,317 @@ def main():
     """Main Streamlit app"""
     
     init_session_state()
-    app = st.session_state.app
+    
+    # Create backend instance
+    if 'backend' not in st.session_state:
+        st.session_state.backend = OutlookEmailHarvesterBackend()
+    
+    backend = st.session_state.backend
     
     # Header
-    st.title("📧 Email Entity Extractor")
+    st.markdown('<div class="main-header">📧 Outlook Email Harvester</div>', 
+                unsafe_allow_html=True)
     st.markdown("---")
     
-    # Sidebar - Configuration (replaces your Tkinter config panel)
+    # ========== SIDEBAR - CONFIGURATION ==========
     with st.sidebar:
         st.header("⚙️ Configuration")
         
-        # Email Credentials
-        st.subheader("📧 Email Settings")
-        app.email_username = st.text_input("Email Address", value=app.email_username)
-        days_back = st.number_input("Days to Fetch", min_value=1, max_value=30, value=7)
-        
-        # Paths
-        st.subheader("📁 Paths")
-        app.temp_path = st.text_input("Temp Path", value=app.temp_path)
-        app.out_path = st.text_input("Output Path", value=app.out_path)
-        
-        # Activity Keywords
-        st.subheader("🏷️ Activity Keywords")
-        keywords_text = st.text_area(
-            "Keywords (one per line)",
-            value="\n".join(app.activity_keywords),
-            height=150
-        )
-        app.activity_keywords = [k.strip() for k in keywords_text.split('\n') if k.strip()]
-        
-        # Entity JSON
-        st.subheader("📋 Entity Definitions")
-        entity_json = st.text_area(
-            "Entity JSON",
-            value=json.dumps(app.entity_definitions, indent=2) if app.entity_definitions else "{}",
-            height=200
+        # Mailbox Selection (Tkinter: mailbox_combo)
+        st.subheader("📬 Mailbox Selection")
+        selected_mailbox = st.selectbox(
+            "Select Mailbox",
+            options=list(backend.mailbox_folders.keys()),
+            index=0
         )
         
-        if st.button("💾 Save Config", type="primary"):
+        # Folder Selection (Tkinter: folder_combo)
+        st.subheader("📁 Folder Selection")
+        available_folders = backend.mailbox_folders.get(selected_mailbox, [])
+        selected_folder = st.selectbox(
+            "Select Outlook Folder",
+            options=available_folders,
+            index=0 if available_folders else None
+        )
+        
+        # Days Back
+        st.subheader("📅 Date Range")
+        days_back = st.number_input(
+            "Days to Search Back",
+            min_value=1,
+            max_value=30,
+            value=3,
+            help="Number of days to search back from today"
+        )
+        
+        # Export options
+        st.markdown("---")
+        st.subheader("💾 Export Options")
+        export_format = st.radio(
+            "Export Format",
+            options=["CSV", "Excel"],
+            index=0
+        )
+    
+    # ========== MAIN CONTENT ==========
+    
+    # Trade IDs Input Section (Tkinter: trade_ids_var)
+    st.header("🔍 Trade ID Input")
+    
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Option 1: Manual Input (Tkinter: Entry widget)
+        trade_ids_manual = st.text_area(
+            "Enter Trade IDs (comma or space separated)",
+            height=100,
+            placeholder="Enter trade IDs separated by comma or space...",
+            help="Example: TRD001, TRD002 TRD003"
+        )
+    
+    with col2:
+        # Option 2: File Upload (Tkinter: file upload button)
+        st.markdown("**OR Upload File**")
+        uploaded_file = st.file_uploader(
+            "Upload CSV/TXT with Trade IDs",
+            type=['csv', 'txt'],
+            help="Upload a file containing trade IDs"
+        )
+        
+        if uploaded_file:
             try:
-                app.entity_definitions = json.loads(entity_json)
-                st.success("✅ Configuration saved!")
-            except json.JSONDecodeError as e:
-                st.error(f"❌ Invalid JSON: {str(e)}")
+                content = uploaded_file.read().decode('utf-8')
+                # Extract trade IDs from file
+                trade_ids_from_file = re.findall(r'\b\w+\b', content)
+                st.success(f"✅ Loaded {len(trade_ids_from_file)} IDs from file")
+                
+                # Show preview
+                with st.expander("📋 Preview Trade IDs from File"):
+                    st.write(", ".join(trade_ids_from_file[:20]))
+                    if len(trade_ids_from_file) > 20:
+                        st.write(f"... and {len(trade_ids_from_file) - 20} more")
+                
+                # Auto-populate manual input
+                if not trade_ids_manual:
+                    trade_ids_manual = ", ".join(trade_ids_from_file)
+            except Exception as e:
+                st.error(f"❌ Error reading file: {str(e)}")
     
-    # Main content tabs (replaces your Tkinter tabs)
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📨 Email Fetch", 
-        "🔍 Extract & Export", 
-        "📊 Consolidate", 
-        "📈 Analytics"
-    ])
+    # Determine final trade IDs
+    final_trade_ids = trade_ids_manual.strip()
     
-    # ========== TAB 1: EMAIL FETCH (replaces your fetch_emails) ==========
-    with tab1:
-        st.header("📨 Fetch Emails from Outlook")
-        
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            st.info(f"📧 Email: {app.email_username or 'Not set'}")
-            st.info(f"📅 Days: {days_back}")
-        
-        with col2:
-            if st.button("🔄 Fetch Emails", type="primary", use_container_width=True):
-                if not app.email_username:
-                    st.error("❌ Please set email address in sidebar")
-                else:
-                    with st.spinner("🔄 Fetching emails from Outlook..."):
-                        result = app.fetch_emails_from_outlook(days_back)
-                    
-                    if result['success']:
-                        st.session_state.email_chain = result['emails']
-                        st.success(f"✅ Fetched {len(result['emails'])} emails")
-                    else:
-                        st.error(f"❌ Error: {result['error']}")
-        
-        # Display fetched emails (replaces your Treeview)
-        if st.session_state.email_chain:
-            st.markdown("---")
-            st.subheader(f"📧 Email Chain ({len(st.session_state.email_chain)} emails)")
-            
-            # Create DataFrame for display
-            email_display = pd.DataFrame([
-                {
-                    'Trade ID': email.get('trade_id', ''),
-                    'Date': email.get('date', ''),
-                    'From': email.get('sender', ''),
-                    'Subject': email.get('subject', '')[:50] + '...' if len(email.get('subject', '')) > 50 else email.get('subject', '')
-                }
-                for email in st.session_state.email_chain
-            ])
-            
-            # Selection
-            selected_idx = st.selectbox(
-                "Select email to process",
-                range(len(st.session_state.email_chain)),
-                format_func=lambda i: f"{i+1}. {st.session_state.email_chain[i].get('subject', 'No subject')}"
-            )
-            
-            if st.button("✅ Select This Email"):
-                app.selected_email = st.session_state.email_chain[selected_idx]
-                st.session_state.selected_email = app.selected_email
-                st.success(f"✅ Selected: {app.selected_email.get('subject', 'No subject')}")
-            
-            # Display table
-            st.dataframe(email_display, use_container_width=True)
-            
-            # Show selected email details
-            if st.session_state.selected_email:
-                with st.expander("📧 Selected Email Details"):
-                    email = st.session_state.selected_email
-                    st.markdown(f"**Trade ID:** {email.get('trade_id', 'N/A')}")
-                    st.markdown(f"**Date:** {email.get('date', 'N/A')}")
-                    st.markdown(f"**From:** {email.get('sender', 'N/A')}")
-                    st.markdown(f"**Subject:** {email.get('subject', 'N/A')}")
-                    
-                    st.markdown("**Body Preview:**")
-                    st.text_area("Email Body", value=email.get('body', '')[:500], height=200, disabled=True)
+    st.markdown("---")
     
-    # ========== TAB 2: EXTRACT & EXPORT (replaces your extract button) ==========
-    with tab2:
-        st.header("🔍 Extract & Export")
-        
-        if not st.session_state.selected_email:
-            st.warning("⚠️ Please select an email from the 'Email Fetch' tab first")
+    # ========== ACTION BUTTONS (Tkinter: button_frame) ==========
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        extract_btn = st.button(
+            "🔍 Extract from Outlook",
+            type="primary",
+            disabled=not final_trade_ids or st.session_state.extraction_running,
+            use_container_width=True
+        )
+    
+    with col2:
+        export_btn = st.button(
+            "💾 Export to File",
+            disabled=len(st.session_state.emails) == 0,
+            use_container_width=True
+        )
+    
+    with col3:
+        clear_btn = st.button(
+            "🗑️ Clear Results",
+            disabled=len(st.session_state.emails) == 0,
+            use_container_width=True
+        )
+    
+    with col4:
+        refresh_btn = st.button(
+            "🔄 Refresh Display",
+            use_container_width=True
+        )
+    
+    # ========== BUTTON ACTIONS ==========
+    
+    # Extract Button Action
+    if extract_btn:
+        if not final_trade_ids:
+            st.error("❌ Please enter trade IDs")
         else:
-            email = st.session_state.selected_email
+            st.session_state.extraction_running = True
             
-            # Show selected email info
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("📋 Trade ID", email.get('trade_id', 'N/A'))
-            with col2:
-                st.metric("📅 Date", email.get('date', 'N/A'))
-            with col3:
-                st.metric("📧 From", email.get('sender', 'N/A')[:20] + '...' if len(email.get('sender', '')) > 20 else email.get('sender', 'N/A'))
+            with st.spinner(f"🔄 Extracting emails for {len(final_trade_ids.split())} trade IDs..."):
+                result = backend.extract_emails(
+                    selected_mailbox,
+                    selected_folder,
+                    final_trade_ids,
+                    days_back
+                )
             
-            st.markdown("---")
+            st.session_state.extraction_running = False
             
-            # Extract button (replaces your Tkinter button)
-            col1, col2, col3 = st.columns([1, 2, 1])
-            
-            with col2:
-                if st.button("🚀 Extract Entities", type="primary", use_container_width=True):
-                    with st.spinner("🔄 Extracting entities from email..."):
-                        result = app.extract_and_export()
-                    
-                    if result['success']:
-                        st.session_state.extraction_results = result
-                        st.success(f"✅ Extracted {result['records']} records!")
-                        st.balloons()
-                    else:
-                        st.error(f"❌ Extraction failed: {result['error']}")
-            
-            # Show extraction results
-            if st.session_state.extraction_results:
-                st.markdown("---")
-                result = st.session_state.extraction_results
+            if result['success']:
+                st.session_state.emails = result['emails']
+                st.success(f"✅ Extracted {len(result['emails'])} emails!")
+                st.balloons()
+            else:
+                st.error(f"❌ Extraction failed: {result['error']}")
+    
+    # Export Button Action
+    if export_btn:
+        if st.session_state.emails:
+            try:
+                df = pd.DataFrame(st.session_state.emails)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
                 
-                # Metrics
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("📝 Total Records", result['records'])
-                with col2:
-                    st.metric("✅ Matched", result['stats']['matched'])
-                with col3:
-                    st.metric("⚠️ Unseen", result['stats']['unseen'])
-                with col4:
-                    st.metric("📊 Tables", result['stats']['tables'])
-                
-                # Dataframe display
-                st.subheader("📋 Extracted Data")
-                df = result['dataframe']
-                
-                if not df.empty:
-                    # Add filters
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        methods = ['All'] + list(df['Extraction_Method'].unique()) if 'Extraction_Method' in df.columns else ['All']
-                        method_filter = st.selectbox("Filter by Method", methods)
-                    
-                    with col2:
-                        sources = ['All'] + list(df['Source'].unique()) if 'Source' in df.columns else ['All']
-                        source_filter = st.selectbox("Filter by Source", sources)
-                    
-                    # Apply filters
-                    filtered_df = df.copy()
-                    if method_filter != 'All':
-                        filtered_df = filtered_df[filtered_df['Extraction_Method'] == method_filter]
-                    if source_filter != 'All':
-                        filtered_df = filtered_df[filtered_df['Source'] == source_filter]
-                    
-                    st.markdown(f"**Showing {len(filtered_df)} of {len(df)} records**")
-                    st.dataframe(filtered_df, use_container_width=True, height=400)
-                    
-                    # Download button
-                    csv = filtered_df.to_csv(index=False).encode('utf-8')
+                if export_format == "CSV":
+                    csv = df.to_csv(index=False).encode('utf-8')
                     st.download_button(
                         label="📥 Download CSV",
                         data=csv,
-                        file_name=f"{email.get('trade_id', 'extraction')}.csv",
+                        file_name=f"email_export_{timestamp}.csv",
                         mime="text/csv"
                     )
+                else:  # Excel
+                    output = BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df.to_excel(writer, index=False, sheet_name='Emails')
+                    excel_data = output.getvalue()
+                    
+                    st.download_button(
+                        label="📥 Download Excel",
+                        data=excel_data,
+                        file_name=f"email_export_{timestamp}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                
+                st.success(f"✅ Export ready!")
+            except Exception as e:
+                st.error(f"❌ Export failed: {str(e)}")
+    
+    # Clear Button Action
+    if clear_btn:
+        st.session_state.emails = []
+        st.session_state.selected_email_idx = None
+        st.success("✅ Results cleared")
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # ========== EMAIL CHAIN DISPLAY (Tkinter: tree) ==========
+    if st.session_state.emails:
+        st.header(f"📧 Email Chain ({len(st.session_state.emails)} emails)")
+        
+        # Create DataFrame for display
+        email_display_data = []
+        for idx, email in enumerate(st.session_state.emails):
+            # Determine email type (same logic as Tkinter)
+            email_type = "Original"
+            subj = email['subject'].lower()
+            if "re:" in subj:
+                email_type = f"Reply {idx}"
+            elif "fw:" in subj or "fwd:" in subj:
+                email_type = f"Forward {idx}"
+            
+            email_display_data.append({
+                'Index': idx,
+                'Trade ID': email['trade_id'],
+                'Subject': email['subject'][:40] + "..." if len(email['subject']) > 40 else email['subject'],
+                'From': email['sender'][:25] + "..." if len(email['sender']) > 25 else email['sender'],
+                'To': email['recipient'][:25] + "..." if len(email['recipient']) > 25 else email['recipient'],
+                'Date': email['date'],
+                'Email Type': email_type
+            })
+        
+        df_display = pd.DataFrame(email_display_data)
+        
+        # Email selection (Tkinter: tree.bind('<<TreeviewSelect>>'))
+        selected_email_idx = st.selectbox(
+            "Select an email to view details",
+            options=df_display['Index'].tolist(),
+            format_func=lambda idx: f"{idx}. {st.session_state.emails[idx]['subject'][:50]}",
+            key='email_selector'
+        )
+        
+        st.session_state.selected_email_idx = selected_email_idx
+        
+        # Display table (Tkinter: Treeview)
+        st.dataframe(
+            df_display.drop('Index', axis=1),
+            use_container_width=True,
+            height=300
+        )
+        
+        st.markdown("---")
+        
+        # ========== EMAIL CONTENT DISPLAY (Tkinter: content_text) ==========
+        if st.session_state.selected_email_idx is not None:
+            st.header("📄 Email Content")
+            
+            email_data = st.session_state.emails[st.session_state.selected_email_idx]
+            
+            # Create tabs for different views
+            tab1, tab2, tab3 = st.tabs(["📝 Plain Text", "🌐 HTML Body", "📊 Metadata"])
+            
+            with tab1:
+                # Plain text view (Tkinter: content_text widget)
+                content = f"Trade ID: {email_data['trade_id']}\n"
+                content += f"From: {email_data['sender']}\n"
+                content += f"To: {email_data['recipient']}\n"
+                content += f"Date: {email_data['date']}\n"
+                content += f"Subject: {email_data['subject']}\n"
+                content += "-" * 50 + "\n"
+                content += email_data['body']
+                
+                st.text_area(
+                    "Email Body",
+                    value=content,
+                    height=500,
+                    disabled=True
+                )
+            
+            with tab2:
+                # HTML body view
+                if email_data.get('html_body'):
+                    st.markdown("**HTML Preview:**")
+                    with st.expander("🔍 View Raw HTML"):
+                        st.code(email_data['html_body'][:1000], language='html')
+                    
+                    # Render HTML (be careful with this in production)
+                    st.markdown("**Rendered HTML:**")
+                    st.markdown(email_data['html_body'], unsafe_allow_html=True)
                 else:
-                    st.info("ℹ️ No records extracted")
+                    st.info("ℹ️ No HTML body available")
+            
+            with tab3:
+                # Metadata view
+                st.markdown("**Email Meta**")
+                metadata_df = pd.DataFrame([
+                    {'Field': 'Trade ID', 'Value': email_data['trade_id']},
+                    {'Field': 'From', 'Value': email_data['sender']},
+                    {'Field': 'To', 'Value': email_data['recipient']},
+                    {'Field': 'Date', 'Value': email_data['date']},
+                    {'Field': 'Subject', 'Value': email_data['subject']},
+                    {'Field': 'Body Length', 'Value': f"{len(email_data['body'])} characters"},
+                    {'Field': 'Has HTML', 'Value': 'Yes' if email_data.get('html_body') else 'No'}
+                ])
+                st.dataframe(metadata_df, use_container_width=True, hide_index=True)
     
-    # ========== TAB 3: CONSOLIDATE (replaces your consolidate button) ==========
-    with tab3:
-        st.header("📊 Consolidate Results")
-        
-        # Show temp files
-        csv_files = glob.glob(f"{app.temp_path}/*.csv")
-        
-        st.info(f"📁 Found {len(csv_files)} CSV files in temp folder")
-        
-        if csv_files:
-            # Show files
-            with st.expander("📄 Files to Consolidate"):
-                for file in csv_files:
-                    st.text(f"• {os.path.basename(file)}")
-            
-            st.markdown("---")
-            
-            # Consolidate button
-            col1, col2, col3 = st.columns([1, 2, 1])
-            
-            with col2:
-                if st.button("📊 Consolidate All Files", type="primary", use_container_width=True):
-                    with st.spinner("🔄 Consolidating files..."):
-                        result = app.export_consolidated_results()
-                    
-                    if result['success']:
-                        st.success(f"✅ Consolidated {result['records']} records!")
-                        st.info(f"📁 Output: {result['file']}")
-                        
-                        # Show download button
-                        if os.path.exists(result['file']):
-                            with open(result['file'], 'rb') as f:
-                                st.download_button(
-                                    label="📥 Download Consolidated Excel",
-                                    data=f,
-                                    file_name=os.path.basename(result['file']),
-                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                                )
-                    else:
-                        st.error(f"❌ Consolidation failed: {result['error']}")
-        else:
-            st.warning("⚠️ No CSV files found in temp folder. Extract some emails first!")
+    else:
+        # No emails loaded yet
+        st.info("ℹ️ No emails loaded. Enter trade IDs and click 'Extract from Outlook'")
     
-    # ========== TAB 4: ANALYTICS ==========
-    with tab4:
-        st.header("📈 Analytics & Statistics")
-        
-        if st.session_state.extraction_results:
-            result = st.session_state.extraction_results
-            df = result['dataframe']
-            
-            if not df.empty:
-                # Visualizations
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    if 'Extraction_Method' in df.columns:
-                        method_counts = df['Extraction_Method'].value_counts()
-                        st.bar_chart(method_counts)
-                        st.caption("Extraction Methods Distribution")
-                
-                with col2:
-                    if 'Source' in df.columns:
-                        source_counts = df['Source'].value_counts()
-                        st.bar_chart(source_counts)
-                        st.caption("Records by Source")
-                
-                # Entity coverage
-                st.subheader("📊 Entity Coverage")
-                metadata_cols = ['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject',
-                               'Conversation_ID', 'Package_ID', 'ActivityType', 'Pattern_ID',
-                               'Source', 'Source_Line', 'Line_Index', 'Extraction_Method']
-                entity_cols = [col for col in df.columns if col not in metadata_cols]
-                
-                if entity_cols:
-                    coverage = []
-                    for col in entity_cols:
-                        non_null = df[col].notna().sum()
-                        coverage.append({
-                            'Entity': col,
-                            'Count': non_null,
-                            'Coverage %': (non_null / len(df)) * 100
-                        })
-                    
-                    coverage_df = pd.DataFrame(coverage).sort_values('Coverage %', ascending=False)
-                    st.dataframe(coverage_df, use_container_width=True)
-            else:
-                st.info("ℹ️ No data to analyze")
-        else:
-            st.info("ℹ️ Extract entities first to see analytics")
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        f"<div style='text-align: center; color: gray;'>"
+        f"Outlook Email Harvester v2.0 | Streamlit Edition | "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"</div>",
+        unsafe_allow_html=True
+    )
 
 
 # ============================================================================

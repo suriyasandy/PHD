@@ -89,12 +89,7 @@ class OutlookEmailHarvesterBackend:
     
     def __init__(self):
         self.mailbox_folders = {
-            "HBEU-Rates-TA": ["Sent Items", "QTrack History 2025Q4"],
-            "EXOTICSTAG HBFR-DMTC": ["Sent Items", "QTrack History 2025Q4"],
-            "FO-EURO-RATES HBFR-DMTC": ["Sent Items", "QTrack History 2025Q4"],
-            "MODERIV-HSBCF HBFR-DMTC": ["Sent Items", "QTrack History 2025Q4"],
-            "GMO_DARR": ["Sent Items", "QTrack History 2025Q4"],
-            "HKFI Derv Flow": ["Sent Items", "QTrack History 2025Q4"]
+           
         }
     
     def connect_to_outlook(self, mailbox_name, folder_name):

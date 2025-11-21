@@ -1,0 +1,596 @@
+# streamlit_email_extractor.py
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import json
+import re
+import time
+import glob
+import os
+from datetime import datetime
+from bs4 import BeautifulSoup
+import plotly.express as px
+import plotly.graph_objects as go
+from pathlib import Path
+
+# Set page config
+st.set_page_config(
+    page_title="Email Entity Extractor",
+    page_icon="📧",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        padding: 1rem 0;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .success-box {
+        background-color: #d4edda;
+        border-left: 5px solid #28a745;
+        padding: 1rem;
+        margin: 1rem 0;
+    }
+    .warning-box {
+        background-color: #fff3cd;
+        border-left: 5px solid #ffc107;
+        padding: 1rem;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
+
+def init_session_state():
+    """Initialize session state variables"""
+    if 'extraction_results' not in st.session_state:
+        st.session_state.extraction_results = None
+    if 'email_data' not in st.session_state:
+        st.session_state.email_data = None
+    if 'entity_definitions' not in st.session_state:
+        st.session_state.entity_definitions = None
+    if 'extraction_stats' not in st.session_state:
+        st.session_state.extraction_stats = {}
+
+
+# ============================================================================
+# MAIN APP
+# ============================================================================
+
+def main():
+    """Main Streamlit app"""
+    
+    init_session_state()
+    
+    # Header
+    st.markdown('<div class="main-header">📧 Email Entity Extractor</div>', 
+                unsafe_allow_html=True)
+    st.markdown("---")
+    
+    # Sidebar - Configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        # Paths
+        st.subheader("📁 Paths")
+        temp_path = st.text_input("Temp Path", value="./temp")
+        out_path = st.text_input("Output Path", value="./output")
+        
+        # Activity Keywords
+        st.subheader("🏷️ Activity Keywords")
+        activity_keywords = st.text_area(
+            "Activity Keywords (one per line)",
+            value="BOOKED\nCANCELLED\nAMENDED\nCONFIRMED\nPENDING",
+            height=150
+        )
+        activity_list = [kw.strip() for kw in activity_keywords.split('\n') if kw.strip()]
+        
+        # Entity Definitions
+        st.subheader("📋 Entity Definitions")
+        entity_json = st.text_area(
+            "Entity JSON",
+            value='{\n  "Customer": {"entity_type": "pattern"},\n  "Amount": {"entity_type": "pattern"}\n}',
+            height=200
+        )
+        
+        # Upload Pattern Config
+        st.subheader("📄 Upload Pattern Config")
+        uploaded_config = st.file_uploader("Upload Pattern Config (JSON)", type=['json'])
+        if uploaded_config:
+            entity_json = uploaded_config.read().decode('utf-8')
+        
+        # Save button
+        if st.button("💾 Save Configuration", type="primary"):
+            try:
+                st.session_state.entity_definitions = json.loads(entity_json)
+                st.success("✅ Configuration saved!")
+            except json.JSONDecodeError as e:
+                st.error(f"❌ Invalid JSON: {str(e)}")
+    
+    # Main content area
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📧 Email Input", 
+        "🔍 Extraction Results", 
+        "📊 Analytics", 
+        "📁 Export"
+    ])
+    
+    # ========== TAB 1: EMAIL INPUT ==========
+    with tab1:
+        st.header("📧 Email Input")
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader("📝 Email Body (Plain Text)")
+            email_body = st.text_area(
+                "Paste email body here",
+                height=300,
+                placeholder="Paste your email content here..."
+            )
+            
+            st.subheader("🌐 Email HTML Body")
+            email_html = st.text_area(
+                "Paste HTML body here (optional)",
+                height=200,
+                placeholder="Paste HTML content here (optional)..."
+            )
+        
+        with col2:
+            st.subheader("📋 Email Metadata")
+            trade_id = st.text_input("Trade ID", value="AUTO")
+            email_from = st.text_input("From", value="")
+            email_subject = st.text_input("Subject", value="")
+            email_date = st.date_input("Date", value=datetime.now())
+            
+            # Upload email file
+            st.subheader("📎 Or Upload Email File")
+            uploaded_email = st.file_uploader("Upload .txt or .html file", type=['txt', 'html'])
+            
+            if uploaded_email:
+                content = uploaded_email.read().decode('utf-8')
+                if uploaded_email.name.endswith('.html'):
+                    email_html = content
+                else:
+                    email_body = content
+                st.success(f"✅ Loaded: {uploaded_email.name}")
+        
+        # Extract button
+        st.markdown("---")
+        col1, col2, col3 = st.columns([1, 2, 1])
+        
+        with col2:
+            if st.button("🚀 Extract Entities", type="primary", use_container_width=True):
+                if not email_body and not email_html:
+                    st.error("❌ Please provide email body or HTML")
+                else:
+                    # Prepare email data
+                    if trade_id == "AUTO":
+                        trade_id = f"TRADE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                    
+                    st.session_state.email_data = {
+                        'trade_id': trade_id,
+                        'body': email_body,
+                        'html_body': email_html,
+                        'sender': email_from,
+                        'subject': email_subject,
+                        'date': email_date.strftime('%Y-%m-%d')
+                    }
+                    
+                    # Run extraction
+                    with st.spinner("🔄 Extracting entities..."):
+                        results = run_extraction(
+                            st.session_state.email_data,
+                            st.session_state.entity_definitions,
+                            activity_list
+                        )
+                        st.session_state.extraction_results = results
+                    
+                    st.success("✅ Extraction complete!")
+                    st.balloons()
+    
+    # ========== TAB 2: EXTRACTION RESULTS ==========
+    with tab2:
+        st.header("🔍 Extraction Results")
+        
+        if st.session_state.extraction_results is None:
+            st.info("ℹ️ No extraction results yet. Go to 'Email Input' tab and extract entities.")
+        else:
+            results = st.session_state.extraction_results
+            
+            # Metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("📝 Total Records", results['total_records'])
+            with col2:
+                st.metric("✅ Matched", results['matched_count'])
+            with col3:
+                st.metric("⚠️ Unseen", results['unseen_count'])
+            with col4:
+                st.metric("📊 Tables", results['table_count'])
+            
+            # Additional metrics
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("📧 Conversations", results.get('conversation_count', 0))
+            with col2:
+                st.metric("📦 Packages", results.get('package_count', 0))
+            with col3:
+                st.metric("⏱️ Time (s)", f"{results['processing_time']:.2f}")
+            with col4:
+                match_rate = (results['matched_count'] / 
+                            (results['matched_count'] + results['unseen_count']) * 100) \
+                            if (results['matched_count'] + results['unseen_count']) > 0 else 0
+                st.metric("📈 Match Rate", f"{match_rate:.1f}%")
+            
+            st.markdown("---")
+            
+            # Data display
+            df = results['dataframe']
+            
+            if not df.empty:
+                # Filter options
+                col1, col2, col3 = st.columns(3)
+                
+                with col1:
+                    extraction_methods = ['All'] + list(df['Extraction_Method'].unique()) \
+                        if 'Extraction_Method' in df.columns else ['All']
+                    method_filter = st.selectbox("Filter by Method", extraction_methods)
+                
+                with col2:
+                    sources = ['All'] + list(df['Source'].unique()) \
+                        if 'Source' in df.columns else ['All']
+                    source_filter = st.selectbox("Filter by Source", sources)
+                
+                with col3:
+                    conversations = ['All'] + list(df['Conversation_ID'].unique()) \
+                        if 'Conversation_ID' in df.columns else ['All']
+                    conv_filter = st.selectbox("Filter by Conversation", conversations)
+                
+                # Apply filters
+                filtered_df = df.copy()
+                if method_filter != 'All':
+                    filtered_df = filtered_df[filtered_df['Extraction_Method'] == method_filter]
+                if source_filter != 'All':
+                    filtered_df = filtered_df[filtered_df['Source'] == source_filter]
+                if conv_filter != 'All':
+                    filtered_df = filtered_df[filtered_df['Conversation_ID'] == conv_filter]
+                
+                st.markdown(f"**Showing {len(filtered_df)} of {len(df)} records**")
+                
+                # Display dataframe
+                st.dataframe(
+                    filtered_df,
+                    use_container_width=True,
+                    height=400
+                )
+                
+                # Expandable sections for different views
+                with st.expander("🔍 View by Extraction Method"):
+                    if 'Extraction_Method' in df.columns:
+                        for method in df['Extraction_Method'].unique():
+                            method_df = df[df['Extraction_Method'] == method]
+                            st.markdown(f"### {method} ({len(method_df)} records)")
+                            st.dataframe(method_df, use_container_width=True)
+                
+                with st.expander("📦 View by Package"):
+                    if 'Package_ID' in df.columns:
+                        for pkg in df['Package_ID'].unique():
+                            pkg_df = df[df['Package_ID'] == pkg]
+                            st.markdown(f"### Package #{pkg} ({len(pkg_df)} records)")
+                            st.dataframe(pkg_df, use_container_width=True)
+            else:
+                st.warning("⚠️ No records extracted")
+    
+    # ========== TAB 3: ANALYTICS ==========
+    with tab3:
+        st.header("📊 Analytics & Visualizations")
+        
+        if st.session_state.extraction_results is None:
+            st.info("ℹ️ No data to analyze. Extract entities first.")
+        else:
+            results = st.session_state.extraction_results
+            df = results['dataframe']
+            
+            if not df.empty:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Extraction method distribution
+                    if 'Extraction_Method' in df.columns:
+                        method_counts = df['Extraction_Method'].value_counts()
+                        fig = px.pie(
+                            values=method_counts.values,
+                            names=method_counts.index,
+                            title="Extraction Methods Distribution"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Source distribution
+                    if 'Source' in df.columns:
+                        source_counts = df['Source'].value_counts()
+                        fig = px.bar(
+                            x=source_counts.index,
+                            y=source_counts.values,
+                            title="Records by Source",
+                            labels={'x': 'Source', 'y': 'Count'}
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    # Records per package
+                    if 'Package_ID' in df.columns:
+                        pkg_counts = df['Package_ID'].value_counts().sort_index()
+                        fig = px.bar(
+                            x=pkg_counts.index,
+                            y=pkg_counts.values,
+                            title="Records per Package",
+                            labels={'x': 'Package ID', 'y': 'Records'}
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                    
+                    # Activity type distribution
+                    if 'ActivityType' in df.columns:
+                        activity_counts = df['ActivityType'].dropna().value_counts()
+                        if not activity_counts.empty:
+                            fig = px.pie(
+                                values=activity_counts.values,
+                                names=activity_counts.index,
+                                title="Activity Types"
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+                
+                # Entity coverage heatmap
+                st.subheader("🗺️ Entity Coverage")
+                
+                # Get entity columns (exclude metadata)
+                metadata_cols = ['Trade_ID', 'Email_Date', 'Email_From', 'Email_Subject',
+                               'Conversation_ID', 'Package_ID', 'ActivityType', 'Pattern_ID',
+                               'Source', 'Source_Line', 'Line_Index', 'Extraction_Method',
+                               'Table_Index', 'Row_Index']
+                entity_cols = [col for col in df.columns if col not in metadata_cols]
+                
+                if entity_cols:
+                    coverage_data = []
+                    for col in entity_cols:
+                        non_null = df[col].notna().sum()
+                        coverage_data.append({
+                            'Entity': col,
+                            'Non-Null Count': non_null,
+                            'Coverage %': (non_null / len(df)) * 100
+                        })
+                    
+                    coverage_df = pd.DataFrame(coverage_data)
+                    coverage_df = coverage_df.sort_values('Coverage %', ascending=False)
+                    
+                    fig = px.bar(
+                        coverage_df,
+                        x='Entity',
+                        y='Coverage %',
+                        title="Entity Coverage",
+                        color='Coverage %',
+                        color_continuous_scale='Blues'
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    
+                    st.dataframe(coverage_df, use_container_width=True)
+            else:
+                st.warning("⚠️ No data to visualize")
+    
+    # ========== TAB 4: EXPORT ==========
+    with tab4:
+        st.header("📁 Export Options")
+        
+        if st.session_state.extraction_results is None:
+            st.info("ℹ️ No data to export. Extract entities first.")
+        else:
+            results = st.session_state.extraction_results
+            df = results['dataframe']
+            
+            if not df.empty:
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.subheader("💾 Export to CSV")
+                    
+                    csv = df.to_csv(index=False).encode('utf-8')
+                    
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=csv,
+                        file_name=f"{st.session_state.email_data['trade_id']}_extraction.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                
+                with col2:
+                    st.subheader("📊 Export to Excel")
+                    
+                    # Create Excel file with multiple sheets
+                    from io import BytesIO
+                    output = BytesIO()
+                    
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        # Main data
+                        df.to_excel(writer, sheet_name='Extraction_Results', index=False)
+                        
+                        # Table data only
+                        if 'Extraction_Method' in df.columns:
+                            table_df = df[df['Extraction_Method'] == 'html_table']
+                            if not table_df.empty:
+                                table_df.to_excel(writer, sheet_name='Table_Data', index=False)
+                        
+                        # Statistics
+                        stats_data = {
+                            'Metric': ['Total Records', 'Matched', 'Unseen', 'Tables', 
+                                     'Conversations', 'Packages', 'Processing Time (s)'],
+                            'Value': [
+                                results['total_records'],
+                                results['matched_count'],
+                                results['unseen_count'],
+                                results['table_count'],
+                                results.get('conversation_count', 0),
+                                results.get('package_count', 0),
+                                f"{results['processing_time']:.2f}"
+                            ]
+                        }
+                        pd.DataFrame(stats_data).to_excel(writer, sheet_name='Statistics', index=False)
+                    
+                    excel_data = output.getvalue()
+                    
+                    st.download_button(
+                        label="📥 Download Excel",
+                        data=excel_data,
+                        file_name=f"{st.session_state.email_data['trade_id']}_extraction.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                
+                st.markdown("---")
+                
+                # Export configuration
+                st.subheader("⚙️ Export Configuration")
+                
+                export_cols = st.multiselect(
+                    "Select columns to export",
+                    options=list(df.columns),
+                    default=list(df.columns)
+                )
+                
+                if export_cols:
+                    filtered_export_df = df[export_cols]
+                    
+                    csv_filtered = filtered_export_df.to_csv(index=False).encode('utf-8')
+                    
+                    st.download_button(
+                        label="📥 Download Filtered CSV",
+                        data=csv_filtered,
+                        file_name=f"{st.session_state.email_data['trade_id']}_filtered.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+            else:
+                st.warning("⚠️ No data to export")
+
+
+# ============================================================================
+# EXTRACTION LOGIC (Simplified for Streamlit)
+# ============================================================================
+
+def run_extraction(email_data, entity_definitions, activity_keywords):
+    """
+    Run extraction with progress tracking
+    """
+    
+    start_time = time.time()
+    
+    # Initialize results
+    extraction_records = []
+    matched_count = 0
+    unseen_count = 0
+    table_count = 0
+    conversation_count = 0
+    package_count = 0
+    
+    # Extract from HTML if available
+    html_content = email_data.get('html_body', '')
+    
+    if html_content:
+        # Extract HTML tables
+        soup = BeautifulSoup(html_content, 'html.parser')
+        tables = soup.find_all('table')
+        table_count = len(tables)
+        
+        for table_idx, table in enumerate(tables, 1):
+            headers = [th.get_text(strip=True) for th in table.find('tr').find_all(['th', 'td'])] \
+                     if table.find('tr') else []
+            
+            rows = [[td.get_text(strip=True) for td in tr.find_all(['td', 'th'])] 
+                   for tr in table.find_all('tr')[1:]]
+            
+            for row_idx, row in enumerate(rows):
+                if len([item for item in row if item]) >= 2:
+                    record = {
+                        'Trade_ID': email_data['trade_id'],
+                        'Email_Date': email_data['date'],
+                        'Email_From': email_data['sender'],
+                        'Email_Subject': email_data['subject'],
+                        'Source': 'html_table',
+                        'Extraction_Method': 'html_table',
+                        'Table_Index': table_idx,
+                        'Row_Index': row_idx
+                    }
+                    
+                    for col_idx, header in enumerate(headers):
+                        if col_idx < len(row) and row[col_idx]:
+                            record[header] = row[col_idx]
+                    
+                    extraction_records.append(record)
+                    matched_count += 1
+        
+        # Remove tables and get text
+        for table in tables:
+            table.decompose()
+        
+        text_content = soup.get_text(separator='\n', strip=True)
+        email_lines = [line.strip() for line in text_content.splitlines() if line.strip()]
+    else:
+        # Use plain text
+        email_lines = [line.strip() for line in email_data['body'].splitlines() if line.strip()]
+    
+    # Simple line-by-line extraction (simplified for demo)
+    for line_idx, line in enumerate(email_lines):
+        # Check for conversation boundaries
+        if 'from:' in line.lower() or 'sent:' in line.lower():
+            conversation_count += 1
+        
+        # Check for package boundaries
+        if line.strip() in ['---', '==='] or any(kw in line.upper() for kw in activity_keywords):
+            package_count += 1
+        
+        # Simple pattern matching (you'd use your compiled patterns here)
+        # This is just a placeholder
+        unseen_count += 1
+    
+    # Create DataFrame
+    df = pd.DataFrame(extraction_records) if extraction_records else pd.DataFrame()
+    
+    processing_time = time.time() - start_time
+    
+    return {
+        'dataframe': df,
+        'total_records': len(extraction_records),
+        'matched_count': matched_count,
+        'unseen_count': unseen_count,
+        'table_count': table_count,
+        'conversation_count': conversation_count,
+        'package_count': package_count,
+        'processing_time': processing_time
+    }
+
+
+# ============================================================================
+# RUN APP
+# ============================================================================
+
+if __name__ == "__main__":
+    main()

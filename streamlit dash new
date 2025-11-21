@@ -1,0 +1,1646 @@
+"""
+Email Harvester - Streamlit Version
+Complete migration from Tkinter with enhanced visualizations and multi-email selection
+"""
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import os
+import json
+import re
+import logging
+import time
+from collections import defaultdict
+import glob
+import shutil
+from pathlib import Path
+
+# Email processing imports
+try:
+    from exchangelib import Credentials, Account, Configuration, DELEGATE
+    from exchangelib import EWSDateTime, EWSTimeZone
+    EXCHANGE_AVAILABLE = True
+except ImportError:
+    EXCHANGE_AVAILABLE = False
+    st.warning("⚠️ exchangelib not installed. Email connectivity disabled.")
+
+# Set page config
+st.set_page_config(
+    page_title="Email Harvester Pro",
+    page_icon="📧",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        padding: 1rem 0;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+    }
+    .stButton>button {
+        width: 100%;
+    }
+    .success-box {
+        padding: 1rem;
+        background-color: #d4edda;
+        border-left: 4px solid #28a745;
+        border-radius: 0.25rem;
+        margin: 1rem 0;
+    }
+    .warning-box {
+        padding: 1rem;
+        background-color: #fff3cd;
+        border-left: 4px solid #ffc107;
+        border-radius: 0.25rem;
+        margin: 1rem 0;
+    }
+    .error-box {
+        padding: 1rem;
+        background-color: #f8d7da;
+        border-left: 4px solid #dc3545;
+        border-radius: 0.25rem;
+        margin: 1rem 0;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
+
+def init_session_state():
+    """Initialize all session state variables"""
+    
+    # Email connection
+    if 'account' not in st.session_state:
+        st.session_state.account = None
+    if 'connected' not in st.session_state:
+        st.session_state.connected = False
+    
+    # Email data
+    if 'emails' not in st.session_state:
+        st.session_state.emails = []
+    if 'selected_emails' not in st.session_state:
+        st.session_state.selected_emails = []
+    if 'email_df' not in st.session_state:
+        st.session_state.email_df = pd.DataFrame()
+    
+    # Extraction results
+    if 'extraction_results' not in st.session_state:
+        st.session_state.extraction_results = []
+    if 'extraction_df' not in st.session_state:
+        st.session_state.extraction_df = pd.DataFrame()
+    if 'matched_count' not in st.session_state:
+        st.session_state.matched_count = 0
+    if 'unseen_count' not in st.session_state:
+        st.session_state.unseen_count = 0
+    if 'conversation_count' not in st.session_state:
+        st.session_state.conversation_count = 0
+    if 'table_count' not in st.session_state:
+        st.session_state.table_count = 0
+    
+    # Configuration
+    if 'config' not in st.session_state:
+        st.session_state.config = {
+            'entity_definitions': {},
+            'selected_columns': [],
+            'gazetteer_data': {},
+            'static_headers': []
+        }
+    
+    # Pattern cache
+    if 'compiled_patterns' not in st.session_state:
+        st.session_state.compiled_patterns = {}
+    
+    # RAG processor
+    if 'rag_extractor' not in st.session_state:
+        st.session_state.rag_extractor = None
+    
+    # Paths
+    if 'temp_path' not in st.session_state:
+        st.session_state.temp_path = "./temp_extraction"
+    if 'out_path' not in st.session_state:
+        st.session_state.out_path = "./output"
+    
+    # Create directories
+    os.makedirs(st.session_state.temp_path, exist_ok=True)
+    os.makedirs(st.session_state.out_path, exist_ok=True)
+
+
+# ============================================================================
+# EMAIL CONNECTION
+# ============================================================================
+
+def connect_to_email(email, password, server):
+    """Connect to Exchange email server"""
+    try:
+        credentials = Credentials(email, password)
+        config = Configuration(server=server, credentials=credentials)
+        account = Account(
+            primary_smtp_address=email,
+            config=config,
+            autodiscover=False,
+            access_type=DELEGATE
+        )
+        return account, True
+    except Exception as e:
+        logger.error(f"Email connection error: {str(e)}")
+        return None, False
+
+
+def fetch_emails(account, folder_name, start_date, end_date, max_emails=1000):
+    """Fetch emails from specified folder and date range"""
+    try:
+        # Get folder
+        if folder_name.lower() == 'inbox':
+            folder = account.inbox
+        else:
+            folder = account.inbox / folder_name
+        
+        # Set timezone
+        tz = EWSTimeZone.timezone('UTC')
+        start_dt = tz.localize(EWSDateTime(start_date.year, start_date.month, start_date.day))
+        end_dt = tz.localize(EWSDateTime(end_date.year, end_date.month, end_date.day, 23, 59, 59))
+        
+        # Fetch emails
+        emails = []
+        items = folder.filter(datetime_received__range=(start_dt, end_dt)).order_by('-datetime_received')
+        
+        for item in items[:max_emails]:
+            try:
+                email_data = {
+                    'subject': item.subject or '',
+                    'sender': item.sender.email_address if item.sender else '',
+                    'date': item.datetime_received,
+                    'body': item.body or '',
+                    'text_body': item.text_body or '',
+                    'conversation_id': item.conversation_id.id if item.conversation_id else '',
+                    'item_id': item.id,
+                    'has_attachments': item.has_attachments,
+                    'importance': str(item.importance) if hasattr(item, 'importance') else 'Normal'
+                }
+                emails.append(email_data)
+            except Exception as e:
+                logger.warning(f"Error processing email: {str(e)}")
+                continue
+        
+        return emails
+    
+    except Exception as e:
+        logger.error(f"Error fetching emails: {str(e)}")
+        return []
+
+
+# ============================================================================
+# PATTERN MATCHING & EXTRACTION
+# ============================================================================
+
+def compile_patterns(entity_definitions):
+    """Compile regex patterns for faster matching"""
+    compiled = {}
+    
+    for entity_name, entity_config in entity_definitions.items():
+        if 'patterns' in entity_config:
+            patterns = entity_config['patterns']
+            compiled[entity_name] = []
+            
+            for pattern_config in patterns:
+                try:
+                    pattern = pattern_config.get('pattern', '')
+                    regex = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+                    compiled[entity_name].append({
+                        'regex': regex,
+                        'config': pattern_config
+                    })
+                except Exception as e:
+                    logger.error(f"Error compiling pattern for {entity_name}: {str(e)}")
+    
+    return compiled
+
+
+def extract_with_patterns(text, compiled_patterns, entity_names):
+    """Extract entities using compiled regex patterns"""
+    results = {}
+    
+    for entity_name in entity_names:
+        if entity_name not in compiled_patterns:
+            continue
+        
+        matches = []
+        for pattern_obj in compiled_patterns[entity_name]:
+            regex = pattern_obj['regex']
+            config = pattern_obj['config']
+            
+            for match in regex.finditer(text):
+                match_text = match.group(0)
+                matches.append({
+                    'text': match_text,
+                    'start': match.start(),
+                    'end': match.end(),
+                    'pattern_id': config.get('id', 'unknown')
+                })
+        
+        results[entity_name] = matches
+    
+    return results
+
+
+def extract_with_gazetteer(text, gazetteer_data, entity_names):
+    """Extract entities using gazetteer (dictionary lookup)"""
+    results = {}
+    
+    for entity_name in entity_names:
+        if entity_name not in gazetteer_data:
+            continue
+        
+        matches = []
+        terms = gazetteer_data[entity_name]
+        
+        for term in terms:
+            # Case-insensitive search
+            pattern = re.compile(re.escape(term), re.IGNORECASE)
+            for match in pattern.finditer(text):
+                matches.append({
+                    'text': match.group(0),
+                    'start': match.start(),
+                    'end': match.end(),
+                    'gazetteer_term': term
+                })
+        
+        results[entity_name] = matches
+    
+    return results
+
+
+def detect_text_tables(lines):
+    """
+    Detect ASCII/text tables in email body
+    Returns list of table info dictionaries
+    """
+    tables = []
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i]
+        
+        # Look for table headers (multiple capitalized words separated by spaces/tabs)
+        if looks_like_table_header(line):
+            # Check if next line is a separator
+            if i + 1 < len(lines) and is_table_separator(lines[i + 1]):
+                # Found a table!
+                start_line = i
+                table_lines = [line, lines[i + 1]]  # Header + separator
+                
+                # Collect data rows
+                j = i + 2
+                while j < len(lines):
+                    data_line = lines[j]
+                    
+                    # Stop if we hit a blank line or non-table content
+                    if not data_line.strip():
+                        break
+                    
+                    if not looks_like_table_row(data_line, line):
+                        break
+                    
+                    table_lines.append(data_line)
+                    j += 1
+                
+                # Only consider it a table if we have at least 1 data row
+                if len(table_lines) > 2:
+                    tables.append({
+                        'start_line': start_line,
+                        'end_line': j - 1,
+                        'header_line': start_line,
+                        'separator_line': start_line + 1,
+                        'data_start': start_line + 2,
+                        'lines': table_lines,
+                        'header': line
+                    })
+                    
+                    logger.info(f"Detected text table from line {start_line} to {j-1}")
+                    i = j
+                    continue
+        
+        i += 1
+    
+    return tables
+
+
+def looks_like_table_header(line):
+    """Check if line looks like a table header"""
+    if not line.strip():
+        return False
+    
+    # Split by multiple spaces or tabs
+    parts = re.split(r'\s{2,}|\t+', line.strip())
+    
+    # Should have at least 2 columns
+    if len(parts) < 2:
+        return False
+    
+    # Most parts should start with capital letter or be common headers
+    common_headers = ['customer', 'amount', 'currency', 'date', 'status', 'id', 'type',
+                     'price', 'quantity', 'total', 'name', 'value', 'description']
+    
+    capital_count = sum(1 for part in parts if part and (part[0].isupper() or part.lower() in common_headers))
+    
+    return capital_count >= len(parts) * 0.6  # At least 60% look like headers
+
+
+def is_table_separator(line):
+    """Check if line is a table separator (dashes, equals, or underscores)"""
+    if not line.strip():
+        return False
+    
+    stripped = line.strip()
+    separator_chars = ['-', '=', '_', '─']
+    
+    # At least 80% of the line should be separator chars
+    separator_count = sum(1 for char in stripped if char in separator_chars)
+    
+    return separator_count >= len(stripped) * 0.8 and len(stripped) >= 5
+
+
+def looks_like_table_row(line, header):
+    """Check if line looks like a data row matching the header structure"""
+    if not line.strip():
+        return False
+    
+    # Count columns in header
+    header_parts = re.split(r'\s{2,}|\t+', header.strip())
+    line_parts = re.split(r'\s{2,}|\t+', line.strip())
+    
+    # Should have similar number of columns (within 1)
+    return abs(len(line_parts) - len(header_parts)) <= 1
+
+
+def extract_from_text_table(table_info, all_lines, email_data, conversation_id, package_id, activity):
+    """Extract data from detected text table"""
+    records = []
+    
+    header_line = all_lines[table_info['header_line']].strip()
+    
+    # Parse header columns
+    columns = re.split(r'\s{2,}|\t+', header_line)
+    columns = [col.strip() for col in columns if col.strip()]
+    
+    logger.info(f"Text table columns: {columns}")
+    
+    # Extract data rows
+    for i in range(table_info['data_start'], table_info['end_line'] + 1):
+        if i >= len(all_lines):
+            break
+        
+        data_line = all_lines[i].strip()
+        if not data_line:
+            continue
+        
+        # Parse data values (aligned with columns)
+        values = re.split(r'\s{2,}|\t+', data_line)
+        values = [val.strip() for val in values if val.strip()]
+        
+        # Create record
+        record = {
+            'Trade_ID': email_data.get('trade_id', ''),
+            'Email_Date': email_data.get('date', ''),
+            'Email_From': email_data.get('sender', ''),
+            'Email_Subject': email_data.get('subject', ''),
+            'Conversation_ID': conversation_id,
+            'Package_ID': package_id,
+            'Source_Line': i,
+            'Pattern_ID': 'TEXT_TABLE',
+            'Line_Index': i,
+            'Extraction_Method': 'text_table'
+        }
+        
+        if activity:
+            record['ActivityType'] = activity
+        
+        # Map values to columns
+        for col_idx, col_name in enumerate(columns):
+            if col_idx < len(values):
+                record[col_name] = values[col_idx]
+        
+        records.append(record)
+        logger.debug(f"Extracted text table row: {record}")
+    
+    logger.info(f"Extracted {len(records)} records from text table")
+    return records
+
+
+def extract_from_html_body(email_data, compiled_patterns_map, entity_names):
+    """Extract entities from HTML body using patterns"""
+    records = []
+    
+    body = email_data.get('body', '')
+    if not body:
+        return records
+    
+    # Extract using patterns
+    pattern_matches = extract_with_patterns(body, compiled_patterns_map, entity_names)
+    
+    for entity_name, matches in pattern_matches.items():
+        for match in matches:
+            record = {
+                'Trade_ID': email_data.get('trade_id', ''),
+                'Email_Date': email_data.get('date', ''),
+                'Email_From': email_data.get('sender', ''),
+                'Email_Subject': email_data.get('subject', ''),
+                'Entity': entity_name,
+                'Value': match['text'],
+                'Pattern_ID': match.get('pattern_id', 'unknown'),
+                'Extraction_Method': 'html_pattern'
+            }
+            records.append(record)
+    
+    return records
+
+
+def is_conversation_boundary(line, line_idx, email_lines):
+    """Detect conversation boundaries in email chains"""
+    boundary_patterns = [
+        r'^From:.*',
+        r'^Sent:.*',
+        r'^To:.*',
+        r'^Subject:.*',
+        r'^-----Original Message-----',
+        r'^On.*wrote:',
+        r'^________________________________'
+    ]
+    
+    for pattern in boundary_patterns:
+        if re.match(pattern, line, re.IGNORECASE):
+            return True
+    
+    return False
+
+
+def is_package_boundary(line, prev_line):
+    """Detect package boundaries (deal/trade groupings)"""
+    package_indicators = [
+        r'Deal\s*#?\s*\d+',
+        r'Trade\s*#?\s*\d+',
+        r'Package\s*#?\s*\d+',
+        r'Transaction\s*#?\s*\d+'
+    ]
+    
+    for pattern in package_indicators:
+        if re.search(pattern, line, re.IGNORECASE):
+            return True
+    
+    return False
+
+
+# ============================================================================
+# MAIN EXTRACTION ORCHESTRATION
+# ============================================================================
+
+def extract_and_export(selected_emails, config, progress_callback=None):
+    """
+    Main extraction function - processes multiple emails
+    Returns extraction results and statistics
+    """
+    all_records = []
+    matched_count = 0
+    unseen_count = 0
+    conversation_count = 0
+    table_count = 0
+    
+    entity_names = list(config.get('entity_definitions', {}).keys())
+    compiled_patterns = compile_patterns(config.get('entity_definitions', {}))
+    gazetteer_data = config.get('gazetteer_data', {})
+    
+    total_emails = len(selected_emails)
+    
+    for email_idx, email_data in enumerate(selected_emails):
+        try:
+            if progress_callback:
+                progress_callback(email_idx + 1, total_emails, f"Processing email {email_idx + 1}/{total_emails}")
+            
+            # Extract trade ID from subject
+            subject = email_data.get('subject', '')
+            trade_id_match = re.search(r'([A-Z0-9]{8,})', subject)
+            trade_id = trade_id_match.group(1) if trade_id_match else f"EMAIL_{email_idx}"
+            email_data['trade_id'] = trade_id
+            
+            # Split email into lines
+            text_body = email_data.get('text_body', '') or email_data.get('body', '')
+            email_lines = text_body.split('\n')
+            
+            # Detect conversations
+            conversation_id = email_data.get('conversation_id', f'CONV_{email_idx}')
+            package_id = f'PKG_{email_idx}_1'
+            
+            # Detect text tables
+            tables = detect_text_tables(email_lines)
+            table_count += len(tables)
+            
+            # Extract from tables
+            for table in tables:
+                table_records = extract_from_text_table(
+                    table, email_lines, email_data, 
+                    conversation_id, package_id, None
+                )
+                all_records.extend(table_records)
+                matched_count += len(table_records)
+            
+            # Extract from HTML body using patterns
+            html_records = extract_from_html_body(email_data, compiled_patterns, entity_names)
+            all_records.extend(html_records)
+            matched_count += len(html_records)
+            
+            # Extract using gazetteer
+            if gazetteer_data:
+                gazetteer_matches = extract_with_gazetteer(text_body, gazetteer_data, entity_names)
+                for entity_name, matches in gazetteer_matches.items():
+                    for match in matches:
+                        record = {
+                            'Trade_ID': trade_id,
+                            'Email_Date': email_data.get('date', ''),
+                            'Email_From': email_data.get('sender', ''),
+                            'Email_Subject': subject,
+                            'Entity': entity_name,
+                            'Value': match['text'],
+                            'Extraction_Method': 'gazetteer'
+                        }
+                        all_records.append(record)
+                        matched_count += 1
+            
+            conversation_count += 1
+            
+        except Exception as e:
+            logger.error(f"Error processing email {email_idx}: {str(e)}")
+            continue
+    
+    # Create DataFrame
+    if all_records:
+        df = pd.DataFrame(all_records)
+    else:
+        df = pd.DataFrame()
+    
+    stats = {
+        'total_records': len(all_records),
+        'matched_count': matched_count,
+        'unseen_count': unseen_count,
+        'conversation_count': conversation_count,
+        'table_count': table_count,
+        'emails_processed': total_emails
+    }
+    
+    return df, stats
+
+
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
+
+def create_extraction_summary_chart(stats):
+    """Create summary metrics visualization"""
+    fig = go.Figure()
+    
+    categories = ['Matched', 'Conversations', 'Tables', 'Emails']
+    values = [
+        stats.get('matched_count', 0),
+        stats.get('conversation_count', 0),
+        stats.get('table_count', 0),
+        stats.get('emails_processed', 0)
+    ]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    
+    fig.add_trace(go.Bar(
+        x=categories,
+        y=values,
+        marker_color=colors,
+        text=values,
+        textposition='outside'
+    ))
+    
+    fig.update_layout(
+        title="Extraction Summary",
+        xaxis_title="Category",
+        yaxis_title="Count",
+        height=400,
+        showlegend=False
+    )
+    
+    return fig
+
+
+def create_entity_distribution_chart(df):
+    """Create entity type distribution pie chart"""
+    if 'Entity' not in df.columns or df.empty:
+        return None
+    
+    entity_counts = df['Entity'].value_counts()
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=entity_counts.index,
+        values=entity_counts.values,
+        hole=0.3
+    )])
+    
+    fig.update_layout(
+        title="Entity Type Distribution",
+        height=400
+    )
+    
+    return fig
+
+
+def create_extraction_timeline(df):
+    """Create timeline of extractions by date"""
+    if 'Email_Date' not in df.columns or df.empty:
+        return None
+    
+    df_copy = df.copy()
+    df_copy['Date'] = pd.to_datetime(df_copy['Email_Date']).dt.date
+    timeline_data = df_copy.groupby('Date').size().reset_index(name='Count')
+    
+    fig = px.line(
+        timeline_data,
+        x='Date',
+        y='Count',
+        title='Extraction Timeline',
+        markers=True
+    )
+    
+    fig.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Number of Extractions",
+        height=400
+    )
+    
+    return fig
+
+
+def create_sender_analysis(df):
+    """Create sender-based analysis"""
+    if 'Email_From' not in df.columns or df.empty:
+        return None
+    
+    sender_counts = df['Email_From'].value_counts().head(10)
+    
+    fig = go.Figure(data=[go.Bar(
+        x=sender_counts.values,
+        y=sender_counts.index,
+        orientation='h',
+        marker_color='#1f77b4'
+    )])
+    
+    fig.update_layout(
+        title="Top 10 Senders by Extractions",
+        xaxis_title="Number of Extractions",
+        yaxis_title="Sender",
+        height=400
+    )
+    
+    return fig
+
+
+def create_pattern_effectiveness_chart(df):
+    """Analyze pattern matching effectiveness"""
+    if 'Pattern_ID' not in df.columns or df.empty:
+        return None
+    
+    pattern_counts = df['Pattern_ID'].value_counts().head(10)
+    
+    fig = go.Figure(data=[go.Bar(
+        x=pattern_counts.index,
+        y=pattern_counts.values,
+        marker_color='#2ca02c'
+    )])
+    
+    fig.update_layout(
+        title="Top 10 Pattern Matches",
+        xaxis_title="Pattern ID",
+        yaxis_title="Match Count",
+        height=400
+    )
+    
+    return fig
+
+
+def create_extraction_method_comparison(df):
+    """Compare extraction methods"""
+    if 'Extraction_Method' not in df.columns or df.empty:
+        return None
+    
+    method_counts = df['Extraction_Method'].value_counts()
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=method_counts.index,
+        values=method_counts.values,
+        hole=0.3
+    )])
+    
+    fig.update_layout(
+        title="Extraction Method Comparison",
+        height=400
+    )
+    
+    return fig
+
+
+# ============================================================================
+# CONFIGURATION MANAGEMENT
+# ============================================================================
+
+def load_config_from_file(file_path):
+    """Load configuration from JSON file"""
+    try:
+        with open(file_path, 'r') as f:
+            config = json.load(f)
+        return config, True
+    except Exception as e:
+        logger.error(f"Error loading config: {str(e)}")
+        return {}, False
+
+
+def save_config_to_file(config, file_path):
+    """Save configuration to JSON file"""
+    try:
+        with open(file_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Error saving config: {str(e)}")
+        return False
+
+
+# ============================================================================
+# EXPORT FUNCTIONS
+# ============================================================================
+
+def export_to_csv(df, filename):
+    """Export DataFrame to CSV"""
+    try:
+        output_path = os.path.join(st.session_state.out_path, filename)
+        df.to_csv(output_path, index=False)
+        return output_path, True
+    except Exception as e:
+        logger.error(f"Error exporting to CSV: {str(e)}")
+        return None, False
+
+
+def export_to_excel(df, filename, sheet_name='Extractions'):
+    """Export DataFrame to Excel"""
+    try:
+        output_path = os.path.join(st.session_state.out_path, filename)
+        df.to_excel(output_path, sheet_name=sheet_name, index=False)
+        return output_path, True
+    except Exception as e:
+        logger.error(f"Error exporting to Excel: {str(e)}")
+        return None, False
+
+
+def create_consolidated_report(df, stats, filename):
+    """Create consolidated Excel report with multiple sheets"""
+    try:
+        output_path = os.path.join(st.session_state.out_path, filename)
+        
+        with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+            # Main data sheet
+            df.to_excel(writer, sheet_name='Extractions', index=False)
+            
+            # Summary sheet
+            summary_data = {
+                'Metric': list(stats.keys()),
+                'Value': list(stats.values())
+            }
+            summary_df = pd.DataFrame(summary_data)
+            summary_df.to_excel(writer, sheet_name='Summary', index=False)
+            
+            # Entity summary
+            if 'Entity' in df.columns and not df.empty:
+                entity_summary = df['Entity'].value_counts().reset_index()
+                entity_summary.columns = ['Entity', 'Count']
+                entity_summary.to_excel(writer, sheet_name='Entity_Summary', index=False)
+            
+            # Pattern summary
+            if 'Pattern_ID' in df.columns and not df.empty:
+                pattern_summary = df['Pattern_ID'].value_counts().reset_index()
+                pattern_summary.columns = ['Pattern_ID', 'Count']
+                pattern_summary.to_excel(writer, sheet_name='Pattern_Summary', index=False)
+        
+        return output_path, True
+    
+    except Exception as e:
+        logger.error(f"Error creating consolidated report: {str(e)}")
+        return None, False
+
+
+# ============================================================================
+# STREAMLIT UI COMPONENTS
+# ============================================================================
+
+def render_sidebar():
+    """Render sidebar with configuration options"""
+    with st.sidebar:
+        st.image("https://img.icons8.com/fluency/96/000000/mail.png", width=80)
+        st.title("📧 Email Harvester")
+        st.markdown("---")
+        
+        # Navigation
+        page = st.radio(
+            "Navigation",
+            ["🔌 Connect", "📥 Fetch Emails", "🔍 Extract", "📊 Visualize", "⚙️ Settings"],
+            key="nav_radio"
+        )
+        
+        st.markdown("---")
+        
+        # Connection status
+        if st.session_state.connected:
+            st.success("✅ Connected to email")
+        else:
+            st.warning("⚠️ Not connected")
+        
+        # Quick stats
+        if st.session_state.extraction_df is not None and not st.session_state.extraction_df.empty:
+            st.markdown("### 📈 Quick Stats")
+            st.metric("Total Extractions", len(st.session_state.extraction_df))
+            st.metric("Matched Patterns", st.session_state.matched_count)
+            st.metric("Conversations", st.session_state.conversation_count)
+        
+        st.markdown("---")
+        st.caption("© 2025 Email Harvester Pro")
+        
+        return page
+
+
+def render_connect_page():
+    """Render email connection page"""
+    st.markdown('<h1 class="main-header">🔌 Connect to Email</h1>', unsafe_allow_html=True)
+    
+    if not EXCHANGE_AVAILABLE:
+        st.error("❌ Exchange library not available. Please install exchangelib: `pip install exchangelib`")
+        return
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("### Email Configuration")
+        
+        email = st.text_input("Email Address", value="", key="email_input")
+        password = st.text_input("Password", type="password", key="password_input")
+        server = st.text_input("Exchange Server", value="outlook.office365.com", key="server_input")
+        
+        st.markdown("---")
+        
+        col_a, col_b, col_c = st.columns(3)
+        
+        with col_a:
+            if st.button("🔌 Connect", use_container_width=True):
+                if not email or not password:
+                    st.error("Please provide email and password")
+                else:
+                    with st.spinner("Connecting to email server..."):
+                        account, success = connect_to_email(email, password, server)
+                        
+                        if success:
+                            st.session_state.account = account
+                            st.session_state.connected = True
+                            st.success("✅ Successfully connected!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Connection failed. Please check credentials.")
+        
+        with col_b:
+            if st.button("🔄 Disconnect", use_container_width=True, disabled=not st.session_state.connected):
+                st.session_state.account = None
+                st.session_state.connected = False
+                st.success("Disconnected from email")
+                st.rerun()
+        
+        with col_c:
+            if st.button("🧪 Test Connection", use_container_width=True, disabled=not st.session_state.connected):
+                try:
+                    # Test by accessing inbox
+                    inbox = st.session_state.account.inbox
+                    st.success(f"✅ Connection OK! Inbox accessible.")
+                except Exception as e:
+                    st.error(f"❌ Connection test failed: {str(e)}")
+    
+    with col2:
+        st.markdown("### 📝 Instructions")
+        st.info("""
+        1. Enter your email credentials
+        2. Specify Exchange server
+        3. Click Connect
+        4. Wait for confirmation
+        
+        **Note:** Ensure you have proper access rights to the mailbox.
+        """)
+        
+        if st.session_state.connected:
+            st.success("""
+            ✅ **Connected!**
+            
+            You can now:
+            - Fetch emails
+            - Extract entities
+            - Generate reports
+            """)
+
+
+def render_fetch_emails_page():
+    """Render email fetching page"""
+    st.markdown('<h1 class="main-header">📥 Fetch Emails</h1>', unsafe_allow_html=True)
+    
+    if not st.session_state.connected:
+        st.warning("⚠️ Please connect to email first (Connect tab)")
+        return
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("### Fetch Configuration")
+        
+        folder_name = st.text_input("Folder Name", value="Inbox", key="folder_name_input")
+        
+        col_date1, col_date2 = st.columns(2)
+        with col_date1:
+            start_date = st.date_input(
+                "Start Date",
+                value=datetime.now() - timedelta(days=7),
+                key="start_date_input"
+            )
+        with col_date2:
+            end_date = st.date_input(
+                "End Date",
+                value=datetime.now(),
+                key="end_date_input"
+            )
+        
+        max_emails = st.number_input(
+            "Maximum Emails to Fetch",
+            min_value=1,
+            max_value=10000,
+            value=100,
+            key="max_emails_input"
+        )
+        
+        st.markdown("---")
+        
+        if st.button("📥 Fetch Emails", use_container_width=True, type="primary"):
+            with st.spinner(f"Fetching emails from {folder_name}..."):
+                emails = fetch_emails(
+                    st.session_state.account,
+                    folder_name,
+                    start_date,
+                    end_date,
+                    max_emails
+                )
+                
+                if emails:
+                    st.session_state.emails = emails
+                    
+                    # Create DataFrame for display
+                    email_display_data = []
+                    for idx, email in enumerate(emails):
+                        email_display_data.append({
+                            'Index': idx,
+                            'Date': email['date'].strftime('%Y-%m-%d %H:%M') if email['date'] else '',
+                            'From': email['sender'],
+                            'Subject': email['subject'][:50] + '...' if len(email['subject']) > 50 else email['subject'],
+                            'Has Attachments': '📎' if email['has_attachments'] else '',
+                            'Importance': email['importance']
+                        })
+                    
+                    st.session_state.email_df = pd.DataFrame(email_display_data)
+                    st.success(f"✅ Fetched {len(emails)} emails successfully!")
+                    st.rerun()
+                else:
+                    st.warning("No emails found in the specified range")
+    
+    with col2:
+        st.markdown("### 📊 Fetch Statistics")
+        if st.session_state.emails:
+            st.metric("Total Emails Fetched", len(st.session_state.emails))
+            
+            # Calculate some stats
+            with_attachments = sum(1 for e in st.session_state.emails if e['has_attachments'])
+            st.metric("Emails with Attachments", with_attachments)
+            
+            unique_senders = len(set(e['sender'] for e in st.session_state.emails))
+            st.metric("Unique Senders", unique_senders)
+        else:
+            st.info("No emails fetched yet")
+    
+    # Display fetched emails
+    if not st.session_state.email_df.empty:
+        st.markdown("---")
+        st.markdown("### 📧 Fetched Emails")
+        
+        # Multi-select emails
+        st.markdown("**Select emails to extract:**")
+        
+        col_select1, col_select2, col_select3 = st.columns(3)
+        with col_select1:
+            if st.button("✅ Select All", use_container_width=True):
+                st.session_state.selected_emails = list(range(len(st.session_state.emails)))
+                st.rerun()
+        with col_select2:
+            if st.button("❌ Clear Selection", use_container_width=True):
+                st.session_state.selected_emails = []
+                st.rerun()
+        with col_select3:
+            st.info(f"Selected: {len(st.session_state.selected_emails)} emails")
+        
+        # Display with checkboxes
+        for idx, row in st.session_state.email_df.iterrows():
+            col_check, col_content = st.columns([1, 20])
+            
+            with col_check:
+                is_selected = idx in st.session_state.selected_emails
+                if st.checkbox("", value=is_selected, key=f"email_check_{idx}"):
+                    if idx not in st.session_state.selected_emails:
+                        st.session_state.selected_emails.append(idx)
+                else:
+                    if idx in st.session_state.selected_emails:
+                        st.session_state.selected_emails.remove(idx)
+            
+            with col_content:
+                with st.expander(f"📧 {row['Subject']} - {row['From']} ({row['Date']})"):
+                    email = st.session_state.emails[idx]
+                    st.write(f"**From:** {email['sender']}")
+                    st.write(f"**Date:** {email['date']}")
+                    st.write(f"**Subject:** {email['subject']}")
+                    st.write(f"**Conversation ID:** {email['conversation_id'][:20]}...")
+                    st.write("**Body Preview:**")
+                    body_preview = email['text_body'][:500] if email['text_body'] else email['body'][:500]
+                    st.text_area("", body_preview, height=150, key=f"body_preview_{idx}", disabled=True)
+
+
+def render_extract_page():
+    """Render extraction page"""
+    st.markdown('<h1 class="main-header">🔍 Extract Entities</h1>', unsafe_allow_html=True)
+    
+    if not st.session_state.selected_emails:
+        st.warning("⚠️ Please select emails to extract from (Fetch Emails tab)")
+        return
+    
+    st.info(f"📧 {len(st.session_state.selected_emails)} emails selected for extraction")
+    
+    # Configuration
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        st.markdown("### Configuration")
+        
+        # Upload or edit configuration
+        config_option = st.radio(
+            "Configuration Source",
+            ["Upload Config File", "Use Session Config", "Create New"],
+            key="config_option"
+        )
+        
+        if config_option == "Upload Config File":
+            uploaded_file = st.file_uploader("Upload JSON Configuration", type=['json'])
+            if uploaded_file:
+                config_data = json.load(uploaded_file)
+                st.session_state.config = config_data
+                st.success("✅ Configuration loaded")
+        
+        elif config_option == "Create New":
+            st.markdown("#### Entity Definitions")
+            entity_json = st.text_area(
+                "Paste entity definitions JSON",
+                height=200,
+                value=json.dumps(st.session_state.config.get('entity_definitions', {}), indent=2)
+            )
+            try:
+                entity_defs = json.loads(entity_json)
+                st.session_state.config['entity_definitions'] = entity_defs
+            except:
+                st.error("Invalid JSON format")
+        
+        # Show current config summary
+        if st.session_state.config.get('entity_definitions'):
+            with st.expander("📋 Current Configuration Summary"):
+                entity_defs = st.session_state.config['entity_definitions']
+                st.write(f"**Entities Configured:** {len(entity_defs)}")
+                for entity_name in entity_defs.keys():
+                    st.write(f"- {entity_name}")
+    
+    with col2:
+        st.markdown("### Actions")
+        
+        if st.button("🔍 Start Extraction", use_container_width=True, type="primary"):
+            if not st.session_state.config.get('entity_definitions'):
+                st.error("Please configure entity definitions first")
+            else:
+                # Get selected emails
+                selected_email_data = [st.session_state.emails[idx] for idx in st.session_state.selected_emails]
+                
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                def update_progress(current, total, message):
+                    progress = current / total
+                    progress_bar.progress(progress)
+                    status_text.text(message)
+                
+                # Extract
+                start_time = time.time()
+                with st.spinner("Extracting entities..."):
+                    df, stats = extract_and_export(
+                        selected_email_data,
+                        st.session_state.config,
+                        progress_callback=update_progress
+                    )
+                
+                end_time = time.time()
+                elapsed = end_time - start_time
+                
+                # Store results
+                st.session_state.extraction_df = df
+                st.session_state.extraction_results = df.to_dict('records') if not df.empty else []
+                st.session_state.matched_count = stats['matched_count']
+                st.session_state.unseen_count = stats['unseen_count']
+                st.session_state.conversation_count = stats['conversation_count']
+                st.session_state.table_count = stats['table_count']
+                
+                # Success message
+                progress_bar.progress(1.0)
+                status_text.text("Extraction complete!")
+                
+                st.success(f"""
+                ✅ **Extraction Complete!**
+                
+                - **Time Taken:** {elapsed:.2f} seconds
+                - **Emails Processed:** {stats['emails_processed']}
+                - **Total Records:** {stats['total_records']}
+                - **Matched:** {stats['matched_count']}
+                - **Conversations:** {stats['conversation_count']}
+                - **Tables Found:** {stats['table_count']}
+                """)
+                
+                time.sleep(1)
+                st.rerun()
+        
+        st.markdown("---")
+        
+        if st.button("💾 Save Config", use_container_width=True):
+            filename = f"config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filepath = os.path.join(st.session_state.out_path, filename)
+            success = save_config_to_file(st.session_state.config, filepath)
+            if success:
+                st.success(f"Config saved: {filename}")
+        
+        if st.button("🗑️ Clear Results", use_container_width=True):
+            st.session_state.extraction_df = pd.DataFrame()
+            st.session_state.extraction_results = []
+            st.session_state.matched_count = 0
+            st.session_state.unseen_count = 0
+            st.success("Results cleared")
+            st.rerun()
+    
+    # Display results
+    if not st.session_state.extraction_df.empty:
+        st.markdown("---")
+        st.markdown("### 📊 Extraction Results")
+        
+        # Metrics
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Total Records", len(st.session_state.extraction_df))
+        col_m2.metric("Matched", st.session_state.matched_count)
+        col_m3.metric("Conversations", st.session_state.conversation_count)
+        col_m4.metric("Tables", st.session_state.table_count)
+        
+        # Display DataFrame
+        st.dataframe(st.session_state.extraction_df, use_container_width=True, height=400)
+        
+        # Export options
+        st.markdown("### 💾 Export Options")
+        col_e1, col_e2, col_e3 = st.columns(3)
+        
+        with col_e1:
+            if st.button("📄 Export CSV", use_container_width=True):
+                filename = f"extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+                filepath, success = export_to_csv(st.session_state.extraction_df, filename)
+                if success:
+                    with open(filepath, 'rb') as f:
+                        st.download_button(
+                            "⬇️ Download CSV",
+                            f,
+                            file_name=filename,
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+        
+        with col_e2:
+            if st.button("📊 Export Excel", use_container_width=True):
+                filename = f"extraction_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                filepath, success = export_to_excel(st.session_state.extraction_df, filename)
+                if success:
+                    with open(filepath, 'rb') as f:
+                        st.download_button(
+                            "⬇️ Download Excel",
+                            f,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+        
+        with col_e3:
+            if st.button("📋 Consolidated Report", use_container_width=True):
+                filename = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                stats = {
+                    'total_records': len(st.session_state.extraction_df),
+                    'matched_count': st.session_state.matched_count,
+                    'unseen_count': st.session_state.unseen_count,
+                    'conversation_count': st.session_state.conversation_count,
+                    'table_count': st.session_state.table_count
+                }
+                filepath, success = create_consolidated_report(
+                    st.session_state.extraction_df, stats, filename
+                )
+                if success:
+                    with open(filepath, 'rb') as f:
+                        st.download_button(
+                            "⬇️ Download Report",
+                            f,
+                            file_name=filename,
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True
+                        )
+
+
+def render_visualize_page():
+    """Render visualization page with insightful charts"""
+    st.markdown('<h1 class="main-header">📊 Visualizations & Analytics</h1>', unsafe_allow_html=True)
+    
+    if st.session_state.extraction_df.empty:
+        st.warning("⚠️ No extraction data available. Please run extraction first.")
+        return
+    
+    df = st.session_state.extraction_df
+    
+    # Summary statistics
+    st.markdown("### 📈 Summary Statistics")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    col1.metric("Total Records", len(df))
+    col2.metric("Matched Patterns", st.session_state.matched_count)
+    col3.metric("Conversations", st.session_state.conversation_count)
+    col4.metric("Tables Found", st.session_state.table_count)
+    
+    if 'Entity' in df.columns:
+        unique_entities = df['Entity'].nunique()
+        col5.metric("Unique Entities", unique_entities)
+    
+    st.markdown("---")
+    
+    # Visualization tabs
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📊 Overview",
+        "🎯 Entity Analysis",
+        "📅 Timeline",
+        "👥 Sender Analysis",
+        "🔍 Pattern Analysis"
+    ])
+    
+    with tab1:
+        st.markdown("### Extraction Overview")
+        
+        col_v1, col_v2 = st.columns(2)
+        
+        with col_v1:
+            # Summary bar chart
+            stats = {
+                'matched_count': st.session_state.matched_count,
+                'conversation_count': st.session_state.conversation_count,
+                'table_count': st.session_state.table_count,
+                'emails_processed': len(st.session_state.selected_emails)
+            }
+            fig = create_extraction_summary_chart(stats)
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col_v2:
+            # Extraction method comparison
+            fig = create_extraction_method_comparison(df)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("Extraction method data not available")
+    
+    with tab2:
+        st.markdown("### Entity Type Analysis")
+        
+        if 'Entity' in df.columns:
+            col_e1, col_e2 = st.columns(2)
+            
+            with col_e1:
+                # Entity distribution pie chart
+                fig = create_entity_distribution_chart(df)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with col_e2:
+                # Entity count table
+                st.markdown("#### Entity Counts")
+                entity_counts = df['Entity'].value_counts().reset_index()
+                entity_counts.columns = ['Entity', 'Count']
+                st.dataframe(entity_counts, use_container_width=True, height=400)
+            
+            # Entity value analysis
+            if 'Value' in df.columns:
+                st.markdown("#### Sample Entity Values")
+                selected_entity = st.selectbox(
+                    "Select Entity Type",
+                    df['Entity'].unique()
+                )
+                
+                filtered_df = df[df['Entity'] == selected_entity][['Entity', 'Value', 'Email_Subject']].head(20)
+                st.dataframe(filtered_df, use_container_width=True)
+        else:
+            st.info("Entity data not available in extraction results")
+    
+    with tab3:
+        st.markdown("### Timeline Analysis")
+        
+        if 'Email_Date' in df.columns:
+            # Timeline chart
+            fig = create_extraction_timeline(df)
+            if fig:
+                st.plotly_chart(fig, use_container_width=True)
+            
+            # Hourly distribution
+            st.markdown("#### Hourly Distribution")
+            df_copy = df.copy()
+            df_copy['Hour'] = pd.to_datetime(df_copy['Email_Date']).dt.hour
+            hourly_dist = df_copy['Hour'].value_counts().sort_index()
+            
+            fig_hourly = px.bar(
+                x=hourly_dist.index,
+                y=hourly_dist.values,
+                labels={'x': 'Hour of Day', 'y': 'Count'},
+                title='Extractions by Hour of Day'
+            )
+            st.plotly_chart(fig_hourly, use_container_width=True)
+        else:
+            st.info("Date information not available")
+    
+    with tab4:
+        st.markdown("### Sender Analysis")
+        
+        if 'Email_From' in df.columns:
+            col_s1, col_s2 = st.columns(2)
+            
+            with col_s1:
+                # Top senders bar chart
+                fig = create_sender_analysis(df)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with col_s2:
+                # Sender statistics table
+                st.markdown("#### Sender Statistics")
+                sender_stats = df.groupby('Email_From').agg({
+                    'Email_Subject': 'count',
+                    'Trade_ID': 'nunique'
+                }).reset_index()
+                sender_stats.columns = ['Sender', 'Total Extractions', 'Unique Trades']
+                sender_stats = sender_stats.sort_values('Total Extractions', ascending=False).head(10)
+                st.dataframe(sender_stats, use_container_width=True)
+        else:
+            st.info("Sender information not available")
+    
+    with tab5:
+        st.markdown("### Pattern Effectiveness Analysis")
+        
+        if 'Pattern_ID' in df.columns:
+            col_p1, col_p2 = st.columns(2)
+            
+            with col_p1:
+                # Pattern effectiveness chart
+                fig = create_pattern_effectiveness_chart(df)
+                if fig:
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            with col_p2:
+                # Pattern statistics
+                st.markdown("#### Pattern Statistics")
+                pattern_stats = df['Pattern_ID'].value_counts().reset_index()
+                pattern_stats.columns = ['Pattern ID', 'Match Count']
+                st.dataframe(pattern_stats, use_container_width=True, height=400)
+            
+            # Pattern comparison by entity
+            if 'Entity' in df.columns:
+                st.markdown("#### Pattern Performance by Entity")
+                pattern_entity = df.groupby(['Entity', 'Pattern_ID']).size().reset_index(name='Count')
+                fig_heatmap = px.density_heatmap(
+                    pattern_entity,
+                    x='Pattern_ID',
+                    y='Entity',
+                    z='Count',
+                    title='Pattern Matches by Entity Type'
+                )
+                st.plotly_chart(fig_heatmap, use_container_width=True)
+        else:
+            st.info("Pattern information not available")
+    
+    # Download visualizations
+    st.markdown("---")
+    st.markdown("### 💾 Download Analytics Report")
+    
+    if st.button("📄 Generate PDF Report", use_container_width=False):
+        st.info("PDF report generation coming soon...")
+
+
+def render_settings_page():
+    """Render settings and configuration page"""
+    st.markdown('<h1 class="main-header">⚙️ Settings & Configuration</h1>', unsafe_allow_html=True)
+    
+    tab1, tab2, tab3 = st.tabs(["📁 Paths", "🔧 Configuration", "ℹ️ About"])
+    
+    with tab1:
+        st.markdown("### Directory Configuration")
+        
+        temp_path = st.text_input(
+            "Temporary Files Path",
+            value=st.session_state.temp_path,
+            key="temp_path_input"
+        )
+        
+        out_path = st.text_input(
+            "Output Files Path",
+            value=st.session_state.out_path,
+            key="out_path_input"
+        )
+        
+        if st.button("💾 Update Paths"):
+            st.session_state.temp_path = temp_path
+            st.session_state.out_path = out_path
+            
+            # Create directories
+            os.makedirs(temp_path, exist_ok=True)
+            os.makedirs(out_path, exist_ok=True)
+            
+            st.success("Paths updated successfully!")
+        
+        st.markdown("---")
+        st.markdown("### Directory Info")
+        
+        col_d1, col_d2 = st.columns(2)
+        
+        with col_d1:
+            st.info(f"""
+            **Temp Path:**
+            `{st.session_state.temp_path}`
+            
+            **Exists:** {os.path.exists(st.session_state.temp_path)}
+            """)
+        
+        with col_d2:
+            st.info(f"""
+            **Output Path:**
+            `{st.session_state.out_path}`
+            
+            **Exists:** {os.path.exists(st.session_state.out_path)}
+            """)
+    
+    with tab2:
+        st.markdown("### Application Configuration")
+        
+        # Entity definitions editor
+        st.markdown("#### Entity Definitions")
+        entity_json_str = json.dumps(st.session_state.config.get('entity_definitions', {}), indent=2)
+        entity_json = st.text_area(
+            "Entity Definitions (JSON)",
+            value=entity_json_str,
+            height=300
+        )
+        
+        col_c1, col_c2 = st.columns(2)
+        
+        with col_c1:
+            if st.button("💾 Save Configuration"):
+                try:
+                    entity_defs = json.loads(entity_json)
+                    st.session_state.config['entity_definitions'] = entity_defs
+                    st.success("Configuration saved!")
+                except Exception as e:
+                    st.error(f"Invalid JSON: {str(e)}")
+        
+        with col_c2:
+            if st.button("📥 Export Configuration"):
+                filename = f"config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                config_str = json.dumps(st.session_state.config, indent=2)
+                st.download_button(
+                    "⬇️ Download Config",
+                    config_str,
+                    file_name=filename,
+                    mime="application/json"
+                )
+        
+        st.markdown("---")
+        
+        # Upload configuration
+        st.markdown("#### Import Configuration")
+        uploaded_config = st.file_uploader("Upload Configuration File", type=['json'])
+        if uploaded_config:
+            try:
+                config_data = json.load(uploaded_config)
+                st.session_state.config = config_data
+                st.success("Configuration imported successfully!")
+                st.json(config_data)
+            except Exception as e:
+                st.error(f"Error loading configuration: {str(e)}")
+    
+    with tab3:
+        st.markdown("### About Email Harvester Pro")
+        
+        st.info("""
+        **Email Harvester Pro** - Streamlit Version
+        
+        A powerful email extraction and analysis tool designed for:
+        - Pattern-based entity extraction
+        - Multi-email processing
+        - Comprehensive visualization
+        - Export and reporting
+        
+        **Features:**
+        - 📧 Exchange email integration
+        - 🔍 Advanced pattern matching
+        - 📊 Interactive visualizations
+        - 💾 Multiple export formats
+        - 📈 Real-time analytics
+        
+        **Version:** 1.0.0
+        **Built with:** Streamlit, Pandas, Plotly
+        """)
+        
+        st.markdown("---")
+        
+        st.markdown("### System Information")
+        
+        col_i1, col_i2 = st.columns(2)
+        
+        with col_i1:
+            st.metric("Python Version", f"{os.sys.version_info.major}.{os.sys.version_info.minor}")
+            st.metric("Pandas Version", pd.__version__)
+        
+        with col_i2:
+            st.metric("Total Emails Fetched", len(st.session_state.emails))
+            st.metric("Total Extractions", len(st.session_state.extraction_df) if not st.session_state.extraction_df.empty else 0)
+
+
+# ============================================================================
+# MAIN APPLICATION
+# ============================================================================
+
+def main():
+    """Main application entry point"""
+    
+    # Initialize session state
+    init_session_state()
+    
+    # Render sidebar and get current page
+    current_page = render_sidebar()
+    
+    # Render appropriate page
+    if current_page == "🔌 Connect":
+        render_connect_page()
+    
+    elif current_page == "📥 Fetch Emails":
+        render_fetch_emails_page()
+    
+    elif current_page == "🔍 Extract":
+        render_extract_page()
+    
+    elif current_page == "📊 Visualize":
+        render_visualize_page()
+    
+    elif current_page == "⚙️ Settings":
+        render_settings_page()
+
+
+if __name__ == "__main__":
+    main()

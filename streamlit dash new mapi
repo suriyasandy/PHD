@@ -1,207 +1,512 @@
+# streamlit_app.py
 import streamlit as st
 import os
 import datetime
 import json
+import sys
 from pathlib import Path
+from filelock import FileLock
+import logging
 
-class EmailEntityExtractor:
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+class EmailEntityExtractorStreamlit:
+    """Streamlit-based Email Entity Extractor App"""
+    
     def __init__(self):
-        """Initialize Streamlit UI components and session state"""
+        """Initialize the Streamlit app without Tkinter"""
         
-        # Initialize session state variables if not exists
-        if 'date_var' not in st.session_state:
-            st.session_state.date_var = datetime.date.today().strftime("%Y-%m-%d")
-        if 'folder_var' not in st.session_state:
-            st.session_state.folder_var = ""
-        if 'file_path_var' not in st.session_state:
-            st.session_state.file_path_var = ""
-        if 'trade_ids_var' not in st.session_state:
-            st.session_state.trade_ids_var = ""
-        if 'selected_columns' not in st.session_state:
-            st.session_state.selected_columns = []
-        if 'activity_keywords' not in st.session_state:
-            st.session_state.activity_keywords = []
-        if 'trade_status' not in st.session_state:
-            st.session_state.trade_status = []
-        if 'static_headers' not in st.session_state:
-            st.session_state.static_headers = []
-        if 'mailbox_folders' not in st.session_state:
-            st.session_state.mailbox_folders = []
-        if 'emails' not in st.session_state:
-            st.session_state.emails = []
-        if 'selected_email' not in st.session_state:
-            st.session_state.selected_email = None
-        if 'displayed_emails' not in st.session_state:
-            st.session_state.displayed_emails = []
-        if 'current_email_index' not in st.session_state:
-            st.session_state.current_email_index = -1
-        if 'entity_definitions' not in st.session_state:
-            st.session_state.entity_definitions = None
-        
-        # App configuration
+        # Set page config (must be first Streamlit command)
         st.set_page_config(
             page_title="Email Harvester Bot",
+            page_icon="📧",
             layout="wide",
             initial_sidebar_state="expanded"
         )
         
+        # Initialize paths
+        self.out_path = os.path.join(os.getcwd(), "Results")
+        self.temp_path = os.path.join(os.getcwd(), "Temp")
+        
+        # Create timestamp for file naming
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.rag_filename = f"RAG_Pattern_Analysis_{timestamp}.xlsx"
+        self.rag_report_path = os.path.join(self.out_path, self.rag_filename)
+        
+        # Initialize session state variables
+        self._initialize_session_state()
+        
+        # Load configuration
+        self._load_configuration()
+        
+        # Initialize components
+        self._initialize_components()
+    
+    def _initialize_session_state(self):
+        """Initialize all session state variables"""
+        
+        # Define default values
+        defaults = {
+            'selected_columns': [],
+            'activity_keywords': [
+                'confirmation', 'approve', 'approved', 'reject', 'rejected',
+                'accept', 'accepted', 'decline', 'declined', 'agree', 'agreed'
+            ],
+            'trade_status': [
+                'pending', 'approved', 'rejected', 'confirmed',
+                'cancelled', 'executed', 'settled'
+            ],
+            'static_headers': [
+                'Trade_ID', 'Subject', 'From', 'To', 'Date',
+                'Email_Type', 'Activity', 'Status'
+            ],
+            'mailbox_folders': {},  # Will be populated from config
+            'emails': [],
+            'selected_email': None,
+            'displayed_emails': [],
+            'current_email_index': -1,
+            'entity_definitions': None,
+            'date_var': datetime.date.today().strftime("%Y-%m-%d"),
+            'folder_var': "",
+            'file_path_var': "",
+            'trade_ids_var': "",
+            'mailbox_selection': "Sent Items",
+            'results_data': [],  # Store extraction results
+            'rag_processor': None,
+            'thread_parser': None,
+            'pattern_manager': None,
+            'usage_tracker': None,
+            'processing': False,
+            'progress_value': 0
+        }
+        
+        # Initialize only if not already in session state
+        for key, value in defaults.items():
+            if key not in st.session_state:
+                st.session_state[key] = value
+    
+    def _load_configuration(self):
+        """Load pattern configuration file"""
+        
+        config_filename = os.path.join(os.getcwd(), 'Pattern_Config.json')
+        
+        if os.path.exists(config_filename):
+            try:
+                with open(config_filename, 'r') as f:
+                    config_data = json.load(f)
+                    if config_data:
+                        logger.info("✅ Config Loaded Successfully")
+                        st.session_state.entity_definitions = config_data
+                    else:
+                        logger.info("❌ Config Load Failed")
+            except Exception as e:
+                logger.error(f"Error loading config: {e}")
+        else:
+            logger.info("❌ Config File Not Found")
+    
+    def _initialize_components(self):
+        """Initialize application components"""
+        
+        # Import your existing classes
+        from pattern_manager import PatternManager
+        from usage_tracker import PatternUsageTracker
+        from email_parser import AdvancedEmailThreadParser
+        
+        # Initialize only once per session
+        if st.session_state.pattern_manager is None:
+            config_filename = os.path.join(os.getcwd(), 'Pattern_Config.json')
+            st.session_state.pattern_manager = PatternManager(config_filename)
+        
+        if st.session_state.usage_tracker is None:
+            st.session_state.usage_tracker = PatternUsageTracker()
+        
+        if st.session_state.thread_parser is None:
+            st.session_state.thread_parser = AdvancedEmailThreadParser()
+    
+    def run(self):
+        """Main app execution - replaces Tkinter mainloop"""
+        
+        # Create directory structure
+        self._create_directories()
+        
+        # Display UI
+        self._render_ui()
+    
+    def _create_directories(self):
+        """Create necessary directories"""
+        
+        logger.info(f"📧 Mail Harvester Bot triggered - User: {os.getlogin()}")
+        
+        today = datetime.date.today()
+        dir_path = os.path.join(
+            self.out_path,
+            str(today.year),
+            str(today.month).zfill(2),
+            str(today.day).zfill(2),
+            os.getlogin()
+        )
+        
+        os.makedirs(dir_path, exist_ok=True)
+        logger.info(f"Output Directory: {dir_path}")
+        
+        temp_path = os.path.join(
+            os.getcwd(),
+            "Results",
+            str(today.year),
+            str(today.month).zfill(2),
+            str(today.day).zfill(2)
+        )
+        
+        os.makedirs(temp_path, exist_ok=True)
+        logger.info(f"Output Directory: {temp_path}")
+    
+    def _render_ui(self):
+        """Render the complete Streamlit UI"""
+        
         # Title
         st.title("📧 Email Harvester Bot")
         
-        # Load pattern config
-        config_filename = os.path.join(os.getcwd(), 'Pattern_Config.json')
-        
-        # Initialize pattern manager and usage tracker
-        self.pattern_manager = PatternManager(config_filename)
-        self.usage_tracker = PatternUsageTracker()
-        
-        # Load config data
-        if os.path.exists(config_filename):
-            with open(config_filename, 'r') as f:
-                config_data = json.load(f)
-                if config_
-                    st.success("✅ Config Loaded Successfully")
-                    st.session_state.entity_definitions = config_data
-                else:
-                    st.error("❌ Config Load Failed")
+        # Show config status
+        if st.session_state.entity_definitions:
+            st.success("✅ Configuration Loaded Successfully")
         else:
-            st.error("❌ Config File Not Found Failed")
-        
-        # Hardcoded mailbox/folder configuration
-        st.session_state.mailbox_folders = [
-            # Add your mailbox folders here
-        ]
-        
-        # Create layout
-        self.create_ui()
-    
-    def create_ui(self):
-        """Create the main Streamlit UI layout"""
+            st.error("❌ Configuration Not Loaded")
         
         # Sidebar for inputs
         with st.sidebar:
-            st.header("📋 Input Parameters")
-            
-            # Mailbox/Folder Selection
-            st.subheader("Select Mailbox:")
-            mailbox_options = ["Sent Items"] + list(st.session_state.mailbox_folders.keys())
-            selected_mailbox = st.selectbox(
-                "Mailbox",
-                options=mailbox_options,
-                key="mailbox_combo"
-            )
-            
-            # Date Selection
-            st.subheader("Select Date:")
-            st.session_state.date_var = st.date_input(
-                "Date",
-                value=datetime.datetime.strptime(st.session_state.date_var, "%Y-%m-%d"),
-                format="YYYY-MM-DD",
-                key="date_picker"
-            ).strftime("%Y-%m-%d")
-            
-            # Outlook Folder Selection
-            st.subheader("Select Outlook Folder:")
-            st.session_state.folder_var = st.text_input(
-                "Folder Path",
-                value=st.session_state.folder_var,
-                key="folder_input"
-            )
-            
-            # File Path for Input Trade_Id
-            st.subheader("Browse for Input Trade_Id File:")
-            uploaded_file = st.file_uploader(
-                "Upload CSV/Excel File",
-                type=['csv', 'xlsx', 'xls'],
-                key="file_uploader"
-            )
-            if uploaded_file:
-                st.session_state.file_path_var = uploaded_file.name
-                st.info(f"📁 File: {uploaded_file.name}")
-            
-            # Trade ID Input
-            st.subheader("Trade ID:")
-            st.session_state.trade_ids_var = st.text_input(
-                "Enter Trade IDs (comma-separated)",
-                value=st.session_state.trade_ids_var,
-                key="trade_id_input"
-            )
-            
-            st.divider()
-            
-            # Action Buttons
-            st.subheader("🚀 Actions")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("📥 Extract Emails", use_container_width=True):
-                    self.extract_email_chain_from_outlook()
-            
-            with col2:
-                if st.button("📤 Extract & Export", use_container_width=True):
-                    self.extract_and_export()
-            
-            if st.button("📊 Export Consolidated Results", use_container_width=True):
-                self.export_consolidated_results()
-            
-            if st.button("🗑️ Clear Results", use_container_width=True):
-                self.clear_results()
-            
-            # Progress bar
-            st.session_state.progress = st.progress(0)
+            self._render_sidebar()
         
         # Main content area
-        self.create_main_content()
+        self._render_main_content()
     
-    def create_main_content(self):
-        """Create the main content area with tabs or sections"""
+    def _render_sidebar(self):
+        """Render sidebar with input controls"""
         
-        # Email Chain Display
-        st.header("📧 Email Chain")
+        st.header("📋 Input Parameters")
         
-        # Create a dataframe view for emails (replacing Treeview)
+        # Mailbox Selection
+        st.subheader("Select Mailbox")
+        mailbox_options = ["Sent Items"] + list(st.session_state.mailbox_folders.keys())
+        st.session_state.mailbox_selection = st.selectbox(
+            "Mailbox",
+            options=mailbox_options,
+            key="mailbox_combo",
+            label_visibility="collapsed"
+        )
+        
+        # Date Selection
+        st.subheader("Select Date")
+        date_value = datetime.datetime.strptime(st.session_state.date_var, "%Y-%m-%d").date()
+        selected_date = st.date_input(
+            "Date",
+            value=date_value,
+            format="YYYY-MM-DD",
+            key="date_picker",
+            label_visibility="collapsed"
+        )
+        st.session_state.date_var = selected_date.strftime("%Y-%m-%d")
+        
+        # Outlook Folder Selection
+        st.subheader("Select Outlook Folder")
+        st.session_state.folder_var = st.text_input(
+            "Folder Path",
+            value=st.session_state.folder_var,
+            placeholder="e.g., Inbox/Trade Confirmations",
+            key="folder_input",
+            label_visibility="collapsed"
+        )
+        
+        # File Upload for Trade IDs
+        st.subheader("Browse for Input Trade_Id File")
+        uploaded_file = st.file_uploader(
+            "Upload CSV/Excel File",
+            type=['csv', 'xlsx', 'xls'],
+            key="file_uploader",
+            label_visibility="collapsed"
+        )
+        
+        if uploaded_file:
+            st.session_state.file_path_var = uploaded_file.name
+            st.info(f"📁 {uploaded_file.name}")
+            
+            # Save uploaded file temporarily
+            temp_file_path = os.path.join(self.temp_path, uploaded_file.name)
+            with open(temp_file_path, 'wb') as f:
+                f.write(uploaded_file.getbuffer())
+            st.session_state.file_path_var = temp_file_path
+        
+        # Trade ID Manual Input
+        st.subheader("Trade ID")
+        st.session_state.trade_ids_var = st.text_input(
+            "Enter Trade IDs",
+            value=st.session_state.trade_ids_var,
+            placeholder="e.g., TRD001, TRD002, TRD003",
+            key="trade_id_input",
+            label_visibility="collapsed"
+        )
+        
+        st.divider()
+        
+        # Action Buttons
+        st.subheader("🚀 Actions")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("📥 Extract Emails", use_container_width=True, type="primary"):
+                self.extract_email_chain_from_outlook()
+        
+        with col2:
+            if st.button("📤 Extract & Export", use_container_width=True):
+                self.extract_and_export()
+        
+        if st.button("📊 Export Consolidated", use_container_width=True):
+            self.export_consolidated_results()
+        
+        if st.button("🗑️ Clear Results", use_container_width=True):
+            self.clear_results()
+        
+        # Progress indicator
+        if st.session_state.processing:
+            st.progress(st.session_state.progress_value, text="Processing...")
+    
+    def _render_main_content(self):
+        """Render main content area"""
+        
+        # Create tabs for better organization
+        tab1, tab2, tab3 = st.tabs(["📧 Email Chain", "📄 Email Content", "🔍 Extracted Entities"])
+        
+        with tab1:
+            self._render_email_chain_tab()
+        
+        with tab2:
+            self._render_email_content_tab()
+        
+        with tab3:
+            self._render_extracted_entities_tab()
+    
+    def _render_email_chain_tab(self):
+        """Render email chain display"""
+        
+        st.subheader("Email Chain")
+        
         if st.session_state.emails:
             import pandas as pd
             
             email_df = pd.DataFrame(st.session_state.emails)
             
-            # Display as interactive dataframe
-            selected_rows = st.dataframe(
+            # Interactive dataframe with selection
+            event = st.dataframe(
                 email_df,
                 use_container_width=True,
                 hide_index=True,
+                on_select="rerun",
+                selection_mode="single-row",
                 column_config={
-                    "trade_id": st.column_config.TextColumn("Trade ID", width=120),
-                    "Subject": st.column_config.TextColumn("Subject", width=200),
-                    "From": st.column_config.TextColumn("From", width=120),
-                    "To": st.column_config.TextColumn("To", width=120),
-                    "Date": st.column_config.TextColumn("Date", width=120),
-                    "Email Type": st.column_config.TextColumn("Email Type", width=80)
+                    "trade_id": st.column_config.TextColumn("Trade ID", width="small"),
+                    "Subject": st.column_config.TextColumn("Subject", width="large"),
+                    "From": st.column_config.TextColumn("From", width="medium"),
+                    "To": st.column_config.TextColumn("To", width="medium"),
+                    "Date": st.column_config.TextColumn("Date", width="medium"),
+                    "Email Type": st.column_config.TextColumn("Type", width="small")
                 }
             )
+            
+            # Handle row selection
+            if event.selection.rows:
+                selected_idx = event.selection.rows[0]
+                st.session_state.selected_email = st.session_state.emails[selected_idx]
+                st.session_state.current_email_index = selected_idx
         else:
-            st.info("No emails loaded. Use 'Extract Emails' to fetch data.")
+            st.info("📭 No emails loaded. Use 'Extract Emails' to fetch data.")
+    
+    def _render_email_content_tab(self):
+        """Render email content display"""
         
-        st.divider()
+        st.subheader("Email Content")
         
-        # Email Content Display
-        col1, col2 = st.columns([1, 1])
+        if st.session_state.selected_email:
+            email = st.session_state.selected_email
+            
+            # Display email metadata
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("From", email.get('From', 'N/A'))
+            with col2:
+                st.metric("To", email.get('To', 'N/A'))
+            with col3:
+                st.metric("Date", email.get('Date', 'N/A'))
+            
+            st.markdown(f"**Subject:** {email.get('Subject', 'N/A')}")
+            
+            st.divider()
+            
+            # Display email body
+            st.text_area(
+                "Email Body",
+                value=email.get('body', ''),
+                height=400,
+                key="email_content_display",
+                label_visibility="collapsed"
+            )
+        else:
+            st.info("👆 Select an email from the Email Chain tab")
+    
+    def _render_extracted_entities_tab(self):
+        """Render extracted entities display"""
         
-        with col1:
-            st.subheader("📄 Email Content")
-            if st.session_state.selected_email:
-                st.text_area(
-                    "Content",
-                    value=st.session_state.selected_email.get('body', ''),
-                    height=400,
-                    key="email_content_display"
+        st.subheader("Extracted Entities")
+        
+        if st.session_state.selected_email and 'entities' in st.session_state.selected_email:
+            entities = st.session_state.selected_email['entities']
+            
+            # Display as expandable JSON
+            st.json(entities)
+            
+            # Also display as formatted table if possible
+            if isinstance(entities, dict):
+                import pandas as pd
+                entity_df = pd.DataFrame([entities])
+                st.dataframe(entity_df, use_container_width=True)
+        else:
+            st.info("🔍 No entities extracted yet. Process emails to see results.")
+    
+    # ============================================================
+    # BUSINESS LOGIC METHODS (adapted from Tkinter version)
+    # ============================================================
+    
+    def extract_email_chain_from_outlook(self):
+        """Extract emails from Outlook - adapted for Streamlit"""
+        
+        st.session_state.processing = True
+        st.session_state.progress_value = 0
+        
+        try:
+            with st.spinner("🔄 Extracting emails from Outlook..."):
+                # Your existing extraction logic here
+                # Replace self.progress['value'] with st.session_state.progress_value
+                # Replace logger.info with st.info or st.success
+                
+                # Placeholder implementation
+                st.info("Connecting to Outlook...")
+                st.session_state.progress_value = 0.3
+                
+                # ... your extraction code ...
+                
+                st.session_state.progress_value = 1.0
+                st.success("✅ Emails extracted successfully!")
+                
+        except Exception as e:
+            st.error(f"❌ Error extracting emails: {str(e)}")
+            logger.error(f"Extraction error: {e}")
+        finally:
+            st.session_state.processing = False
+    
+    def extract_and_export(self):
+        """Extract entities and export - adapted for Streamlit"""
+        
+        st.session_state.processing = True
+        
+        try:
+            with st.spinner("🔄 Extracting entities and exporting..."):
+                # Your existing extraction and export logic
+                
+                st.success("✅ Extraction and export completed!")
+                
+        except Exception as e:
+            st.error(f"❌ Error: {str(e)}")
+            logger.error(f"Extract and export error: {e}")
+        finally:
+            st.session_state.processing = False
+    
+    def export_consolidated_results(self):
+        """Export consolidated results - adapted for Streamlit"""
+        
+        if not st.session_state.results_data:
+            st.warning("⚠️ No results to export!")
+            return
+        
+        try:
+            with st.spinner("📊 Exporting consolidated results..."):
+                # Your existing export logic
+                
+                # Generate download button
+                import pandas as pd
+                df = pd.DataFrame(st.session_state.results_data)
+                
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Results CSV",
+                    data=csv,
+                    file_name=f"consolidated_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
                 )
-            else:
-                st.info("Select an email from the table above")
+                
+                st.success("✅ Export completed!")
+                
+        except Exception as e:
+            st.error(f"❌ Export error: {str(e)}")
+            logger.error(f"Export error: {e}")
+    
+    def clear_results(self):
+        """Clear all results - adapted for Streamlit"""
         
-        with col2:
-            st.subheader("🔍 Extracted Entities")
-            if st.session_state.selected_email and 'entities' in st.session_state.selected_email:
-                st.json(st.session_state.selected_email['entities'])
-            else:
-                st.info("No entities extracted yet")
+        st.session_state.emails = []
+        st.session_state.selected_email = None
+        st.session_state.results_data = []
+        st.session_state.current_email_index = -1
+        st.session_state.displayed_emails = []
+        
+        st.success("🗑️ Results cleared!")
+        st.rerun()
+
+
+# ============================================================
+# STREAMLIT ENTRY POINT (replaces fetchFile function)
+# ============================================================
+
+def main():
+    """
+    Main entry point for Streamlit app
+    Replaces the Tkinter-based fetchFile() function
+    """
+    
+    # Single-instance lock mechanism (replaces Tkinter FileLock)
+    lock_file_path = "mail_harvester.lock"
+    lock = FileLock(lock_file_path, timeout=0)
+    
+    try:
+        # Try to acquire the lock (non-blocking)
+        lock.acquire(timeout=0)
+        
+        # Initialize and run the Streamlit app
+        app = EmailEntityExtractorStreamlit()
+        app.run()
+        
+    except TimeoutError:
+        # Another instance is already running
+        st.error("⚠️ Another instance of Mail Harvester is already running.")
+        st.info("Please close the other instance or wait for it to complete.")
+        st.stop()
+    
+    except Exception as e:
+        st.error(f"❌ Application error: {str(e)}")
+        logger.error(f"Application error: {e}")
+    
+    finally:
+        # Release lock when done (though Streamlit keeps running)
+        try:
+            lock.release()
+        except:
+            pass
+
+
+# Run the app
+if __name__ == "__main__":
+    main()

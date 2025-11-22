@@ -1,3 +1,174 @@
+def render_fetch_emails_page():
+    """Render email fetching page - FIXED accessibility warnings"""
+    st.markdown('<h1 class="main-header">📥 Fetch Emails</h1>', unsafe_allow_html=True)
+    
+    if not st.session_state.connected:
+        st.warning("⚠️ Please connect to Outlook first (Connect tab)")
+        return
+    
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.markdown("### Fetch Configuration")
+        
+        # Trade IDs input
+        trade_ids_str = st.text_area(
+            "Trade IDs (comma or space separated)",
+            value="",
+            height=100,
+            placeholder="Enter trade IDs separated by comma or space\nExample: TRADE001, TRADE002, TRADE003",
+            help="Enter the trade IDs you want to search for in emails"
+        )
+        
+        # Date range
+        col_date1, col_date2 = st.columns(2)
+        with col_date1:
+            start_date = st.date_input(
+                "Start Date",
+                value=datetime.now() - timedelta(days=2),
+                help="Start date for email search (skips weekends)"
+            )
+        with col_date2:
+            end_date = st.date_input(
+                "End Date",
+                value=datetime.now(),
+                help="End date for email search"
+            )
+        
+        st.markdown("---")
+        
+        if st.button("📥 Fetch Emails", use_container_width=True, type="primary"):
+            if not trade_ids_str.strip():
+                st.error("Please enter trade IDs!")
+            else:
+                # FIXED: Pass mailbox_name and folder_name, not objects!
+                progress_placeholder = st.empty()
+                status_placeholder = st.empty()
+                
+                progress_queue = Queue()
+                
+                fetch_thread = threading.Thread(
+                    target=worker_fetch_emails,
+                    args=(
+                        st.session_state.mailbox_name,
+                        st.session_state.folder_name,
+                        start_date,
+                        end_date,
+                        trade_ids_str,
+                        progress_queue
+                    ),
+                    daemon=True
+                )
+                fetch_thread.start()
+                
+                # Monitor progress
+                while fetch_thread.is_alive() or not progress_queue.empty():
+                    try:
+                        message = progress_queue.get(timeout=0.1)
+                        
+                        if message['type'] == 'progress':
+                            status_placeholder.text(message['message'])
+                        
+                        elif message['type'] == 'complete':
+                            st.session_state.emails = message['emails']
+                            st.session_state.all_emails_grouped = message['emails_by_trade']
+                            st.session_state.unfound_trades = message.get('unfound_trades', [])
+                            progress_placeholder.success(message['message'])
+                            time.sleep(1)
+                            st.rerun()
+                        
+                        elif message['type'] == 'error':
+                            status_placeholder.error(f"❌ Error: {message['message']}")
+                            break
+                    
+                    except:
+                        time.sleep(0.1)
+                        continue
+                
+                fetch_thread.join(timeout=1)
+    
+    with col2:
+        st.markdown("### 📊 Fetch Statistics")
+        if st.session_state.emails:
+            st.metric("Total Emails", len(st.session_state.emails))
+            st.metric("Trade IDs Found", len(st.session_state.all_emails_grouped))
+            
+            if st.session_state.unfound_trades:
+                st.warning(f"Not Found: {', '.join(st.session_state.unfound_trades)}")
+        else:
+            st.info("No emails fetched yet")
+    
+    # Display emails - FIXED ACCESSIBILITY
+    if st.session_state.emails:
+        st.markdown("---")
+        st.markdown("### 📧 Fetched Emails")
+        
+        # Multi-select controls
+        col_select1, col_select2, col_select3 = st.columns(3)
+        with col_select1:
+            if st.button("✅ Select All", use_container_width=True):
+                st.session_state.selected_emails = list(range(len(st.session_state.emails)))
+                st.rerun()
+        with col_select2:
+            if st.button("❌ Clear Selection", use_container_width=True):
+                st.session_state.selected_emails = []
+                st.rerun()
+        with col_select3:
+            st.info(f"Selected: {len(st.session_state.selected_emails)} emails")
+        
+        # Display emails grouped by trade ID - FIXED ACCESSIBILITY
+        for idx, email in enumerate(st.session_state.emails):
+            col_check, col_content = st.columns([1, 20])
+            
+            with col_check:
+                is_selected = idx in st.session_state.selected_emails
+                # FIX: Proper label with hidden visibility for accessibility
+                checkbox_label = f"Select email {idx + 1}"
+                if st.checkbox(
+                    checkbox_label, 
+                    value=is_selected, 
+                    key=f"email_{idx}",
+                    label_visibility="hidden"
+                ):
+                    if idx not in st.session_state.selected_emails:
+                        st.session_state.selected_emails.append(idx)
+                else:
+                    if idx in st.session_state.selected_emails:
+                        st.session_state.selected_emails.remove(idx)
+            
+            with col_content:
+                # Highlight latest
+                if 'latest' in email.get('tags', ()):
+                    st.markdown(f'<div class="latest-email">🟢 <strong>{email["trade_id"]} - {email["email_type"]}</strong></div>', unsafe_allow_html=True)
+                else:
+                    st.markdown(f"**{email['trade_id']} - {email['email_type']}**")
+                
+                with st.expander(f"{email['subject'][:60]}... ({email['date']})"):
+                    col_info1, col_info2 = st.columns(2)
+                    with col_info1:
+                        st.write(f"**From:** {email['sender']}")
+                        st.write(f"**To:** {email['recipient']}")
+                    with col_info2:
+                        st.write(f"**Date:** {email['date']}")
+                        st.write(f"**Threaded:** {'Yes' if email['is_threaded'] else 'No'}")
+                        if email['is_threaded']:
+                            st.write(f"**Thread Count:** {email['thread_count']}")
+                    
+                    st.markdown("**Email Body (Current Message):**")
+                    # FIX: Proper label for text_area with hidden visibility
+                    st.text_area(
+                        f"Email body content {idx + 1}",
+                        email['body'][:500] + "..." if len(email['body']) > 500 else email['body'], 
+                        height=150, 
+                        key=f"body_{idx}", 
+                        disabled=True,
+                        label_visibility="hidden"
+                    )
+
+
+
+
+
 """
 Email Harvester - Complete Streamlit Version (FIXED)
 Uses EXACT Tkinter MAPI logic with Streamlit UI

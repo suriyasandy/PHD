@@ -1,0 +1,350 @@
+def extract_email_chain_from_outlook(self):
+    """
+    Extract email chain from Outlook - Streamlit version
+    Replaces Tkinter threading, messageboxes, and progress updates
+    """
+    
+    # Get trade IDs from session state
+    trade_ids_str = None
+    df = None
+    
+    # Check if columns are selected for DataFrame filtering
+    if 'selected_columns' in st.session_state and st.session_state.selected_columns:
+        df = pd.DataFrame(columns=st.session_state.selected_columns)
+    
+    # Get trade IDs from text input
+    if st.session_state.trade_ids_var:
+        trade_ids_str = st.session_state.trade_ids_var.strip()
+    
+    # Parse trade IDs
+    trade_ids = [tid.strip() for tid in re.split(r",|\\s+", trade_ids_str) if tid.strip()]
+    
+    logger.info(f"Input TradeIds: {trade_ids}")
+    
+    # Clear previous results
+    self.clear_results()
+    st.session_state.unfound_trades = []
+    
+    # ============================================================
+    # WORKER FUNCTION (adapted from threading.Thread)
+    # ============================================================
+    
+    def process_extraction():
+        """
+        Main extraction logic - adapted from worker() function
+        No threading needed in Streamlit
+        """
+        
+        error_msg = None
+        
+        # Initialize COM for Outlook interaction
+        pythoncom.CoInitialize()
+        
+        try:
+            # Connect to Outlook
+            with st.spinner("🔌 Connecting to Outlook..."):
+                folder = self.connect_to_outlook()
+                
+                if not folder:
+                    st.error("❌ Could not connect to folder")
+                    return
+            
+            # Calculate date range
+            today = datetime.strptime(
+                st.session_state.date_var, 
+                "%Y-%m-%d"
+            ) + timedelta(days=1)
+            days_back = 2
+            checked_days = 0
+            days_ago = 1
+            date_fmt, use_ampm = self.get_region_datefmt_ampm()
+            
+            logger.info(f"Detected locale datefmt: {date_fmt}, Use AM/PM: {use_ampm}")
+            
+            all_items = []
+            
+            # Progress container
+            progress_bar = st.progress(0, text="Searching emails...")
+            status_text = st.empty()
+            
+            # Search through date range
+            while checked_days < days_back:
+                d = today - timedelta(days=days_ago)
+                days_ago += 1
+                
+                # Skip weekends
+                if d.weekday() >= 5:
+                    continue
+                
+                checked_days += 1
+                
+                # Build datetime filter strings
+                start_time, end_time = self.restrict_datetime_strings(
+                    d, date_fmt, use_ampm
+                )
+                
+                filter_str = (
+                    f"[ReceivedTime] >= '{start_time}' AND "
+                    f"[ReceivedTime] <= '{end_time}'"
+                )
+                
+                status_text.text(f"🔍 Searching: {filter_str}")
+                
+                # Get items from folder
+                items = folder.Items.Restrict(filter_str)
+                items_list = self.process_items_in_batches(items, batch_size=150)
+                
+                # If AMPM not working, try lowercase
+                if not items_list and use_ampm:
+                    am_l = d.replace(hour=1).strftime('%p').lower()
+                    pm_l = d.replace(hour=13).strftime('%p').lower()
+                    
+                    start_time_l = f"{d.strftime(date_fmt)} 12:00:00 {am_l}"
+                    end_time_l = f"{d.strftime(date_fmt)} 11:59:59 {pm_l}"
+                    
+                    filter_str_l = (
+                        f"[ReceivedTime] >= '{start_time_l}' AND "
+                        f"[ReceivedTime] <= '{end_time_l}'"
+                    )
+                    
+                    status_text.text(f"🔍 Trying filter (lowercase): {filter_str_l}")
+                    
+                    items = folder.Items.Restrict(filter_str_l)
+                    items_list = self.process_items_in_batches(items, batch_size=150)
+                
+                if items_list:
+                    logger.info(f"Found {len(items_list)} emails for {d.strftime(date_fmt)}")
+                    all_items.extend([entry['item'] for entry in items_list])
+                else:
+                    logger.info(f"No emails for {d.strftime(date_fmt)}")
+            
+            # Update progress
+            progress_bar.progress(0.3, text="Processing emails...")
+            
+            # ============================================================
+            # GROUP & SORT BY TRADE ID
+            # ============================================================
+            
+            tid_re = re.compile(r"^\s*(\d+)\s*$", re.IGNORECASE)
+            matches_by_tradeid = {tid: [] for tid in trade_ids}
+            all_emails = []
+            
+            # Process each item
+            for idx, item in enumerate(all_items):
+                try:
+                    # Check if item is an email (Class 43)
+                    if getattr(item, "Class", None) == 43:
+                        subject = item.Subject or ""
+                        body = item.Body or ""
+                        html_body = ""
+                        
+                        try:
+                            html_body = item.HTMLBody
+                        except Exception:
+                            pass
+                        
+                        # Search for trade IDs in subject and body
+                        search_zone = f"{subject}\n{body}\n{html_body}"
+                        found_tids = set(m.lower() for m in tid_re.findall(search_zone))
+                        
+                        # Match against requested trade IDs
+                        for orig_tid in trade_ids:
+                            if orig_tid.lower() in found_tids:
+                                # ============================================
+                                # THREAD PARSING
+                                # ============================================
+                                
+                                thread_info = self.thread_parser.extract_current_message_only(body)
+                                
+                                email_obj = {
+                                    'trade_id': orig_tid,
+                                    'subject': subject,
+                                    'sender': getattr(item, "SenderName", ""),
+                                    'recipient': getattr(item, "To", ""),
+                                    'date': item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S") if item.ReceivedTime else "",
+                                    'body': body,
+                                    'thread_metadata': {
+                                        'is_threaded': thread_info['is_threaded'],
+                                        'thread_count': thread_info['thread_count'],
+                                        'separator_type': thread_info['separator_type'],
+                                        'html_body': html_body
+                                    }
+                                }
+                                
+                                matches_by_tradeid[orig_tid].append(email_obj)
+                                all_emails.append(email_obj)
+                
+                except Exception as item_error:
+                    logger.warning(f"Error processing item: {str(item_error)}")
+                    pass
+                
+                # Update progress periodically
+                if idx % 10 == 0:
+                    progress = 0.3 + (0.4 * idx / len(all_items))
+                    progress_bar.progress(progress, text=f"Processing emails... {idx}/{len(all_items)}")
+            
+            # Clean up
+            gc.collect()
+            
+            progress_bar.progress(0.7, text="Organizing results...")
+            
+            logger.info(f"Extracted Mails with matched TradeIds: {len(all_emails)}")
+            
+            # ============================================================
+            # FINISH EXTRACTION - populate session state
+            # ============================================================
+            
+            self.finish_extraction(all_emails, None)
+            
+            progress_bar.progress(1.0, text="✅ Complete!")
+            
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(f"Error in extraction: {error_msg}")
+            st.error(f"❌ Extraction failed: {error_msg}")
+            gc.collect()
+    
+    # ============================================================
+    # EXECUTE (No threading needed in Streamlit)
+    # ============================================================
+    
+    logger.info('Starting extraction process')
+    
+    # Run the extraction directly (Streamlit handles async)
+    process_extraction()
+
+
+def finish_extraction(self, all_emails, error):
+    """
+    Handle extraction completion - Streamlit version
+    Replaces Tkinter progress.stop() and messagebox
+    """
+    
+    if error:
+        st.error(f"❌ Extraction Error: Failed to extract emails: {error}")
+        return
+    
+    # Create DataFrame from emails
+    if 'selected_columns' in st.session_state:
+        df = pd.DataFrame(columns=st.session_state.selected_columns)
+    else:
+        df = pd.DataFrame()
+    
+    # Group emails by trade ID
+    emails_by_trade = defaultdict(list)
+    for mail in all_emails:
+        emails_by_trade[mail['trade_id']].append(mail)
+    
+    # Sort emails within each trade (newest to oldest)
+    for trade_id in emails_by_trade:
+        emails_by_trade[trade_id].sort(
+            key=lambda x: parser.parse(x['date']) if x['date'] else datetime.min,
+            reverse=True  # newest-to-oldest
+        )
+    
+    # ============================================================
+    # CRITICAL: Rebuild st.session_state.emails in display order
+    # ============================================================
+    
+    st.session_state.emails = []
+    for trade_id in sorted(emails_by_trade.keys()):
+        st.session_state.emails.append({
+            'trade_id': trade_id,
+            'emails': emails_by_trade[trade_id]
+        })
+    
+    # ============================================================
+    # Populate display structure (replacing Treeview)
+    # ============================================================
+    
+    display_emails = []
+    
+    for entry in st.session_state.emails:
+        trade_emails = entry['emails']
+        
+        for email_idx, mail in enumerate(trade_emails):
+            # Determine email type (Latest vs Reply/Forward/Email)
+            tags = ('latest',) if email_idx == 0 else ()
+            
+            if email_idx == 0:
+                email_type = "Latest"
+            else:
+                subj = mail['subject'].lower()
+                if "re:" in subj:
+                    email_type = f"Reply {email_idx}"
+                elif "fw:" in subj or "fwd:" in subj:
+                    email_type = f"Forward {email_idx}"
+                else:
+                    email_type = f"Email {email_idx}"
+            
+            display_emails.append({
+                'trade_id': mail['trade_id'],
+                'Subject': mail['subject'],
+                'From': mail['sender'],
+                'To': mail['recipient'],
+                'Date': mail['date'],
+                'Email Type': email_type,
+                'body': mail['body'],
+                'tags': tags,
+                '_raw_email': mail  # Store full email object
+            })
+    
+    # Store in session state for display
+    st.session_state.displayed_emails = display_emails
+    
+    # ============================================================
+    # Find unfound trades
+    # ============================================================
+    
+    found_trade_ids = set(mail['trade_id'] for mail in all_emails)
+    
+    st.session_state.unfound_trades = [
+        tid for tid in [
+            tid.strip() for tid in re.split(
+                r",|\\s+", 
+                st.session_state.trade_ids_var.strip()
+            ) if tid.strip()
+        ]
+        if tid not in found_trade_ids
+    ]
+    
+    # ============================================================
+    # Export unfound trades to CSV
+    # ============================================================
+    
+    if st.session_state.unfound_trades:
+        filename = f"{{}}_email_entities_export_{datetime.now().strftime('%m_%d_%Y')}.csv"
+        out_file = os.path.join(self.temp_path, filename)
+        
+        unfound_df = pd.DataFrame({'Trade_ID': st.session_state.unfound_trades})
+        unfound_df.to_csv(out_file, index=False)
+        
+        logger.info(f"[{st.session_state.unfound_trades}] - Not Found In Email")
+    
+    # ============================================================
+    # Show success message (replaces messagebox)
+    # ============================================================
+    
+    st.success(
+        f"✅ Success!\n\n"
+        f"Loaded {len(all_emails)} emails across "
+        f"{len(found_trade_ids)} Trade IDs."
+    )
+    
+    # Auto-rerun to refresh display
+    st.rerun()
+
+
+def clear_results(self):
+    """Clear all results - Streamlit version"""
+    
+    # Clear Treeview equivalent (session state)
+    st.session_state.emails = []
+    st.session_state.displayed_emails = []
+    st.session_state.selected_email = None
+    st.session_state.current_email_index = -1
+    
+    # Clear text displays
+    st.session_state.results_data = []
+    
+    logger.info("Results cleared")

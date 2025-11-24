@@ -1,0 +1,19 @@
+from exchangelib import Credentials, Account, Configuration, DELEGATE
+
+credentials = Credentials(
+    username="your_email@company.co.in",   # MUST use full email for O365
+    password="your_password"
+)
+
+config = Configuration(
+    server="outlook.office365.com",   # O365 EWS host
+    credentials=credentials,
+    auth_type="basic"                 # VERY IMPORTANT for Office 365 EWS
+)
+
+account = Account(
+    primary_smtp_address="your_email@company.co.in",
+    autodiscover=False,
+    config=config,
+    access_type=DELEGATE
+)

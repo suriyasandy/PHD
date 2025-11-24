@@ -1,0 +1,6 @@
+I am pleased to announce that the Email Entity Extractor tool has been updated with an enhanced reporting structure to improve data organization and analysis.
+WHAT’S NEW:
+The consolidated Excel file now contains THREE organized sheets:
+1.	Consolidated_Report - Main extraction results with all entity data, trade IDs, email metadata, and extracted fields
+2.	Table_Data (NEW!) - Dedicated sheet for HTML table extractions with preserved table structure and row/column tracking
+3.	Statistics/RAG Reports - Processing metrics and previously generated RAG reports are preserved

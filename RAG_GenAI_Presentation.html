@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG GenAI Implementation - Presentation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .presentation {
+            width: 100%;
+            max-width: 1200px;
+            aspect-ratio: 16 / 9;
+            background: white;
+            border-radius: 10px;
+            box-shadow: 0 10px 50px rgba(0,0,0,0.3);
+            display: flex;
+            overflow: hidden;
+        }
+        
+        .slides-container {
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .slide {
+            width: 100%;
+            height: 100%;
+            padding: 60px 80px;
+            display: none;
+            flex-direction: column;
+            justify-content: center;
+            background: white;
+            animation: fadeIn 0.5s;
+        }
+        
+        .slide.active {
+            display: flex;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+        
+        /* Slide Styles */
+        .slide-title {
+            font-size: 64px;
+            font-weight: 700;
+            color: #667eea;
+            margin-bottom: 20px;
+        }
+        
+        .slide-subtitle {
+            font-size: 28px;
+            color: #666;
+            margin-bottom: 40px;
+        }
+        
+        .slide-content {
+            font-size: 18px;
+            line-height: 1.8;
+            color: #333;
+        }
+        
+        .content-item {
+            margin: 15px 0;
+            padding-left: 30px;
+            position: relative;
+        }
+        
+        .content-item:before {
+            content: "▸";
+            color: #667eea;
+            position: absolute;
+            left: 0;
+            font-size: 24px;
+        }
+        
+        .stat-box {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            border-radius: 10px;
+            margin: 15px 0;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .stat-value {
+            font-size: 42px;
+            margin-bottom: 10px;
+        }
+        
+        .two-column {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 40px;
+            margin-top: 30px;
+        }
+        
+        .column h3 {
+            color: #667eea;
+            margin-bottom: 20px;
+            font-size: 22px;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+        
+        th {
+            background: #667eea;
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+        }
+        
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #eee;
+        }
+        
+        tr:hover {
+            background: #f5f5f5;
+        }
+        
+        .controls {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: #f5f5f5;
+            padding: 20px;
+            border-top: 1px solid #ddd;
+        }
+        
+        button {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 14px;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        
+        button:hover {
+            background: #764ba2;
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .slide-counter {
+            font-size: 14px;
+            color: #666;
+            margin: 0 20px;
+        }
+        
+        .slide-thumbnail {
+            width: 120px;
+            height: 90px;
+            background: #f0f0f0;
+            border: 2px solid #ddd;
+            border-radius: 5px;
+            padding: 8px;
+            font-size: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-align: center;
+            overflow: hidden;
+        }
+        
+        .slide-thumbnail.active {
+            border-color: #667eea;
+            background: #667eea;
+            color: white;
+        }
+        
+        .architecture-diagram {
+            background: #f9f9f9;
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            overflow-x: auto;
+        }
+        
+        .highlight {
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .success {
+            color: #4caf50;
+        }
+        
+        .warning {
+            color: #ff9800;
+        }
+        
+        .critical {
+            color: #f44336;
+        }
+        
+        .roadmap-item {
+            background: #f0f0f0;
+            padding: 20px;
+            margin: 10px 0;
+            border-left: 4px solid #667eea;
+            border-radius: 4px;
+        }
+        
+        .roadmap-item h4 {
+            color: #667eea;
+            margin-bottom: 8px;
+        }
+        
+        .slide-separator {
+            height: 2px;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            margin: 30px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="presentation">
+        <div class="slides-container">
+            <!-- Slide 1: Title -->
+            <div class="slide active">
+                <div class="slide-title">RAG with Phi-4 LLM</div>
+                <div class="slide-subtitle">Email Entity Extraction Enhancement</div>
+                <div class="slide-separator"></div>
+                <div class="slide-content">
+                    <div class="content-item">GenAI-Powered Trade Identification System</div>
+                    <div class="content-item">Market Middle Office / Market Security</div>
+                    <div class="content-item">POC Timeline: 4-6 Weeks</div>
+                    <div class="content-item">Expected ROI: 1,785% (Year 1)</div>
+                </div>
+                <div style="margin-top: 60px; text-align: center; color: #999; font-size: 14px;">
+                    November 27, 2025 | Internal - Management Review
+                </div>
+            </div>
+
+            <!-- Slide 2: Current Problem -->
+            <div class="slide">
+                <div class="slide-title">Current Challenges</div>
+                <div class="slide-separator"></div>
+                <div class="two-column">
+                    <div class="column">
+                        <h3>❌ Manual Process Issues</h3>
+                        <div class="content-item">Time-consuming manual search</div>
+                        <div class="content-item">5-8% false positive rate</div>
+                        <div class="content-item">No contextual understanding</div>
+                        <div class="content-item">30-40% manual review needed</div>
+                    </div>
+                    <div class="column">
+                        <h3>📊 Performance Impact</h3>
+                        <table>
+                            <tr>
+                                <th>Metric</th>
+                                <th>Current</th>
+                            </tr>
+                            <tr>
+                                <td>Daily Volume</td>
+                                <td>500-1000</td>
+                            </tr>
+                            <tr>
+                                <td>Processing Time</td>
+                                <td>8-12 hrs/1k</td>
+                            </tr>
+                            <tr>
+                                <td>Accuracy</td>
+                                <td>92-95%</td>
+                            </tr>
+                            <tr>
+                                <td>Manual Review</td>
+                                <td>30-40%</td>
+                            </tr>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slide 3: Proposed Solution -->
+            <div class="slide">
+                <div class="slide-title">Proposed Solution: RAG with Phi-4</div>
+                <div class="slide-separator"></div>
+                <div class="slide-content">
+                    <div class="stat-box">
+                        <div>Retrieval-Augmented Generation</div>
+                        <div style="font-size: 18px; margin-top: 10px;">
+                            Historical Context + Local LLM = Intelligent Extraction
+                        </div>
+                    </div>
+                    <div class="two-column">
+                        <div class="column">
+                            <h3>Key Benefits</h3>
+                            <div class="content-item"><span class="success">✓</span> 97%+ accuracy</div>
+                            <div class="content-item"><span class="success">✓</span> 2-4 sec per email</div>
+                            <div class="content-item"><span class="success">✓</span> <5% manual review</div>
+                            <div class="content-item"><span class="success">✓</span> 100% data privacy</div>
+                        </div>
+                        <div class="column">
+                            <h3>Technology Stack</h3>
+                            <div class="content-item">Phi-4 (3.8B LLM)</div>
+                            <div class="content-item">Chroma (Vector DB)</div>
+                            <div class="content-item">Ollama (Deployment)</div>
+                            <div class="content-item">Python + Tkinter</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slide 4: Architecture -->
+            <div class="slide">
+                <div class="slide-title">System Architecture</div>
+                <div class="slide-separator"></div>
+                <div class="architecture-diagram">Input Email
+    ↓
+[PREPROCESSING] Extract subject/body, clean HTML
+    ↓
+[VECTOR RETRIEVAL] Find 5 similar historical patterns
+    ↓
+[CONTEXT AUGMENTATION] Load definitions + examples
+    ↓
+[PHI-4 INFERENCE] Generate structured JSON (2-5 sec)
+    ↓
+[VALIDATION] Check confidence, dedup, flag results
+    ↓
+✓ Output: Trade data with confidence score</div>
+            </div>
+
+            <!-- Slide 5: Why Phi-4 -->
+            <div class="slide">
+                <div class="slide-title">Why Phi-4 LLM?</div>
+                <div class="slide-separator"></div>
+                <table>
+                    <tr>
+                        <th>Aspect</th>
+                        <th>Phi-4</th>
+                        <th>GPT-4</th>
+                        <th>Claude 3</th>
+                    </tr>
+                    <tr>
+                        <td>Model Size</td>
+                        <td><span class="highlight">3.8B</span></td>
+                        <td>1.7T</td>
+                        <td>~100B</td>
+                    </tr>
+                    <tr>
+                        <td>Deployment</td>
+                        <td><span class="highlight">Local</span></td>
+                        <td>Cloud API</td>
+                        <td>Cloud API</td>
+                    </tr>
+                    <tr>
+                        <td>Cost</td>
+                        <td><span class="success">$0</span></td>
+                        <td>$0.03/1K tokens</td>
+                        <td>$0.015/1K tokens</td>
+                    </tr>
+                    <tr>
+                        <td>Data Privacy</td>
+                        <td><span class="success">100% Local</span></td>
+                        <td><span class="critical">Cloud</span></td>
+                        <td><span class="critical">Cloud</span></td>
+                    </tr>
+                    <tr>
+                        <td>Inference Speed</td>
+                        <td><span class="highlight">2-5 sec (GPU)</span></td>
+                        <td>~1 sec</td>
+                        <td>~2 sec</td>
+                    </tr>
+                    <tr>
+                        <td>Accuracy</td>
+                        <td><span class="highlight">95-97%</span></td>
+                        <td>98%+</td>
+                        <td>97-98%</td>
+                    </tr>
+                </table>
+                <div style="margin-top: 20px; color: #666;">
+                    <strong>Recommendation:</strong> Phi-4 is optimal for POC (local, cost-free, privacy-compliant)
+                </div>
+            </div>
+
+            <!-- Slide 6: ROI Analysis -->
+            <div class="slide">
+                <div class="slide-title">Financial Impact: ROI Analysis</div>
+                <div class="slide-separator"></div>
+                <div class="slide-content">
+                    <div class="two-column">
+                        <div class="column">
+                            <h3>Investment Required</h3>
+                            <div class="content-item">Development: $15,000</div>
+                            <div class="content-item">Infrastructure: $1,000</div>
+                            <div class="content-item">QA/Testing: $3,000</div>
+                            <div class="content-item">Training: $1,500</div>
+                            <div style="margin-top: 20px; font-weight: bold;">Total: $20,500</div>
+                        </div>
+                        <div class="column">
+                            <h3>Annual Savings</h3>
+                            <div class="content-item">Processing time: $75,000</div>
+                            <div class="content-item">Manual review: $312,500</div>
+                            <div style="margin-top: 20px; font-weight: bold;">Total: $387,500/year</div>
+                        </div>
+                    </div>
+                    <div class="stat-box" style="margin-top: 40px;">
+                        <div>ROI: 1,785% (Year 1)</div>
+                        <div class="stat-value">18.9x Return</div>
+                        <div>Payback: 3 Weeks</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slide 7: Implementation Timeline -->
+            <div class="slide">
+                <div class="slide-title">6-Week Implementation Roadmap</div>
+                <div class="slide-separator"></div>
+                <div class="roadmap-item">
+                    <h4>📅 Week 1-2: POC Setup</h4>
+                    <div>RAG components + Vector store indexing + Phi-4 integration</div>
+                    <div style="font-size: 12px; margin-top: 5px;">Target: Initial testing, ~88-92% accuracy</div>
+                </div>
+                <div class="roadmap-item">
+                    <h4>📅 Week 3-4: Integration & Testing</h4>
+                    <div>Tkinter UI integration + Hybrid mode + Comprehensive testing</div>
+                    <div style="font-size: 12px; margin-top: 5px;">Target: 95%+ accuracy, <5 sec/email</div>
+                </div>
+                <div class="roadmap-item">
+                    <h4>📅 Week 5-6: Validation & Production Ready</h4>
+                    <div>Real-world testing + Documentation + Go/No-go decision</div>
+                    <div style="font-size: 12px; margin-top: 5px;">Target: 97%+ accuracy, production deployment</div>
+                </div>
+            </div>
+
+            <!-- Slide 8: Success Metrics -->
+            <div class="slide">
+                <div class="slide-title">Success Metrics & KPIs</div>
+                <div class="slide-separator"></div>
+                <table>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Current</th>
+                        <th>POC Target</th>
+                        <th>Production</th>
+                    </tr>
+                    <tr>
+                        <td>Extraction Accuracy</td>
+                        <td>92-95%</td>
+                        <td><span class="success">95%+</span></td>
+                        <td><span class="success">98%+</span></td>
+                    </tr>
+                    <tr>
+                        <td>Processing Time/Email</td>
+                        <td>45-60 sec</td>
+                        <td><span class="success">5-10 sec</span></td>
+                        <td><span class="success">3-5 sec</span></td>
+                    </tr>
+                    <tr>
+                        <td>Manual Review Rate</td>
+                        <td>30-40%</td>
+                        <td><span class="success">15-20%</span></td>
+                        <td><span class="success">5-10%</span></td>
+                    </tr>
+                    <tr>
+                        <td>Daily Volume Capacity</td>
+                        <td>500-1000</td>
+                        <td><span class="success">1500-2000</span></td>
+                        <td><span class="success">2000-3000</span></td>
+                    </tr>
+                    <tr>
+                        <td>System Uptime</td>
+                        <td>N/A</td>
+                        <td><span class="success">95%+</span></td>
+                        <td><span class="success">99.5%+</span></td>
+                    </tr>
+                </table>
+            </div>
+
+            <!-- Slide 9: Risk Mitigation -->
+            <div class="slide">
+                <div class="slide-title">Risk Management</div>
+                <div class="slide-separator"></div>
+                <div class="two-column">
+                    <div class="column">
+                        <h3>Technical Risks</h3>
+                        <div class="content-item"><span class="warning">▸</span> Slow inference</div>
+                        <div style="padding-left: 50px; margin-top: -10px; font-size: 14px; color: #666;">
+                            → Use GPU + quantization
+                        </div>
+                        <div class="content-item"><span class="warning">▸</span> Low accuracy</div>
+                        <div style="padding-left: 50px; margin-top: -10px; font-size: 14px; color: #666;">
+                            → Hybrid mode, confidence filtering
+                        </div>
+                        <div class="content-item"><span class="warning">▸</span> System instability</div>
+                        <div style="padding-left: 50px; margin-top: -10px; font-size: 14px; color: #666;">
+                            → Health checks, fallback
+                        </div>
+                    </div>
+                    <div class="column">
+                        <h3>Mitigation Strategy</h3>
+                        <div class="content-item"><span class="success">✓</span> Hybrid RAG + Pattern</div>
+                        <div class="content-item"><span class="success">✓</span> Confidence threshold</div>
+                        <div class="content-item"><span class="success">✓</span> Manual review queue</div>
+                        <div class="content-item"><span class="success">✓</span> Continuous monitoring</div>
+                        <div class="content-item"><span class="success">✓</span> Rollback plan</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slide 10: Compliance & Governance -->
+            <div class="slide">
+                <div class="slide-title">Compliance & Data Privacy</div>
+                <div class="slide-separator"></div>
+                <div class="slide-content">
+                    <div class="stat-box" style="background: linear-gradient(135deg, #4caf50 0%, #388e3c 100%);">
+                        <div>100% Data Privacy Compliant</div>
+                        <div style="font-size: 18px; margin-top: 10px;">
+                            Local LLM + On-premise Storage = Zero External API Calls
+                        </div>
+                    </div>
+                    <div class="two-column" style="margin-top: 40px;">
+                        <div class="column">
+                            <h3>Security Controls</h3>
+                            <div class="content-item"><span class="success">✓</span> No external APIs</div>
+                            <div class="content-item"><span class="success">✓</span> Encryption at rest</div>
+                            <div class="content-item"><span class="success">✓</span> Audit logs</div>
+                            <div class="content-item"><span class="success">✓</span> Data retention policies</div>
+                        </div>
+                        <div class="column">
+                            <h3>Compliance</h3>
+                            <div class="content-item"><span class="success">✓</span> GDPR compliant</div>
+                            <div class="content-item"><span class="success">✓</span> SOX ready</div>
+                            <div class="content-item"><span class="success">✓</span> Internal policies</div>
+                            <div class="content-item"><span class="success">✓</span> Model governance</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slide 11: Next Steps -->
+            <div class="slide">
+                <div class="slide-title">Decision & Next Steps</div>
+                <div class="slide-separator"></div>
+                <div class="slide-content">
+                    <h3 style="color: #667eea; margin-bottom: 30px; font-size: 24px;">Approval Required:</h3>
+                    <div class="content-item"><span class="highlight">1.</span> POC phase allocation (2-3 weeks)</div>
+                    <div class="content-item"><span class="highlight">2.</span> Budget approval ($20,500)</div>
+                    <div class="content-item"><span class="highlight">3.</span> Team resources (1 engineer + 1 analyst)</div>
+                    <div class="content-item"><span class="highlight">4.</span> Infrastructure (GPU server - optional)</div>
+                    
+                    <div style="margin-top: 40px; padding: 20px; background: #f0f0f0; border-radius: 8px;">
+                        <h4 style="color: #667eea; margin-bottom: 10px;">Expected Outcomes (Week 6):</h4>
+                        <div class="content-item">Fully functional RAG system integrated with Tkinter</div>
+                        <div class="content-item">97%+ accuracy validated on ground truth</div>
+                        <div class="content-item">Production-ready deployment package</div>
+                        <div class="content-item">Clear go/no-go recommendation</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slide 12: Contact & Questions -->
+            <div class="slide">
+                <div class="slide-title">Questions & Discussion</div>
+                <div class="slide-separator"></div>
+                <div class="slide-content" style="text-align: center;">
+                    <div style="margin: 80px 0;">
+                        <div style="font-size: 32px; color: #667eea; margin-bottom: 40px;">
+                            Ready for Implementation
+                        </div>
+                        <div style="font-size: 20px; margin-bottom: 60px;">
+                            4-6 Week POC Timeline<br>
+                            1,785% Year 1 ROI<br>
+                            Production Ready
+                        </div>
+                    </div>
+                    <div style="background: #f0f0f0; padding: 30px; border-radius: 8px; margin-top: 40px;">
+                        <div style="font-size: 18px; margin-bottom: 20px;">
+                            <strong>Next Step:</strong> Steering Committee Approval
+                        </div>
+                        <div style="font-size: 14px; color: #666;">
+                            Implementation can begin immediately upon approval
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button id="prevBtn" onclick="previousSlide()">← Previous</button>
+            <span class="slide-counter">
+                <span id="currentSlide">1</span> / <span id="totalSlides">12</span>
+            </span>
+            <button id="nextBtn" onclick="nextSlide()">Next →</button>
+        </div>
+    </div>
+
+    <script>
+        let currentSlide = 0;
+        const slides = document.querySelectorAll('.slide');
+        const totalSlides = slides.length;
+        
+        document.getElementById('totalSlides').textContent = totalSlides;
+
+        function showSlide(n) {
+            slides.forEach(slide => slide.classList.remove('active'));
+            if (n >= totalSlides) currentSlide = totalSlides - 1;
+            if (n < 0) currentSlide = 0;
+            
+            slides[currentSlide].classList.add('active');
+            document.getElementById('currentSlide').textContent = currentSlide + 1;
+            
+            document.getElementById('prevBtn').disabled = currentSlide === 0;
+            document.getElementById('nextBtn').disabled = currentSlide === totalSlides - 1;
+        }
+
+        function nextSlide() {
+            currentSlide++;
+            showSlide(currentSlide);
+        }
+
+        function previousSlide() {
+            currentSlide--;
+            showSlide(currentSlide);
+        }
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'ArrowRight') nextSlide();
+            if (e.key === 'ArrowLeft') previousSlide();
+        });
+
+        showSlide(currentSlide);
+    </script>
+</body>
+</html>

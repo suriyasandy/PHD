@@ -1,0 +1,140 @@
+OFF-MARKET RATE CHECKING INTELLIGENCE (OMRCI)
+Multi-Asset Hybrid Risk Control System (IRD, GFX, GBM)
+AI Governance Use Case Submission
+
+VERSION 2.0 | NOVEMBER 28, 2025
+CLASSIFICATION: INVESTMENT BANKING | INTERNAL RISK CONTROL
+STATUS: POC COMPLETE (CELS) | UAT IN PROGRESS (IRD/Tkinter)
+
+═══════════════════════════════════════════════════════════════════════════════
+
+EXECUTIVE SUMMARY
+
+PROPOSAL TITLE
+Off-Market Rate Checking Intelligence (OMRCI): Multi-Asset Risk Validation Ecosystem
+
+USE CASE IN ONE SENTENCE
+A unified risk control platform that orchestrates product-specific validation logic: GenAI-powered email reconstruction for complex IRD negotiations (via Tkinter) and Semantic Justification Analysis for GFX/GBM high-volume flows (via CELS).
+
+CURRENT STATUS
+• Custom Exception Linkage System (CELS): POC Complete. Proven capability to link exceptions to historical patterns.
+• IRD Email Extraction (Tkinter): Currently in UAT. Validating email-based rate justifications.
+• GenAI Intelligence Layer: PROPOSED. The final component to automate justification analysis across both flows.
+
+STRATEGIC ALIGNMENT
+✓ Critical Risk Control: Prevents "off-market" booking errors and regulatory breaches.
+✓ Product-Specific Fit: Acknowledges that IRD (Complex/Email-based) and GFX (High-vol/Source-based) require different validation methods.
+✓ Asset Utilization: Leverages the CELS engine (already built) and Tkinter App (in UAT), rejecting the costly and ill-fitted SWB alternative.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SECTION 1: THE DUAL-FLOW PROBLEM
+
+1.1 THE ASSET CLASS DIVERGENCE
+Generic tools like SWB assume all trades are documents. In reality, Off-Market Rate checking requires two distinct workflows:
+
+FLOW A: IRD (Interest Rate Derivatives - Swaps, Swaptions)
+• Nature: Low volume, High complexity.
+• Data Source: Unstructured Email Conversations.
+• Validation Method: "Conversational Reconstruction."
+• Risk: Terms negotiated over days; justification buried in thread (e.g., "Discount agreed due to CSA terms").
+
+FLOW B: GFX & GBM (Global FX, Global Business Markets)
+• Nature: High volume, Standardized.
+• Data Source: Trader Notes + External Market Sources (Bloomberg/Reuters).
+• Validation Method: "Source Corroboration."
+• Risk: Trader enters 1-line note (e.g., "Distressed liquidity"). System must cross-reference this against market volatility snapshots.
+
+1.2 WHY SWB FAILS FOR BOTH
+• Fails IRD: SWB extracts fields from single docs. It cannot reconstruct a 5-email negotiation thread to find the *reason* for a price deviation.
+• Fails GFX/GBM: SWB processes documents. It cannot connect to live Bloomberg market data to verify if a "Liquidity" justification is valid.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SECTION 2: PROPOSED SOLUTION - THE OMRCI ECOSYSTEM
+
+We propose a centralized intelligence layer that sits on top of our two existing ingestion channels.
+
+2.1 THE CORE ENGINE: CELS (Status: POC Complete)
+The "Brain" of the operation.
+• Ingests exceptions from risk engines.
+• Links current exceptions to historical approvals (e.g., "Client X standing approval").
+• Holds the "State" of the investigation.
+
+2.2 INPUT CHANNEL A: IRD / Tkinter (Status: UAT In-Progress)
+The "Reader" for complex deals.
+• Workflow: Analyst opens Tkinter app → Fetches email thread for Trade ID.
+• GenAI Task: "Read this email chain. Extract the justification for the 5bps deviation. Identify the approver."
+• Output: Structured justification sent to CELS.
+
+2.3 INPUT CHANNEL B: GFX / GBM (Status: Standard Integration)
+The "Validator" for flow trading.
+• Workflow: System pulls Trader Note + Market Data Snapshot.
+• GenAI Task: "Trader justification is 'Volatile Market'. Compare against VIX/Volatility index at trade time. Is this justification plausible?"
+• Output: Validation Score (Green/Red) sent to CELS.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SECTION 3: DETAILED GENAI USE CASE
+
+3.1 USE CASE 1: CONVERSATIONAL REASONING (IRD)
+• Input: 5-email thread extracted by Tkinter (currently in UAT).
+• Challenge: Determining *which* email contains the final agreed price and *why* it deviates.
+• GenAI Role:
+  - Summarize the negotiation timeline.
+  - Pinpoint the specific sentence justifying the rate (e.g., "Agreed to mid-market minus 2 due to early termination").
+  - Map this unstructured text to a Risk Category (e.g., "Commercial Agreement").
+
+3.2 USE CASE 2: SEMANTIC VALIDATION (GFX/GBM)
+• Input: Short text Trader Note (e.g., "Leg 2 off mkt/package") + Market Context.
+• Challenge: High volume validation.
+• GenAI Role:
+  - Classify the note.
+  - Cross-reference: If note says "Package Trade", check if Strategy ID links to a multi-leg deal.
+  - Cross-reference: If note says "Market Move", check Reuters feed for price spikes at that minute.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SECTION 4: PROJECT STATUS & TIMELINE
+
+PHASE 1: FOUNDATION (COMPLETE)
+✓ CELS Core Logic: Developed & Validated (POC Done).
+✓ Exception Linkage Logic: 95% Accuracy in testing.
+
+PHASE 2: IRD INTEGRATION (IN PROGRESS)
+► Tkinter App Development: Complete.
+► UAT Testing: 60% Complete.
+► GenAI Integration: PENDING APPROVAL (This Request).
+
+PHASE 3: GFX/GBM EXPANSION (PLANNED)
+• Connect CELS to Market Data API.
+• Deploy GenAI Semantic Validator for high-volume notes.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SECTION 5: GOVERNANCE & CONTROL
+
+5.1 HUMAN-IN-THE-LOOP
+• IRD: GenAI suggests the justification from the email. Analyst MUST click "Confirm" in the Tkinter UI.
+• GFX/GBM: GenAI flags "Implausible Justifications" (e.g., Trader claims volatility, but market was flat). Analyst investigates flags.
+
+5.2 AUDITABILITY
+• CELS stores the "Golden Record."
+• Every AI suggestion is logged alongside the specific email ID or Market Data snapshot used to generate it.
+
+5.3 DATA SOVEREIGNTY
+• Email data processed on-prem / private cloud.
+• No sensitive client data used for model training.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+SECTION 6: VALUE PROPOSITION
+
+WHY THIS SPECIFIC APPROACH?
+1. Agility: We are already in UAT with IRD/Tkinter. Switching to SWB now would scrap 6 months of work and fail to meet the specific "Conversational" requirement of IRD.
+2. Coverage: SWB cannot handle the "Source-based" validation required for GFX/GBM. Only our CELS + GenAI approach covers the full Investment Bank portfolio.
+3. Efficiency: Automates the complex reading task (IRD) and the high-volume validation task (GFX), saving estimated $1.5M/year in analyst time.
+
+RECOMMENDATION:
+Approve GenAI integration for the OMRCI ecosystem to support the active UAT of IRD/Tkinter and the Phase 3 rollout for GFX/GBM.
+═══════════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,29 @@
 “We propose a GenAI‑assisted configuration and pattern generator for the existing IRD Tkinter email extractor. When the extractor encounters new broker formats or fails in UAT, a RAG pipeline will retrieve similar historical emails and current config patterns, and an LLM will propose new JSON/regex extraction rules and explain their behavior. These suggestions are reviewed and approved by engineers before deployment; the LLM never books trades or runs in the production extraction path. The goal is to reduce manual pattern authoring effort, speed up onboarding of new templates and products, and make the rulebase more maintainable, while keeping all risk‑sensitive decisions and trade booking logic in the existing deterministic engine.”
 
+GenAI-Assisted Pattern & Config Generator for IRD Email Extraction  
+Business Requirements Document (BRD) – Draft v1.0
+1.	Background and Context
+The Off-Market Rate Checking and Trade Capture teams currently use a Tkinter-based IRD email extraction tool to pull key fields (e.g., trade economics, dates, counterparties) from broker mail conversations. The tool relies on a configuration-driven engine (JSON + regex/pattern rules) and works well for known templates and counterparties.
+However, whenever brokers introduce new phrasing, layouts, or product variants, the current process requires a specialist to manually:
+•	Inspect the failed email.
+•	Reverse-engineer the pattern.
+•	Handcraft new config/regex.
+•	Push changes through UAT and deployment.
+This creates a bottleneck, slows IRD UAT and onboarding of new flows, and makes coverage growth dependent on a small set of technical users. Similar GenAI and RAG patterns are already used in financial services to assist configuration, rule authoring, and structured extraction workflows.[hatchworks +3]
+This BRD proposes adding a GenAI + RAG “config assistant” around the existing Tkinter extractor and configuration repo, not replacing the current deterministic extraction engine. The LLM will act only in a design-time / UAT context and never directly in the trade booking path.[arize +1]
+1.	Objectives
+Primary objectives:
+•	Reduce manual effort and cycle time to create or update extraction patterns for IRD email formats.
+•	Improve pattern coverage and maintainability as new brokers, products, and templates are added.
+•	Preserve the existing deterministic, auditable extraction and booking pipeline; use GenAI only as a configuration assistant.
+Secondary objectives:
+•	Reduce dependency on a small number of regex/config experts.
+•	Provide better documentation and explainability of patterns for handover and audit.
+•	Enable faster UAT iterations for new IRD flows.
+1.	In-Scope and Out-of-Scope
+In scope:
+
+
 
 
 OFF-MARKET RATE CHECKING INTELLIGENCE (OMRCI)

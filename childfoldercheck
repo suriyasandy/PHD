@@ -1,0 +1,17 @@
+import win32com.client as win32
+
+outlook = win32.Dispatch("Outlook.Application")
+ns = outlook.GetNamespace("MAPI")
+
+# Option 1: mailbox added as full store in profile
+shared_root = ns.Folders["Shared Mailbox Name"]   # display name in Outlook
+shared_inbox = shared_root.Folders["Inbox"]
+
+# Direct subfolder: Inbox\Child
+child = shared_inbox.Folders["ChildFolderName"]
+
+# Nested subfolder: Inbox\Child\GrandChild
+grandchild = shared_inbox.Folders["ChildFolderName"].Folders["GrandChild"]
+
+for f in shared_inbox.Folders:
+    print(f.Name)

@@ -1,0 +1,26 @@
+import win32com.client as win32
+
+outlook = win32.Dispatch("Outlook.Application")
+ns = outlook.GetNamespace("MAPI")
+
+# Get the "suriya" mailbox
+suriya = ns.Folders["suriya"]
+
+# Get "booking" folder
+booking = suriya.Folders["booking"]
+
+# Iterate through ALL subfolders in booking (2024, 2025, 2026, etc.)
+for year_folder in booking.Folders:
+    print(f"\n{'='*50}")
+    print(f"Folder: {year_folder.Name}")
+    print(f"{'='*50}")
+    
+    # List all mails in this year folder
+    for item in year_folder.Items:
+        try:
+            print(f"  Subject: {item.Subject}")
+            print(f"  From: {item.SenderName}")
+            print(f"  Received: {item.ReceivedTime}")
+            print()
+        except Exception as e:
+            print(f"  Error reading item: {e}")

@@ -1,26 +1,119 @@
-import win32com.client as win32
+def connect_to_outlook(self, mailbox_name, folder_name):
+    """Your existing connect_to_outlook function"""
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        mapi = outlook.GetNamespace("MAPI")
+        
+        mailbox = None
 
-outlook = win32.Dispatch("Outlook.Application")
-ns = outlook.GetNamespace("MAPI")
+        for i in range(1, mapi.Folders.Count + 1):
+            m = mapi.Folders.Item(i)
+            if m.Name == mailbox_name:
+                mailbox = m
+                break
+        
+        if mailbox is None:
+            return None
+        
+        folder = None
+        for j in range(1, mailbox.Folders.Count + 1):
+            f = mailbox.Folders.Item(j)
+            if f.Name == folder_name:
+                folder = f
+                break
+        
+        return folder
+    except Exception as e:
+        logger.error(f"Failed to connect to Outlook: {e}")
+        return None
 
-# Get the "suriya" mailbox
-suriya = ns.Folders["suriya"]
-
-# Get "booking" folder
-booking = suriya.Folders["booking"]
-
-# Iterate through ALL subfolders in booking (2024, 2025, 2026, etc.)
-for year_folder in booking.Folders:
-    print(f"\n{'='*50}")
-    print(f"Folder: {year_folder.Name}")
-    print(f"{'='*50}")
+def get_items_recursive(self, folder, filter_str):
+    """Recursively get items from folder and all subfolders"""
+    all_items = []
     
-    # List all mails in this year folder
-    for item in year_folder.Items:
-        try:
-            print(f"  Subject: {item.Subject}")
-            print(f"  From: {item.SenderName}")
-            print(f"  Received: {item.ReceivedTime}")
-            print()
-        except Exception as e:
-            print(f"  Error reading item: {e}")
+    try:
+        # Get items from current folder with filter
+        items = folder.Items.Restrict(filter_str)
+        items_list = self.process_items_in_batches(items, batch_size=150)
+        
+        if items_list:
+            all_items.extend([entry["item"] for entry in items_list])
+    except Exception as e:
+        logger.warning(f"Error processing folder '{folder.Name}': {e}")
+    
+    # Recursively get items from all subfolders
+    try:
+        for subfolder in folder.Folders:
+            sub_items = self.get_items_recursive(subfolder, filter_str)
+            all_items.extend(sub_items)
+    except Exception as e:
+        logger.warning(f"Error accessing subfolders of '{folder.Name}': {e}")
+    
+    return all_items
+
+def extract_emails(self, mailbox_name, folder_name, trade_ids, days_back=3):
+    """Your existing extraction logic - now with subfolder support"""
+    pythoncom.CoInitialize()
+    try:
+        folder = self.connect_to_outlook(mailbox_name, folder_name)
+        if not folder:
+            return {'success': False, 'error': 'Could not connect to folder'}
+        
+        trade_ids_list = [tid.strip() for tid in re.split(",|\\s", trade_ids) if tid.strip()]
+        today = datetime.now()
+        date_fmt, use_ampm = self.get_region_datefmt_ampm()
+        all_items = []
+
+        for days_ago in range(1, days_back + 1):
+            d = today - timedelta(days=days_ago)
+            start_time, end_time = self.restrict_datetime_strings(d, date_fmt, use_ampm)
+            filter_str = f"[ReceivedTime] >= '{start_time}' AND [ReceivedTime] <= '{end_time}'"
+            
+            # Get items from folder AND all subfolders recursively
+            items_list = self.get_items_recursive(folder, filter_str)
+            
+            if not items_list and use_ampm:
+                am_l = d.replace(hour=1).strftime('%p').lower()
+                pm_l = d.replace(hour=13).strftime('%p').lower()
+                start_time_l = f"{d.strftime(date_fmt)} 12:00:00 {am_l}"
+                end_time_l = f"{d.strftime(date_fmt)} 11:59:59 {pm_l}"
+                filter_str_l = f"[ReceivedTime] >= '{start_time_l}' AND [ReceivedTime] <= '{end_time_l}'"
+                
+                # Recursive call with alternate filter
+                items_list = self.get_items_recursive(folder, filter_str_l)
+            
+            if items_list:
+                all_items.extend(items_list)
+
+        emails = []
+        for trade_id in trade_ids_list:
+            for item in all_items:
+                try:
+                    if getattr(item, "Class", None) == 43:
+                        subject = item.Subject or ""
+                        body = item.Body or ""
+                        html_body = ""
+                        try:
+                            html_body = item.HTMLBody
+                        except Exception:
+                            pass
+                        if (trade_id in subject or trade_id in body or (html_body and trade_id in html_body)):
+                            emails.append({
+                                'trade_id': trade_id,
+                                'subject': subject,
+                                'sender': getattr(item, "SenderName", ""),
+                                'recipient': getattr(item, "To", ""),
+                                'date': item.ReceivedTime.strftime("%Y-%m-%d %H:%M:%S") if item.ReceivedTime else "",
+                                'body': body,
+                                'html_body': html_body,
+                            })
+                except Exception:
+                    pass
+
+        gc.collect()
+        return {'success': True, 'emails': emails}
+    except Exception as e:
+        gc.collect()
+        return {'success': False, 'error': str(e)}
+    finally:
+        pythoncom.CoUninitialize()

@@ -27,8 +27,8 @@ def connect_to_outlook(self, mailbox_name, folder_name):
         logger.error(f"Failed to connect to Outlook: {e}")
         return None
 
-def get_items_recursive(self, folder, filter_str):
-    """Recursively get items from folder and all subfolders"""
+def get_items_from_folder_recursive(self, folder, filter_str):
+    """Recursively get items from folder and subfolders using .Item() approach"""
     all_items = []
     
     try:
@@ -41,11 +41,16 @@ def get_items_recursive(self, folder, filter_str):
     except Exception as e:
         logger.warning(f"Error processing folder '{folder.Name}': {e}")
     
-    # Recursively get items from all subfolders
+    # Recursively get items from all subfolders using .Item() iteration
     try:
-        for subfolder in folder.Folders:
-            sub_items = self.get_items_recursive(subfolder, filter_str)
-            all_items.extend(sub_items)
+        subfolder_count = folder.Folders.Count
+        for idx in range(1, subfolder_count + 1):
+            try:
+                subfolder = folder.Folders.Item(idx)
+                sub_items = self.get_items_from_folder_recursive(subfolder, filter_str)
+                all_items.extend(sub_items)
+            except Exception as e:
+                logger.warning(f"Error accessing subfolder at index {idx}: {e}")
     except Exception as e:
         logger.warning(f"Error accessing subfolders of '{folder.Name}': {e}")
     
@@ -70,7 +75,7 @@ def extract_emails(self, mailbox_name, folder_name, trade_ids, days_back=3):
             filter_str = f"[ReceivedTime] >= '{start_time}' AND [ReceivedTime] <= '{end_time}'"
             
             # Get items from folder AND all subfolders recursively
-            items_list = self.get_items_recursive(folder, filter_str)
+            items_list = self.get_items_from_folder_recursive(folder, filter_str)
             
             if not items_list and use_ampm:
                 am_l = d.replace(hour=1).strftime('%p').lower()
@@ -80,7 +85,7 @@ def extract_emails(self, mailbox_name, folder_name, trade_ids, days_back=3):
                 filter_str_l = f"[ReceivedTime] >= '{start_time_l}' AND [ReceivedTime] <= '{end_time_l}'"
                 
                 # Recursive call with alternate filter
-                items_list = self.get_items_recursive(folder, filter_str_l)
+                items_list = self.get_items_from_folder_recursive(folder, filter_str_l)
             
             if items_list:
                 all_items.extend(items_list)

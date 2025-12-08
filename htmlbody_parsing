@@ -1,1 +1,368 @@
+ENHANCEMENT: HTML PARSING WITH TABLE EXCLUSION
+Addition to Tkinter IRD Email Extraction BRD
+Technical Specification – HTML Body Processing
 
+DECEMBER 8, 2025
+
+═══════════════════════════════════════════════════════════════════════════════
+
+REQUIREMENT: EMAIL BODY TEXT EXTRACTION (TABLE-AWARE)
+
+CURRENT STATE:
+- Tkinter extracts: email_data['body']
+  - This is plain-text linearization of HTML.
+  - Contains table data mixed into text flow.
+  - Result: Noise in extraction patterns, false matches.
+
+DESIRED STATE:
+- Tkinter should extract: cleaned_narrative_text (from HTML)
+  - Parse HTML structure.
+  - Remove all table blocks.
+  - Keep only body text, headers, paragraphs, lists.
+  - Result: Clean narrative for pattern extraction.
+
+═══════════════════════════════════════════════════════════════════════════════
+
+FUNCTIONAL REQUIREMENT: FR8 – TABLE-AWARE HTML BODY EXTRACTION
+
+FR8.1: HTML Parsing
+- Accept email_data['html_body'] as input.
+- Parse HTML into a DOM tree.
+- Preserve semantic structure (h1, h2, p, ul, ol, li, div, etc.).
+
+FR8.2: Table Removal Strategy
+- Identify all table elements: <table>, <thead>, <tbody>, <tr>, <td>, <th>.
+- Two strategies:
+  a) REMOVE ALL TABLES: Delete entire <table>...</table> blocks.
+  b) EXTRACT TABLE AS SEPARATE: Store table content separately for alternative processing.
+  
+- Default strategy: REMOVE ALL TABLES (for clean narrative extraction).
+
+FR8.3: Text Extraction
+- From remaining HTML, extract all text nodes.
+- Preserve paragraph breaks and list structures.
+- Remove HTML tags, scripts, styles.
+- Normalize whitespace (excess newlines, tabs).
+
+FR8.4: Fallback to Plain Text
+- If html_body is unavailable, fall back to email_data['body'].
+- Log this fallback for audit.
+
+FR8.5: Audit & Metadata
+- For each email, log:
+  - Original HTML size (bytes).
+  - Table count (number of <table> elements removed).
+  - Final text size (bytes).
+  - Extraction duration (ms).
+  
+═══════════════════════════════════════════════════════════════════════════════
+
+IMPLEMENTATION: PYTHON CODE EXAMPLES
+
+OPTION 1: BEAUTIFULSOUP APPROACH (RECOMMENDED FOR ROBUSTNESS)
+
+from bs4 import BeautifulSoup
+import re
+from typing import Tuple, Dict
+
+class EmailBodyExtractor:
+    """
+    Extracts clean narrative text from HTML email bodies,
+    excluding tables and other non-narrative elements.
+    """
+    
+    def __init__(self, remove_tables: bool = True, remove_scripts_styles: bool = True):
+        self.remove_tables = remove_tables
+        self.remove_scripts_styles = remove_scripts_styles
+    
+    def extract_narrative_text(self, html_body: str) -> Tuple[str, Dict]:
+        """
+        Extract narrative text from HTML, excluding tables.
+        
+        Args:
+            html_body: Raw HTML email body from Outlook.
+        
+        Returns:
+            Tuple of:
+              - cleaned_text: Plain text narrative (no tables).
+              - metadata: {
+                  'original_size_bytes': int,
+                  'table_count': int,
+                  'final_size_bytes': int,
+                  'extraction_duration_ms': float,
+                  'has_fallback': bool
+                }
+        """
+        import time
+        start_time = time.time()
+        
+        try:
+            # Parse HTML
+            soup = BeautifulSoup(html_body, 'html.parser')
+            
+            # Count tables before removal
+            table_count = len(soup.find_all('table'))
+            
+            # Remove script and style elements (noise)
+            if self.remove_scripts_styles:
+                for script in soup.find_all(['script', 'style']):
+                    script.decompose()
+            
+            # Remove all table elements if requested
+            if self.remove_tables:
+                for table in soup.find_all('table'):
+                    table.decompose()
+            
+            # Get all text
+            text = soup.get_text(separator='\n', strip=True)
+            
+            # Normalize whitespace
+            # Replace multiple newlines with single newline
+            text = re.sub(r'\n\s*\n', '\n\n', text)
+            # Replace multiple spaces with single space
+            text = re.sub(r' +', ' ', text)
+            # Remove leading/trailing whitespace per line
+            text = '\n'.join(line.strip() for line in text.split('\n'))
+            
+            duration_ms = (time.time() - start_time) * 1000
+            
+            metadata = {
+                'original_size_bytes': len(html_body),
+                'table_count': table_count,
+                'final_size_bytes': len(text),
+                'extraction_duration_ms': round(duration_ms, 2),
+                'has_fallback': False,
+                'method': 'beautifulsoup'
+            }
+            
+            return text, metadata
+            
+        except Exception as e:
+            # Fallback to regex-based extraction
+            return self._fallback_extract(html_body, str(e))
+    
+    def _fallback_extract(self, html_body: str, error_msg: str) -> Tuple[str, Dict]:
+        """
+        Fallback extraction if BeautifulSoup parsing fails.
+        Uses regex to remove tables and scripts.
+        """
+        import time
+        start_time = time.time()
+        
+        text = html_body
+        
+        # Remove script and style tags
+        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Remove all table tags (including nested)
+        text = re.sub(r'<table[^>]*>.*?</table>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        # Remove all HTML tags
+        text = re.sub(r'<[^>]+>', '\n', text)
+        
+        # Decode HTML entities
+        import html
+        text = html.unescape(text)
+        
+        # Normalize whitespace
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        text = re.sub(r' +', ' ', text)
+        text = '\n'.join(line.strip() for line in text.split('\n'))
+        
+        duration_ms = (time.time() - start_time) * 1000
+        
+        metadata = {
+            'original_size_bytes': len(html_body),
+            'table_count': 'unknown',
+            'final_size_bytes': len(text),
+            'extraction_duration_ms': round(duration_ms, 2),
+            'has_fallback': True,
+            'fallback_reason': error_msg,
+            'method': 'regex'
+        }
+        
+        return text, metadata
+
+
+# USAGE IN TKINTER EXTRACTION:
+
+def process_selected_email(email_data: dict) -> dict:
+    """
+    Process selected email from Tkinter UI.
+    
+    Args:
+        email_data: Email metadata/content dict with keys:
+          - 'html_body': HTML content (preferred)
+          - 'body': Plain text content (fallback)
+          - 'folder': Folder path
+          - etc.
+    
+    Returns:
+        Enriched email_data with:
+          - 'narrative_text': Cleaned text for extraction
+          - 'extraction_metadata': Processing stats
+          - 'extraction_result': Pattern matching output
+    """
+    extractor = EmailBodyExtractor(remove_tables=True)
+    
+    # Check if HTML body exists
+    if 'html_body' in email_data and email_data['html_body']:
+        html_body = email_data['html_body']
+    else:
+        # Fallback: convert plain text body to minimal HTML
+        plain_text = email_data.get('body', '')
+        html_body = f"<p>{plain_text}</p>"
+    
+    # Extract narrative text
+    narrative_text, metadata = extractor.extract_narrative_text(html_body)
+    
+    # Log extraction metadata
+    email_data['narrative_text'] = narrative_text
+    email_data['extraction_metadata'] = metadata
+    
+    # Now pass narrative_text to your existing extraction patterns
+    email_data['extraction_result'] = {
+        'input_text': narrative_text,
+        'input_size_bytes': len(narrative_text),
+        'tables_removed': metadata['table_count']
+    }
+    
+    # Continue with pattern matching...
+    # extraction_result = apply_config_patterns(narrative_text, config)
+    
+    return email_data
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+OPTION 2: HTML2TEXT APPROACH (LIGHTWEIGHT ALTERNATIVE)
+
+import html2text
+import re
+
+class EmailBodyExtractorLite:
+    """
+    Lightweight alternative using html2text library.
+    Converts HTML to Markdown, then extracts plain text.
+    """
+    
+    def __init__(self):
+        self.h = html2text.HTML2Text()
+        self.h.ignore_links = False
+        self.h.ignore_images = True
+        self.h.ignore_emphasis = False
+    
+    def extract_narrative_text(self, html_body: str) -> tuple:
+        """
+        Convert HTML to markdown, then remove table markers.
+        """
+        import time
+        start_time = time.time()
+        
+        # Convert HTML to markdown
+        markdown_text = self.h.handle(html_body)
+        
+        # Remove markdown table syntax (|---|---|)
+        markdown_text = re.sub(r'\|[-:| ]+\|\n', '', markdown_text)
+        markdown_text = re.sub(r'^\|.+\|$', '', markdown_text, flags=re.MULTILINE)
+        
+        # Normalize whitespace
+        text = re.sub(r'\n\s*\n', '\n\n', markdown_text)
+        text = re.sub(r' +', ' ', text)
+        
+        duration_ms = (time.time() - start_time) * 1000
+        
+        metadata = {
+            'original_size_bytes': len(html_body),
+            'final_size_bytes': len(text),
+            'extraction_duration_ms': round(duration_ms, 2),
+            'method': 'html2text'
+        }
+        
+        return text, metadata
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+OPTION 3: LXML APPROACH (HIGH PERFORMANCE)
+
+from lxml import html as lxml_html
+from lxml import etree
+
+class EmailBodyExtractorPerf:
+    """
+    High-performance extraction using lxml.
+    Best for large batches.
+    """
+    
+    def extract_narrative_text(self, html_body: str) -> tuple:
+        """
+        Use lxml to parse and extract text efficiently.
+        """
+        import time
+        start_time = time.time()
+        
+        try:
+            # Parse with lxml
+            doc = lxml_html.fromstring(html_body)
+        except:
+            # If lxml parsing fails, try with html parser
+            doc = lxml_html.document_fromstring(html_body)
+        
+        # Remove table elements
+        for table in doc.xpath('.//table'):
+            table.getparent().remove(table)
+        
+        # Remove script and style
+        for elem in doc.xpath('.//script | .//style'):
+            elem.getparent().remove(elem)
+        
+        # Extract text content
+        text_content = doc.text_content()
+        
+        # Normalize whitespace
+        import re
+        text = re.sub(r'\n\s*\n', '\n\n', text_content)
+        text = re.sub(r' +', ' ', text)
+        text = '\n'.join(line.strip() for line in text.split('\n'))
+        
+        duration_ms = (time.time() - start_time) * 1000
+        
+        metadata = {
+            'original_size_bytes': len(html_body),
+            'final_size_bytes': len(text),
+            'extraction_duration_ms': round(duration_ms, 2),
+            'method': 'lxml'
+        }
+        
+        return text, metadata
+
+
+═══════════════════════════════════════════════════════════════════════════════
+
+RECOMMENDED CHOICE:
+
+Option 1 (BeautifulSoup) with Regex Fallback:
+✓ Robust HTML parsing.
+✓ Handles malformed HTML gracefully.
+✓ Clear fallback strategy.
+✓ Easy to debug and extend.
+✗ Slightly slower than lxml (but acceptable for UAT).
+
+DEPLOYMENT:
+
+1. Add EmailBodyExtractor to Tkinter app's data processing module.
+2. Before applying config patterns, call: narrative_text, metadata = extractor.extract_narrative_text(html_body)
+3. Pass narrative_text to extraction engine.
+4. Log metadata for audit trail.
+
+TESTING:
+
+Test with real IRD emails:
+✓ Emails with pricing tables → tables removed, narrative preserved.
+✓ Emails with mixed prose and tables → clean separation.
+✓ Legacy emails with no tables → no degradation.
+✓ Malformed HTML → fallback works gracefully.
+
+═══════════════════════════════════════════════════════════════════════════════
